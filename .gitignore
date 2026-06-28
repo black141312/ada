@@ -1,0 +1,7 @@
+node_modules/
+.env
+*.log
+.ada/
+
+# ada session transcripts / local data
+.cos0/
