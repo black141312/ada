@@ -155,4 +155,4 @@ file layout) and **[MISSING.md](MISSING.md)** for the feature checklist.
 
 ## License
 
-Not yet licensed (private repo). Add a `LICENSE` file to set terms — MIT is a common default.
+[MIT](LICENSE) © 2026 Aditya
