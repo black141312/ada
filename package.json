@@ -11,6 +11,7 @@
   "files": [
     "bin/",
     "src/",
+    "skills/",
     "tsconfig.json",
     "README.md"
   ],

@@ -5,8 +5,12 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { readdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { registerTool } from "./tools.ts";
+
+// Skills bundled with ada (committed, shipped). src/client/skills.ts → <package>/skills.
+const BUNDLED = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "skills");
 
 export interface Skill {
   name: string;
@@ -16,7 +20,8 @@ export interface Skill {
 
 function skillDirs(includeProject: boolean): string[] {
   const global = resolve(homedir(), ".ada", "skills");
-  return includeProject ? [resolve(process.cwd(), ".ada", "skills"), global] : [global];
+  // Precedence (first match wins): project → global → bundled built-ins.
+  return includeProject ? [resolve(process.cwd(), ".ada", "skills"), global, BUNDLED] : [global, BUNDLED];
 }
 
 function frontDescription(md: string): string | undefined {

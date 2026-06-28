@@ -10,7 +10,7 @@ import { loadImage } from "./client/image.ts";
 import { expandPrompt } from "./client/prompts.ts";
 import { MarkdownStreamer, highlight, renderEditDiff } from "./client/render.ts";
 import { Session, list } from "./client/session.ts";
-import { registerSkillTool } from "./client/skills.ts";
+import { loadSkills, registerSkillTool } from "./client/skills.ts";
 import { parseTextToolCalls } from "./client/agent.ts";
 import { userBar } from "./client/tui.ts";
 import { isDestructive, registerTool, toolByName } from "./client/tools.ts";
@@ -218,6 +218,12 @@ async function main(): Promise<void> {
   assert.ok(bar.includes("hi") && bar.includes("›"), "user bar shows the text + marker");
   assert.ok(bar.includes("\x1b[48;5;238m"), "user bar has a full-width background");
   assert.ok(userBar("x".repeat(200), 40).length > 40, "over-long input does not crash padding");
+
+  // --- bundled skills load (commit, code-review, write-tests, open-pr) ---
+  const skillNames = loadSkills(true).map((s) => s.name);
+  for (const want of ["commit", "code-review", "write-tests", "open-pr"]) {
+    assert.ok(skillNames.includes(want), `bundled skill present: ${want}`);
+  }
 
   // --- login allowlist ---
   assert.ok(isAllowed("anyone"), "no allowlist → allow any authenticated user");

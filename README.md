@@ -112,6 +112,22 @@ ada -p "fix the build"   # one-shot: print the answer and exit
 **Sign in** (optional — identifies you to the backend): run `/login`, choose GitHub or Google, and
 enter the device code in your browser. The token is stored locally and sent as your client key.
 
+## Skills
+
+ada ships with built-in **skills** — specialized instructions the model pulls in only when a task
+needs them (progressive disclosure). The model loads one via the `use_skill` tool:
+
+| Skill | What it does |
+|---|---|
+| `commit` | Stage changes and write a clean Conventional Commits message |
+| `code-review` | Review the current diff for correctness bugs + quality issues |
+| `write-tests` | Find the test runner, add focused cases, run them, report |
+| `open-pr` | Push the branch and open a GitHub PR (`gh`) with a structured body |
+
+Add your own as `SKILL.md` files under `.ada/skills/<name>/` (project) or `~/.ada/skills/<name>/`
+(global) — a `---\ndescription: …\n---` front-matter line is all that's required. Project skills
+override global, which override the built-ins.
+
 ## Configuration
 
 **Client** (`ada`):
