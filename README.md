@@ -123,6 +123,7 @@ needs them (progressive disclosure). The model loads one via the `use_skill` too
 | `code-review` | Review the current diff for correctness bugs + quality issues |
 | `write-tests` | Find the test runner, add focused cases, run them, report |
 | `open-pr` | Push the branch and open a GitHub PR (`gh`) with a structured body |
+| `ponytail` | Force the laziest solution that works — YAGNI, stdlib before deps, shortest diff |
 
 Add your own as `SKILL.md` files under `.ada/skills/<name>/` (project) or `~/.ada/skills/<name>/`
 (global) — a `---\ndescription: …\n---` front-matter line is all that's required. Project skills

@@ -221,7 +221,7 @@ async function main(): Promise<void> {
 
   // --- bundled skills load (commit, code-review, write-tests, open-pr) ---
   const skillNames = loadSkills(true).map((s) => s.name);
-  for (const want of ["commit", "code-review", "write-tests", "open-pr"]) {
+  for (const want of ["commit", "code-review", "write-tests", "open-pr", "ponytail"]) {
     assert.ok(skillNames.includes(want), `bundled skill present: ${want}`);
   }
 
