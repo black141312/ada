@@ -3,6 +3,8 @@
 ada is two programs in one repo: a thin **client** (the coding agent) and a **backend** (the
 router that holds provider keys). They communicate in one wire format — OpenAI Chat Completions.
 
+![ada architecture](architecture.svg)
+
 ```
  ada (client)                    ada backend                         upstream providers
  ────────────                    ───────────                         ──────────────────

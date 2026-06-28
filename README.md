@@ -4,11 +4,7 @@ A coding agent built from zero — a terminal client in the spirit of pi / Codex
 backed by a **Cursor-style routing backend** that holds every provider key and speaks one wire
 format to the client.
 
-```
- ada (terminal)  ──▶  ada backend  ──▶  Anthropic / OpenAI / Gemini / Mistral / Groq / Ollama / …
- holds no keys        auth · route ·         the real providers
-                      normalize  ← the one control point for keys, limits, billing
-```
+![ada architecture](docs/architecture.svg)
 
 The client talks **only** OpenAI Chat Completions to the backend. The backend routes each request
 to the right provider by model id and normalizes every provider back to that one format — so a new
