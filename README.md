@@ -1,77 +1,158 @@
 # ada
 
-A coding agent built from zero, with a **Cursor-style routing backend**.
+A coding agent built from zero — a terminal client in the spirit of pi / Codex / Cursor,
+backed by a **Cursor-style routing backend** that holds every provider key and speaks one wire
+format to the client.
 
 ```
- terminal client  ──▶  ada backend  ──▶  Anthropic / OpenAI / Mistral / Gemini / …
- (holds no keys)        (auth · route · normalize;        (real providers)
-                         provider keys live here —
-                         the one control point)
+ ada (terminal)  ──▶  ada backend  ──▶  Anthropic / OpenAI / Gemini / Mistral / Groq / Ollama / …
+ holds no keys        auth · route ·         the real providers
+                      normalize  ← the one control point for keys, limits, billing
 ```
 
-The client speaks only **OpenAI Chat Completions** to the backend. The backend routes each
-request to the right provider and normalizes every provider back to that one format.
+The client talks **only** OpenAI Chat Completions to the backend. The backend routes each request
+to the right provider by model id and normalizes every provider back to that one format — so a new
+model is **zero code**, and a new OpenAI-compatible provider is **two lines**.
 
-## Run
+---
+
+## Features
+
+- **Agentic loop** — streams, calls tools, feeds results back, repeats until done.
+- **Tools** — `read_file`, `write_file`, `edit_file` (exact-match), `bash`, `ls`, `grep`, `glob`.
+- **Two front-ends** — a classic readline REPL and an inline **TUI** (`--tui`) with a live "thinking"
+  spinner and Claude-style turn markers.
+- **Plan mode**, **todos**, **checkpoint/undo** (revert the agent's edits), **protected paths** +
+  destructive-command confirmation, and **subagents** (`spawn_agent`).
+- **Sessions** — every turn is persisted; `--continue` / `--resume` to pick up where you left off.
+- **Context compaction** — summarizes old turns automatically as context grows.
+- **Sign in with GitHub or Google** (RFC 8628 device flow) — zero client config.
+- **Extensible** — extensions (tools + hooks + commands), prompt templates, skills, and MCP servers.
+- **No build step** — TypeScript run through `tsx`.
+
+## Providers
+
+The backend proxies any OpenAI-compatible upstream and translates the one that isn't (Anthropic):
+
+| Provider | Models | Key env var |
+|---|---|---|
+| OpenAI | `gpt-*`, `o*` | `OPENAI_API_KEY` |
+| Anthropic | `claude-*` | `ANTHROPIC_API_KEY` |
+| Google Gemini | `gemini-*` | `GEMINI_API_KEY` |
+| Mistral | `mistral-*` | `MISTRAL_API_KEY` |
+| Groq | — | `GROQ_API_KEY` |
+| DeepSeek | `deepseek-*` | `DEEPSEEK_API_KEY` |
+| Together | — | `TOGETHER_API_KEY` |
+| xAI (Grok) | `grok-*` | `XAI_API_KEY` |
+| DashScope (Qwen) | — | `DASHSCOPE_API_KEY` |
+| OpenRouter | everything else | `OPENROUTER_API_KEY` |
+| **Ollama (local)** | `name:tag` (e.g. `qwen2.5-coder:latest`) | *keyless* |
+
+Routing: a model id containing `:` → local Ollama; otherwise by prefix; an explicit `provider`
+field always wins. Set only the keys you have — the rest stay dormant (vendor SDKs load lazily).
+
+---
+
+## Install
+
+Requires **Node ≥ 18**.
 
 ```bash
-# 1) backend (holds the provider keys)
-export ANTHROPIC_API_KEY=sk-ant-...     # and/or OPENAI_API_KEY, MISTRAL_API_KEY, GEMINI_API_KEY, …
-npm run server                          # → http://localhost:8787
-
-# 2) client (in another terminal)
-npm start                               # pick a model, then chat
-npm start -- --list-models              # list everything your keys can reach
-npm start -- --continue                 # resume the last session
+git clone https://github.com/black141312/ada.git
+cd ada
+npm install
+npm link          # puts `ada` and `ada-server` on your PATH
 ```
 
-Windows: use `set VAR=value` instead of `export`.
+`npm link` makes `ada` a global command. (Prefer not to link? Use `npm start` from the repo, or
+`npm install -g .`.) To remove it later: `npm unlink -g ada`.
 
-Checks: `npm run typecheck` · `npm run selfcheck` (offline).
+## Quickstart
 
-## Layout
+ada is two processes: a **backend** (holds keys, routes) and the **`ada`** client.
 
-```
-src/
-  shared/
-    types.ts          shared provider/model types
+**Option A — local, no keys (Ollama):**
 
-  server/             the routing backend            (npm run server)
-    index.ts          HTTP entry: auth → route → dispatch to an adapter
-    config.ts         providers, base URLs, key env vars, port, client-key auth
-    router.ts         model id → provider (prefix rules; explicit `provider` wins)
-    sse.ts            Server-Sent Events helpers
-    providers/
-      adapter.ts      the Adapter interface          ← one adapter per WIRE FORMAT
-      registry.ts     provider → adapter map         ← who shares what, at a glance
-      openai-compat.ts OpenAI-compatible adapter (OpenAI, Mistral, Groq, Gemini-compat, …)
-      anthropic.ts    native Anthropic adapter (lazy @anthropic-ai/sdk)
+```bash
+# terminal 1: backend
+ada-server                              # → http://localhost:8787
 
-  client/             the terminal agent             (npm start)
-    cli.ts            REPL: flags, model picker, approval prompt
-    agent.ts          the agentic loop (stream → tool calls → feed back → repeat)
-    compaction.ts     context management — summarize old turns when context grows
-    tools.ts          read_file / write_file / edit_file / bash
-    session.ts        append-only JSONL session store (.ada/sessions/)
-
-  selfcheck.ts        offline checks (tools, session, routing)
+# terminal 2: the agent
+ada                                     # pick a local model and chat
 ```
 
-## Design
+**Option B — a cloud provider:**
 
-- **One adapter per wire format, not per model or provider.** Most providers speak the
-  OpenAI format and share `openai-compat.ts`; only divergent formats (Anthropic) get their own.
-  So: a new model = **0 code**; a new OpenAI-compatible provider = **2 lines in `config.ts`**;
-  a brand-new format = **1 adapter** + a line in `registry.ts`.
-- **The backend is the one control point** — it holds every provider key and is where auth,
-  rate limits, and billing belong. The client carries only a ada client key.
-- **Vendor SDKs are loaded lazily** (pi-style): a `type`-only import plus a dynamic `import()`,
-  so e.g. `@anthropic-ai/sdk` never loads unless a Claude request actually arrives.
-- **Context management (compaction)** — the client estimates context size (chars/4) and, when it
-  crosses `ADA_COMPACT_AT` (default 100k tokens) or a request overflows, summarizes older turns into
-  one compact summary and keeps the recent ones. Manual `/compact`; `/context` shows the estimate.
+```bash
+# terminal 1
+export ANTHROPIC_API_KEY=sk-ant-...     # and/or OPENAI_API_KEY, GEMINI_API_KEY, …
+ada-server
 
-## Roadmap
+# terminal 2
+ada --model claude-opus-4-8
+```
 
-Native Google (`@google/genai`) and Mistral adapters · client-key auth + usage log · more
-tools (grep, ls) · branching sessions.
+Windows PowerShell: `$env:ANTHROPIC_API_KEY="sk-ant-..."`.
+
+---
+
+## Using `ada`
+
+```bash
+ada                      # interactive; pick a model on first run
+ada --tui                # inline TUI front-end
+ada --model <id>         # start on a specific model
+ada --list-models        # everything your keys can reach (via the backend)
+ada --continue           # resume the most recent session
+ada --resume             # pick a session to resume
+ada --yolo               # auto-approve tool calls (skip prompts)
+ada -p "fix the build"   # one-shot: print the answer and exit
+```
+
+**Slash commands** (in a session): `/model [id]` · `/models` · `/reasoning low|medium|high|off` ·
+`/plan` · `/run` · `/todos` · `/undo` · `/fork` · `/tree` · `/rewind` · `/compact` · `/context` ·
+`/cost` · `/image <path>` · `/paste` · `/login` · `/logout` · `/exit`.
+
+**Sign in** (optional — identifies you to the backend): run `/login`, choose GitHub or Google, and
+enter the device code in your browser. The token is stored locally and sent as your client key.
+
+## Configuration
+
+**Client** (`ada`):
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `ADA_BACKEND_URL` | `http://localhost:8787/v1` | Where the backend lives |
+| `ADA_CLIENT_KEY` | stored login token, else `dev` | Bearer sent to the backend |
+| `ADA_MODEL` | — | Default model id |
+| `ADA_COMPACT_AT` | `100000` | Token estimate that triggers compaction |
+| `ADA_AUTO_APPROVE` | — | `1` ⇒ behave like `--yolo` |
+| `NO_COLOR` / `ADA_THEME` | — | Disable color / theme overrides |
+
+**Backend** (`ada-server`):
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `ADA_PORT` | `8787` | Listen port |
+| `ADA_CLIENT_KEYS` | *(unset = dev/no-auth)* | Comma-separated allowed client keys |
+| `ADA_REQUIRE_LOGIN` / `ADA_ALLOWED_USERS` | — | Gate access to verified GitHub/Google users |
+| `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | Local Ollama endpoint |
+| *(provider keys)* | — | See the [Providers](#providers) table |
+
+---
+
+## Develop
+
+```bash
+npm run typecheck        # tsc --noEmit
+npm run selfcheck        # offline checks (tools, sessions, routing, parsers, TUI)
+npm start                # run the client from source
+npm run server           # run the backend from source
+```
+
+See **[docs/architecture.md](docs/architecture.md)** for the design (adapters, routing, request flow,
+file layout) and **[MISSING.md](MISSING.md)** for the feature checklist.
+
+## License
+
+Not yet licensed (private repo). Add a `LICENSE` file to set terms — MIT is a common default.

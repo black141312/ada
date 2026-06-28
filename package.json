@@ -4,6 +4,19 @@
   "private": true,
   "type": "module",
   "description": "A coding agent from zero with a Cursor-style routing backend",
+  "bin": {
+    "ada": "bin/ada.mjs",
+    "ada-server": "bin/ada-server.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "tsconfig.json",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "tsx src/client/cli.ts",
     "server": "tsx src/server/index.ts",
@@ -12,11 +25,11 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.106.0",
-    "openai": "^6.45.0"
+    "openai": "^6.45.0",
+    "tsx": "^4.22.4"
   },
   "devDependencies": {
     "@types/node": "^26.0.1",
-    "tsx": "^4.22.4",
     "typescript": "^6.0.3"
   }
 }
