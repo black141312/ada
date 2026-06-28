@@ -1,0 +1,66 @@
+<svg viewBox="0 0 900 430" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, system-ui, sans-serif" role="img" aria-labelledby="t d">
+  <title id="t">ada agent loop</title>
+  <desc id="d">A turn: your message goes to the model, which streams a reply. If it has no tool calls the turn is done. If it does, gated tools prompt for approval, the tools run (read, edit, bash, grep), their results are appended as tool messages, and control returns to the model — repeating until the model stops calling tools.</desc>
+
+  <defs>
+    <marker id="a" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#ffaf00"/></marker>
+  </defs>
+
+  <rect x="6" y="6" width="888" height="418" rx="16" fill="#0d0f12" stroke="#262b33"/>
+  <rect x="34" y="32" width="13" height="13" rx="4" transform="rotate(45 40 38)" fill="#ffaf00"/>
+  <text x="58" y="38" fill="#ffaf00" font-size="16" font-weight="700">ada · agent loop</text>
+  <text x="58" y="57" fill="#9aa3af" font-size="11.5">stream → call tools → feed results back → repeat until done</text>
+
+  <!-- arrows -->
+  <g stroke="#ffaf00" stroke-width="1.6" fill="none">
+    <line x1="192" y1="123" x2="248" y2="123" marker-end="url(#a)"/>
+    <line x1="412" y1="123" x2="498" y2="123" marker-end="url(#a)"/>
+    <line x1="622" y1="123" x2="710" y2="123" marker-end="url(#a)"/>
+    <path d="M560,165 V198 H765 V230" marker-end="url(#a)"/>
+    <line x1="690" y1="262" x2="622" y2="262" marker-end="url(#a)"/>
+    <line x1="470" y1="262" x2="412" y2="262" marker-end="url(#a)"/>
+    <path d="M330,230 V152" marker-end="url(#a)"/>
+  </g>
+  <g font-family="ui-monospace, monospace" font-size="10" fill="#9aa3af">
+    <text x="666" y="113" text-anchor="middle" fill="#7ee08a">no</text>
+    <text x="600" y="190" fill="#ffaf00">yes · tool_calls</text>
+    <text x="338" y="195" fill="#9aa3af">append {role: tool}</text>
+  </g>
+
+  <!-- top row -->
+  <g>
+    <rect x="42" y="95" width="150" height="56" rx="11" fill="#14171c" stroke="#262b33"/>
+    <text x="117" y="120" fill="#e6e9ee" font-size="13" font-weight="600" text-anchor="middle">user message</text>
+    <text x="117" y="138" fill="#9aa3af" font-size="10" text-anchor="middle" font-family="ui-monospace, monospace">your prompt</text>
+
+    <rect x="250" y="95" width="162" height="56" rx="11" fill="#101318" stroke="#262b33"/>
+    <text x="331" y="120" fill="#ffaf00" font-size="13" font-weight="700" text-anchor="middle">model</text>
+    <text x="331" y="138" fill="#9aa3af" font-size="10" text-anchor="middle" font-family="ui-monospace, monospace">stream tokens</text>
+
+    <path d="M560,81 L622,123 L560,165 L498,123 Z" fill="#14171c" stroke="#ffaf00"/>
+    <text x="560" y="120" fill="#e6e9ee" font-size="12" font-weight="600" text-anchor="middle">tool</text>
+    <text x="560" y="135" fill="#e6e9ee" font-size="12" font-weight="600" text-anchor="middle">calls?</text>
+
+    <rect x="712" y="95" width="150" height="56" rx="11" fill="#14171c" stroke="#3fb950"/>
+    <text x="787" y="120" fill="#7ee08a" font-size="13" font-weight="700" text-anchor="middle">reply</text>
+    <text x="787" y="138" fill="#9aa3af" font-size="10" text-anchor="middle" font-family="ui-monospace, monospace">turn done</text>
+  </g>
+
+  <!-- bottom row -->
+  <g>
+    <rect x="250" y="234" width="162" height="56" rx="11" fill="#14171c" stroke="#262b33"/>
+    <text x="331" y="259" fill="#e6e9ee" font-size="13" font-weight="600" text-anchor="middle">feed results</text>
+    <text x="331" y="277" fill="#9aa3af" font-size="10" text-anchor="middle" font-family="ui-monospace, monospace">one per tool call</text>
+
+    <rect x="470" y="234" width="152" height="56" rx="11" fill="#14171c" stroke="#262b33"/>
+    <text x="546" y="259" fill="#e6e9ee" font-size="13" font-weight="600" text-anchor="middle">run tools</text>
+    <text x="546" y="277" fill="#9aa3af" font-size="10" text-anchor="middle" font-family="ui-monospace, monospace">read·edit·bash·grep</text>
+
+    <rect x="690" y="234" width="152" height="56" rx="11" fill="#14171c" stroke="#ff7a59"/>
+    <text x="766" y="259" fill="#ff7a59" font-size="13" font-weight="700" text-anchor="middle">approve</text>
+    <text x="766" y="277" fill="#9aa3af" font-size="10" text-anchor="middle" font-family="ui-monospace, monospace">[y/a/N] · gated</text>
+  </g>
+
+  <text x="450" y="345" fill="#9aa3af" font-size="11" text-anchor="middle" font-family="ui-monospace, monospace">read-only tools never prompt · --yolo auto-approves · only the model's tool_calls drive the loop</text>
+  <text x="450" y="372" fill="#6b7480" font-size="10" text-anchor="middle">a tool call leaked into text as JSON (Ollama-over-stream) is recovered and run, not printed</text>
+</svg>

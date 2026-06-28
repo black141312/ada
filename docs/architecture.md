@@ -28,6 +28,23 @@ billing all belong in one place; the client carries only an ada client key. Same
 4. The backend streams normalized OpenAI SSE chunks back; the client renders text and runs tool
    calls, appending one `{role:"tool", tool_call_id, content}` per call and looping.
 
+## The agent loop
+
+![ada agent loop](agent-loop.svg)
+
+Each turn streams the model's reply; if it contains tool calls, gated ones prompt for approval,
+the tools run, and one `{role:"tool", tool_call_id, content}` per call is appended before control
+returns to the model — looping until the model stops calling tools.
+
+## Sign in (device flow)
+
+![ada login device flow](login-flow.svg)
+
+GitHub/Google login uses the OAuth 2.0 device authorization grant (RFC 8628) — no password ever
+reaches ada. The token is stored locally and sent as the bearer; the backend verifies identity in
+`server/identity.ts`. The GitHub `client_id` is baked in (public, like `gh`), so the client needs
+zero config.
+
 ## One adapter per wire format
 
 The key design decision: adapters are keyed by **wire format**, not by provider or model.
