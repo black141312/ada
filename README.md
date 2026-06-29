@@ -106,8 +106,14 @@ ada -p "fix the build"   # one-shot: print the answer and exit
 ```
 
 **Slash commands** (in a session): `/model [id]` · `/models` · `/reasoning low|medium|high|off` ·
-`/plan` · `/run` · `/todos` · `/undo` · `/fork` · `/tree` · `/rewind` · `/compact` · `/context` ·
-`/cost` · `/image <path>` · `/paste` · `/login` · `/logout` · `/exit`.
+`/strategy react|single|plan|multi|toolsmith` · `/plan` · `/run` · `/todos` · `/undo` · `/fork` ·
+`/tree` · `/rewind` · `/compact` · `/context` · `/cost` · `/image <path>` · `/paste` · `/login` ·
+`/logout` · `/exit`.
+
+**Orchestration strategies** — the harness runs pluggable agent architectures (`--strategy <name>`
+or `/strategy`): `react` (default loop), `single` (one shot), `plan` (plan→execute), `multi`
+(sub-agent fan-out), and `toolsmith` (read a connected integration's docs and have sub-agents author
+skills for it). See [docs/orchestration.md](docs/orchestration.md).
 
 **Sign in** (optional — identifies you to the backend): run `/login`, choose GitHub or Google, and
 enter the device code in your browser. The token is stored locally and sent as your client key.

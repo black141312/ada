@@ -1,16 +1,20 @@
 // The agentic loop. Talks ONLY to the ada backend via the OpenAI SDK; the backend
 // routes to the real provider. Streams text, runs tool calls, persists every message.
 
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import type OpenAI from "openai";
 import { compact, estimateTokens, isContextOverflowError } from "./compaction.ts";
 import { MarkdownStreamer } from "./render.ts";
 import { type Tool, type ToolResult, isDestructive, toolByName, tools } from "./tools.ts";
 import { afterTool, beforeTool, transformInput } from "./hooks.ts";
+import { configuredServers } from "./mcp.ts";
 import { Session } from "./session.ts";
 
 type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
+type SendCtrl = { signal?: AbortSignal; steer?: string[]; quiet?: boolean; images?: string[]; onReplyStart?: () => void };
+type ToolCall = { id: string; name: string; args: string };
+type StepResult = { content: string; toolCalls: ToolCall[] };
 type ToolDef = OpenAI.Chat.Completions.ChatCompletionTool;
 
 export type ApprovalDecision = "yes" | "all" | "no";
@@ -120,6 +124,175 @@ const COMPACT_AT = Number(process.env.ADA_COMPACT_AT) || 100_000;
 const PLAN_NOTE =
   "PLAN MODE: do not write, edit, or run commands. Investigate with read-only tools if needed, then present a concise numbered plan and stop. The user will approve before you execute.";
 
+const DECOMPOSE_NOTE =
+  "Break the user's request into 2-5 independent subtasks that can each be done on their own. Output one subtask per line — nothing else.";
+
+// ---- orchestration: pluggable agent architectures over a shared Engine ----
+// The Engine holds the harness primitives (streaming, tool-call recovery, compaction, approval,
+// sessions). An Orchestrator is a Strategy that only decides WHEN to call those primitives, so a
+// new agent architecture is one Orchestrator and zero changes to the engine.
+
+/** The harness primitives a strategy composes. */
+export interface Engine {
+  step(opts?: { allowTools?: boolean; note?: string }): Promise<StepResult | null>; // null = aborted
+  runTools(calls: ToolCall[]): Promise<void>;
+  say(s: string): void;
+  interrupted(): void;
+  addSystem(text: string): void;
+  aborted(): boolean;
+  drainSteer(): boolean;
+  spawn(prompt: string): Promise<string>;
+  soleIntegration(): string | null;
+  readDocs(name: string): Promise<string>;
+  writeSkills(drafts: { name: string; content: string }[]): Promise<number>;
+}
+
+export interface Orchestrator {
+  readonly name: string;
+  run(e: Engine): Promise<void>;
+}
+
+const reAct: Orchestrator = {
+  name: "react", // reason → act → observe → repeat (the default; = the original loop)
+  async run(e) {
+    for (;;) {
+      const turn = await e.step();
+      if (!turn) return;
+      if (!turn.toolCalls.length) {
+        e.say("\n");
+        if (e.drainSteer()) continue;
+        return;
+      }
+      await e.runTools(turn.toolCalls);
+      if (e.aborted()) {
+        e.interrupted();
+        return;
+      }
+      e.drainSteer();
+    }
+  },
+};
+
+const singleShot: Orchestrator = {
+  name: "single", // one model turn, no tools — quick Q&A
+  async run(e) {
+    if (await e.step({ allowTools: false })) e.say("\n");
+  },
+};
+
+const planExecute: Orchestrator = {
+  name: "plan", // read-only plan first, then execute it
+  async run(e) {
+    if (!(await e.step({ allowTools: false, note: PLAN_NOTE }))) return;
+    e.addSystem("Now execute the plan above, step by step, using your tools.");
+    for (;;) {
+      const turn = await e.step();
+      if (!turn) return;
+      if (!turn.toolCalls.length) {
+        e.say("\n");
+        return;
+      }
+      await e.runTools(turn.toolCalls);
+      if (e.aborted()) {
+        e.interrupted();
+        return;
+      }
+    }
+  },
+};
+
+const splitLines = (s: string): string[] =>
+  s
+    .split("\n")
+    .map((l) => l.replace(/^[-*\d.)\s]+/, "").trim())
+    .filter((l) => l.length > 1);
+
+const multiAgent: Orchestrator = {
+  name: "multi", // decompose → fan out to subagents → synthesize
+  async run(e) {
+    const plan = await e.step({ allowTools: false, note: DECOMPOSE_NOTE });
+    if (!plan) return;
+    const tasks = splitLines(plan.content).filter((t) => t.length > 8);
+    if (!tasks.length) {
+      e.say("\n");
+      return;
+    }
+    e.say(`\n\x1b[2m• delegating ${tasks.length} subtasks\x1b[0m\n`);
+    const results = await Promise.all(tasks.map((t) => e.spawn(t)));
+    e.addSystem(`Subagent results:\n\n${results.map((r, i) => `### ${tasks[i]}\n${r}`).join("\n\n")}\n\nSynthesize the final answer for the user.`);
+    await e.step({ allowTools: false });
+    e.say("\n");
+  },
+};
+
+const toolsmith: Orchestrator = {
+  name: "toolsmith", // read the lone integration's docs → subagents author skills for it
+  async run(e) {
+    const integ = e.soleIntegration();
+    if (!integ) {
+      e.say("\x1b[33mtoolsmith needs exactly one integration configured (ada mcp add <name>).\x1b[0m\n");
+      return;
+    }
+    e.say(`\x1b[2m• reading ${integ} docs…\x1b[0m\n`);
+    const docs = await e.readDocs(integ);
+    const plan = await e.step({
+      allowTools: false,
+      note: `These are the ${integ} integration's capabilities:\n\n${docs}\n\nList 4-8 capability AREAS to build skills for — one short kebab-case slug per line, nothing else.`,
+    });
+    if (!plan) return;
+    const areas = splitLines(plan.content)
+      .map((a) => a.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, ""))
+      .filter((a) => a.length > 1)
+      .slice(0, 8);
+    if (!areas.length) {
+      e.say("\x1b[33mtoolsmith: could not derive capability areas from the docs.\x1b[0m\n");
+      return;
+    }
+    e.say(`\x1b[2m• ${integ}: ${areas.join(", ")}\x1b[0m\n`);
+    const drafts = await Promise.all(
+      areas.map(async (area) => ({
+        name: `${integ}-${area}`,
+        content: await e.spawn(
+          `Write an ada SKILL.md for the "${integ}" integration's "${area}" capability. Output ONLY the file, in EXACTLY this format:\n` +
+            `---\nname: ${integ}-${area}\ndescription: <one imperative line, <=110 chars>\ncategory: integration-${integ}\n---\n\n# <Title>\n\n<one-sentence intro>\n\n1. <step>\n... (4-6 steps that reference the relevant ${integ}__* tools)\n\n## Rules\n- <3-5 rules>\n\n` +
+            `Base it strictly on these ${integ} tools:\n${docs}`,
+        ),
+      })),
+    );
+    const n = await e.writeSkills(drafts);
+    e.say(`\n\x1b[38;5;214m✓\x1b[0m toolsmith wrote ${n} ${integ} skills → .ada/skills/  (browse: list_skills category=integration-${integ})\n`);
+  },
+};
+
+const ORCHESTRATORS: Record<string, Orchestrator> = { react: reAct, single: singleShot, plan: planExecute, multi: multiAgent, toolsmith };
+
+/** The only integration configured in .ada/mcp.json, or null if zero or several. */
+function soleIntegration(): string | null {
+  const servers = configuredServers();
+  return servers.length === 1 ? servers[0]! : null;
+}
+
+/** "Docs" for an integration = the descriptions + schemas of its registered <name>__* tools. */
+function readIntegrationDocs(name: string): string {
+  const tools_ = [...toolByName.values()].filter((t) => t.name.startsWith(`${name}__`));
+  if (!tools_.length) return `(no tools registered for "${name}" — connect it in a trusted project first)`;
+  return tools_.map((t) => `## ${t.name}\n${t.description}\nparameters: ${JSON.stringify(t.parameters)}`).join("\n\n");
+}
+
+/** Persist subagent-authored skills under the project's .ada/skills/. Returns how many were written. */
+function writeProjectSkills(drafts: { name: string; content: string }[]): number {
+  let n = 0;
+  for (const d of drafts) {
+    const body = String(d.content ?? "").trim();
+    if (!body.startsWith("---")) continue; // skip non-skill output
+    const dir = resolve(process.cwd(), ".ada", "skills", d.name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "SKILL.md"), `${body}\n`);
+    n++;
+  }
+  return n;
+}
+
 // $ per 1M tokens [input, output] for a few common models; substring-matched.
 const PRICES: Record<string, [number, number]> = {
   "gpt-4o-mini": [0.15, 0.6],
@@ -183,6 +356,7 @@ export class Agent {
   private promptTokens = 0;
   private completionTokens = 0;
   private lastAssistant = "";
+  private strategy = "react"; // orchestration architecture (see ORCHESTRATORS)
 
   constructor(opts: {
     client: OpenAI;
@@ -208,6 +382,14 @@ export class Agent {
 
   setModel(m: string): void {
     this.model = m;
+  }
+
+  setStrategy(s: string): void {
+    this.strategy = s;
+  }
+
+  getStrategy(): string {
+    return this.strategy;
   }
 
   setOnApprove(fn: OnApprove): void {
@@ -238,11 +420,7 @@ export class Agent {
     return `Rewound ${removed} message(s); context now ~${estimateTokens(this.messages)} est. tokens.`;
   }
 
-  async send(
-    input: string,
-    ctrl?: { signal?: AbortSignal; steer?: string[]; quiet?: boolean; images?: string[]; onReplyStart?: () => void },
-  ): Promise<string> {
-    const signal = ctrl?.signal;
+  async send(input: string, ctrl?: SendCtrl): Promise<string> {
     let replyStarted = false;
     const say = (s: string): void => {
       if (ctrl?.quiet) return;
@@ -276,19 +454,58 @@ export class Agent {
 
     if (estimateTokens(this.messages) > this.compactAt) await this.autoCompact("size threshold");
 
+    const engine = this.makeEngine(ctrl, say, interrupted, drainSteer);
+    await (ORCHESTRATORS[this.strategy] ?? reAct).run(engine);
+    return this.lastAssistant;
+  }
+
+  // ---- Engine: the harness primitives an Orchestrator composes ----
+
+  private makeEngine(ctrl: SendCtrl | undefined, say: (s: string) => void, interrupted: () => void, drainSteer: () => boolean): Engine {
+    const signal = ctrl?.signal;
+    return {
+      step: (opts) => this.modelTurn(ctrl, say, interrupted, opts),
+      runTools: (calls) => this.execTools(calls, ctrl, say),
+      say,
+      interrupted,
+      addSystem: (text) => {
+        const m: Msg = { role: "system", content: text };
+        this.messages.push(m);
+        this.session.append(m);
+      },
+      aborted: () => !!signal?.aborted,
+      drainSteer,
+      spawn: (prompt) => this.spawnSub(prompt),
+      soleIntegration,
+      readDocs: async (name) => readIntegrationDocs(name),
+      writeSkills: async (drafts) => writeProjectSkills(drafts),
+    };
+  }
+
+  /** A fresh, headless sub-agent (autoApprove, quiet). Returns its final text. */
+  private async spawnSub(prompt: string): Promise<string> {
+    const sub = new Agent({ client: this.client, model: this.model, session: Session.create(), onApprove: this.onApprove, autoApprove: true, project: false });
+    return sub.send(prompt, { quiet: true });
+  }
+
+  /** One model turn: stream, collect content + tool calls (recovering leaked ones), push the
+   *  assistant message. Returns null if interrupted. Retries once on context overflow. */
+  private async modelTurn(ctrl: SendCtrl | undefined, say: (s: string) => void, interrupted: () => void, opts?: { allowTools?: boolean; note?: string }): Promise<StepResult | null> {
+    const signal = ctrl?.signal;
+    if (signal?.aborted) {
+      interrupted();
+      return null;
+    }
+    const note = opts?.note ?? (this.planMode ? PLAN_NOTE : null);
     let overflowRetried = false;
     for (;;) {
-      if (signal?.aborted) {
-        interrupted();
-        return this.lastAssistant;
-      }
       const create = () =>
         this.client.chat.completions.create(
           {
             model: this.model,
-            messages: this.planMode ? [...this.messages, { role: "system", content: PLAN_NOTE }] : this.messages,
+            messages: note ? [...this.messages, { role: "system", content: note }] : this.messages,
             tools: this.apiTools,
-            tool_choice: "auto",
+            tool_choice: opts?.allowTools === false ? "none" : "auto",
             stream: true,
             stream_options: { include_usage: true },
             ...(this.reasoning ? { reasoning_effort: this.reasoning } : {}),
@@ -301,7 +518,7 @@ export class Agent {
       } catch (e) {
         if (signal?.aborted) {
           interrupted();
-          return this.lastAssistant;
+          return null;
         }
         if (!overflowRetried && isContextOverflowError(e)) {
           overflowRetried = true;
@@ -347,9 +564,8 @@ export class Agent {
       } catch (e) {
         say(md.end());
         if (signal?.aborted) {
-          // drop the partial assistant message; the user turn stands on its own
           interrupted();
-          return this.lastAssistant;
+          return null;
         }
         throw e;
       }
@@ -378,95 +594,89 @@ export class Agent {
       this.messages.push(assistantMsg);
       this.session.append(assistantMsg);
       this.lastAssistant = content;
+      return { content, toolCalls };
+    }
+  }
 
-      if (!toolCalls.length) {
-        say("\n");
-        if (drainSteer()) continue; // user steered after the answer → keep going
-        return this.lastAssistant;
+  /** Run a turn's tool calls (read-only in parallel, gated ones sequentially with approval) and
+   *  append one tool message per call. */
+  private async execTools(toolCalls: ToolCall[], ctrl: SendCtrl | undefined, say: (s: string) => void): Promise<void> {
+    const signal = ctrl?.signal;
+    const printCall = (name: string, args: Record<string, unknown>): void => {
+      say(`\n\x1b[2m• ${name} ${summarize(args)}\x1b[0m\n`);
+    };
+    const printResult = (r: ToolResult): void => {
+      if (r.display) say(`${r.display}\n`);
+      else if (r.isError) say(`\x1b[31m  ${r.output.split("\n")[0]}\x1b[0m\n`);
+    };
+    const argsOf = (s: string): Record<string, unknown> => {
+      try {
+        return JSON.parse(s || "{}");
+      } catch {
+        return {};
       }
+    };
+    const runTool = async (tool: Tool, name: string, a: Record<string, unknown>): Promise<ToolResult> => {
+      const pre = await beforeTool(name, a);
+      if (pre.deny) return { output: pre.deny };
+      return afterTool(name, pre.args, await safeRun(tool, pre.args));
+    };
 
-      const printCall = (name: string, args: Record<string, unknown>): void => {
-        say(`\n\x1b[2m• ${name} ${summarize(args)}\x1b[0m\n`);
-      };
-      const printResult = (r: ToolResult): void => {
-        if (r.display) say(`${r.display}\n`);
-        else if (r.isError) say(`\x1b[31m  ${r.output.split("\n")[0]}\x1b[0m\n`);
-      };
-      const argsOf = (s: string): Record<string, unknown> => {
-        try {
-          return JSON.parse(s || "{}");
-        } catch {
-          return {};
+    const results = new Array<ToolResult>(toolCalls.length);
+    const parallel: number[] = []; // read-only tools — safe to run concurrently
+    for (let i = 0; i < toolCalls.length; i++) {
+      const c = toolCalls[i]!;
+      const args = argsOf(c.args);
+      const tool = toolByName.get(c.name);
+      if (signal?.aborted) {
+        results[i] = { output: "[interrupted by user]" }; // keep every tool_call paired with a result
+        continue;
+      }
+      if (!tool) {
+        printCall(c.name, args);
+        results[i] = { output: `Unknown tool: ${c.name}`, isError: true };
+        continue;
+      }
+      if (!tool.needsApproval) {
+        parallel.push(i);
+        continue;
+      }
+      // gated tool → sequential (so approval prompts and same-file writes don't race)
+      printCall(c.name, args);
+      if (this.planMode) {
+        results[i] = { output: "Plan mode: not executing — finish the plan; the user approves with /run." };
+        printResult(results[i]!);
+        continue;
+      }
+      const forceConfirm = c.name === "bash" && isDestructive(String(args.command ?? ""));
+      if (this.autoApprove && !forceConfirm) {
+        results[i] = await runTool(tool, c.name, args);
+      } else {
+        const decision = await this.onApprove(c.name, forceConfirm ? `⚠ destructive: ${summarize(args)}` : summarize(args));
+        if (decision === "all") {
+          this.autoApprove = true;
+          results[i] = await runTool(tool, c.name, args);
+        } else if (decision === "no") {
+          results[i] = { output: "Denied by user." };
+        } else {
+          results[i] = await runTool(tool, c.name, args);
         }
-      };
-      const runTool = async (tool: Tool, name: string, a: Record<string, unknown>): Promise<ToolResult> => {
-        const pre = await beforeTool(name, a);
-        if (pre.deny) return { output: pre.deny };
-        return afterTool(name, pre.args, await safeRun(tool, pre.args));
-      };
-
-      const results = new Array<ToolResult>(toolCalls.length);
-      const parallel: number[] = []; // read-only tools — safe to run concurrently
-      for (let i = 0; i < toolCalls.length; i++) {
+      }
+      printResult(results[i]!);
+    }
+    await Promise.all(
+      parallel.map(async (i) => {
         const c = toolCalls[i]!;
         const args = argsOf(c.args);
-        const tool = toolByName.get(c.name);
-        if (signal?.aborted) {
-          results[i] = { output: "[interrupted by user]" }; // keep every tool_call paired with a result
-          continue;
-        }
-        if (!tool) {
-          printCall(c.name, args);
-          results[i] = { output: `Unknown tool: ${c.name}`, isError: true };
-          continue;
-        }
-        if (!tool.needsApproval) {
-          parallel.push(i);
-          continue;
-        }
-        // gated tool → sequential (so approval prompts and same-file writes don't race)
         printCall(c.name, args);
-        if (this.planMode) {
-          results[i] = { output: "Plan mode: not executing — finish the plan; the user approves with /run." };
-          printResult(results[i]!);
-          continue;
-        }
-        const forceConfirm = c.name === "bash" && isDestructive(String(args.command ?? ""));
-        if (this.autoApprove && !forceConfirm) {
-          results[i] = await runTool(tool, c.name, args);
-        } else {
-          const decision = await this.onApprove(c.name, forceConfirm ? `⚠ destructive: ${summarize(args)}` : summarize(args));
-          if (decision === "all") {
-            this.autoApprove = true;
-            results[i] = await runTool(tool, c.name, args);
-          } else if (decision === "no") {
-            results[i] = { output: "Denied by user." };
-          } else {
-            results[i] = await runTool(tool, c.name, args);
-          }
-        }
+        results[i] = await runTool(toolByName.get(c.name)!, c.name, args);
         printResult(results[i]!);
-      }
-      await Promise.all(
-        parallel.map(async (i) => {
-          const c = toolCalls[i]!;
-          const args = argsOf(c.args);
-          printCall(c.name, args);
-          results[i] = await runTool(toolByName.get(c.name)!, c.name, args);
-          printResult(results[i]!);
-        }),
-      );
-      for (let i = 0; i < toolCalls.length; i++) {
-        const toolMsg: Msg = { role: "tool", tool_call_id: toolCalls[i]!.id, content: results[i]!.output };
-        this.messages.push(toolMsg);
-        this.session.append(toolMsg);
-      }
-
-      if (signal?.aborted) {
-        interrupted();
-        return this.lastAssistant;
-      }
-      drainSteer(); // inject any steered messages before the next turn
+      }),
+    );
+    for (let i = 0; i < toolCalls.length; i++) {
+      const toolMsg: Msg = { role: "tool", tool_call_id: toolCalls[i]!.id, content: results[i]!.output };
+      this.messages.push(toolMsg);
+      this.session.append(toolMsg);
     }
   }
 

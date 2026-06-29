@@ -54,6 +54,7 @@ interface Flags {
   json?: boolean;
   rpc?: boolean;
   tui?: boolean;
+  strategy?: string;
 }
 
 function parseArgs(argv: string[]): Flags {
@@ -77,6 +78,8 @@ function parseArgs(argv: string[]): Flags {
       f.rpc = true;
     } else if (a === "--tui") {
       f.tui = true;
+    } else if (a === "--strategy") {
+      f.strategy = argv[++i];
     }
   }
   return f;
@@ -529,6 +532,7 @@ async function main(): Promise<void> {
       project: trusted,
       compactAt: settings.compactAt,
     });
+    if (flags.strategy) agent.setStrategy(flags.strategy);
     const text = await agent.send(flags.print, { quiet: !!flags.json });
     if (flags.json) console.log(JSON.stringify({ model: pm, text, usage: agent.usageReport() }));
     return;
@@ -637,6 +641,7 @@ async function main(): Promise<void> {
     compactAt: settings.compactAt,
     history,
   });
+  if (flags.strategy) agent.setStrategy(flags.strategy);
 
   if (flags.tui && stdin.isTTY) {
     rl.close(); // hand stdin to the TUI so readline doesn't echo keystrokes too
@@ -750,6 +755,16 @@ async function main(): Promise<void> {
         console.log("reasoning → off");
       } else {
         console.log(`reasoning: ${agent.reasoning ?? "off"} (set: low | medium | high | off)`);
+      }
+      continue;
+    }
+    if (line === "/strategy" || line.startsWith("/strategy ")) {
+      const v = line.slice("/strategy".length).trim();
+      if (v) {
+        agent.setStrategy(v);
+        console.log(`strategy → ${v}`);
+      } else {
+        console.log(`strategy: ${agent.getStrategy()} (react | single | plan | multi | toolsmith)`);
       }
       continue;
     }

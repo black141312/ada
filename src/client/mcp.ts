@@ -234,6 +234,11 @@ export function removeConnector(name: string): boolean {
   return true;
 }
 
+/** Names of the servers currently configured in .ada/mcp.json. */
+export function configuredServers(): string[] {
+  return Object.keys(readConfig().servers);
+}
+
 /** The catalog annotated with whether each connector is already in .ada/mcp.json. */
 export function listConnectors(): { name: string; description: string; configured: boolean; needsEnv: string[] }[] {
   const cfg = readConfig();
