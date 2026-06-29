@@ -26,8 +26,13 @@ model is **zero code**, and a new OpenAI-compatible provider is **two lines**.
   progress output behave; ANSI is stripped from what the model sees.
 - **Two front-ends** — a classic readline REPL and an inline **TUI** (`--tui`) with a live "thinking"
   spinner and Claude-style turn markers.
-- **Plan mode**, **todos**, **checkpoint/undo** (revert the agent's edits), **protected paths** +
-  destructive-command confirmation, and **subagents** (`spawn_agent`).
+- **Permission modes — ask / plan / auto** — `/ask` confirms each tool, `/plan` is read-only (ada
+  plans, `/run` to execute), `/auto` runs freely (destructive `bash` still confirms). Each approval
+  states in plain words what it wants ("ada wants to run a shell command…") instead of raw args.
+- **Skills that actually fire** — ~285 built-in skills; ada routes every request and **auto-applies**
+  a clearly-matching one (injecting its procedure), or suggests skills to load. See [Skills](#skills).
+- **todos**, **checkpoint/undo** (revert the agent's edits), **protected paths**, **git worktrees**,
+  **workspace snapshots** (`/snapshot` `/restore`), **named agents**, and **subagents** (`spawn_agent`).
 - **Sessions** — every turn is persisted; `--continue` / `--resume` to pick up where you left off.
 - **Context compaction** — summarizes old turns automatically as context grows.
 - **Sign in with GitHub or Google** (RFC 8628 device flow) — zero client config.
@@ -113,10 +118,17 @@ ada --yolo               # auto-approve tool calls (skip prompts)
 ada -p "fix the build"   # one-shot: print the answer and exit
 ```
 
-**Slash commands** (in a session): `/model [id]` · `/models` · `/reasoning low|medium|high|off` ·
-`/strategy react|single|plan|multi|toolsmith` · `/agent [name]` · `/plan` · `/run` · `/todos` ·
-`/undo` · `/snapshot` · `/restore` · `/jobs` · `/fork` · `/tree` · `/rewind` · `/compact` ·
-`/context` · `/cost` · `/image <path>` · `/paste` · `/login` · `/logout` · `/exit`.
+**Slash commands** (in a session): `/ask` · `/plan` · `/auto` · `/mode` (cycle the permission mode) ·
+`/run` · `/model [id]` · `/models` · `/reasoning low|medium|high|off` ·
+`/strategy react|single|plan|multi|toolsmith` · `/agent [name]` · `/todos` · `/undo` · `/snapshot` ·
+`/restore` · `/jobs` · `/fork` · `/tree` · `/rewind` · `/compact` · `/context` · `/cost` ·
+`/image <path>` · `/paste` · `/login` · `/logout` · `/exit`.
+
+**Permission modes** — switch with `/ask` · `/plan` · `/auto` (or `/mode` to cycle); the current mode
+shows in the prompt line. In **ask** mode each gated tool prompts with what it wants in plain words
+(`ada wants to run a shell command…`) and one key: `[y]es` · `[a]uto` (run the rest without asking) ·
+`[p]lan` · `[n]o`. **plan** is read-only — ada plans but won't edit; `/run` approves and executes.
+**auto** runs tools without asking (destructive `bash` still confirms). `--yolo` starts in **auto**.
 
 **Subcommands:** `ada mcp …` (connectors) · `ada skill add <url>` · `ada worktree add <name>` ·
 `ada serve` (HTTP API) · `ada share` (view a session) · `ada acp` (editor bridge). See
@@ -132,12 +144,13 @@ enter the device code in your browser. The token is stored locally and sent as y
 
 ## Skills
 
-ada ships with **~200 built-in skills** across 28 categories — specialized instructions the model
-pulls in only when a task needs them (progressive disclosure). ada **routes** each request to the
-likely skills (a relevance ranker over names + descriptions) and surfaces them automatically; the
-model can also browse with **`list_skills`** (by `category`/`filter`), search with **`find_skill`**
-(ranked), and load one with **`use_skill`** — so nothing bloats the prompt until it's used. A sample
-of the categories:
+ada ships with **~285 built-in skills** across ~30 categories — specialized instructions the model
+pulls in only when a task needs them (progressive disclosure). ada **routes** every request with a
+relevance ranker over names + descriptions: when one skill clearly fits, ada **auto-applies** it —
+injecting its procedure so even a weak model follows it (announced as `↳ skill: <name>`); when the
+match is ambiguous it just suggests them. The model can also browse with **`list_skills`** (by
+`category`/`filter`), search with **`find_skill`** (ranked), and load one with **`use_skill`** — so
+nothing bloats the prompt until it's used. A sample of the categories:
 
 `git` · `review` · `testing` · `debugging` · `refactoring` · `docs` · `security` · `ci-cd` ·
 `performance` · `database` · `api` · `frontend` · `ui-design` · `html` · `pptx` · `image` ·
@@ -145,7 +158,7 @@ of the categories:
 `agent-llm` · `web3` · `networking` · `shell` · `connectors` · `compliance` · …
 
 Examples: `commit`, `code-review`, `dockerize`, `migration`, `react-hooks`, `terraform-module`,
-`rag-pipeline`, `security-audit`, `ponytail`.
+`rag-pipeline`, `security-audit`, `project-overview`, `architecture-diagram`, `graphify`, `ponytail`.
 
 Add your own as `SKILL.md` files under `.ada/skills/<name>/` (project) or `~/.ada/skills/<name>/`
 (global) — `---\ndescription: …\ncategory: …\n---` front-matter is all that's required. Project
@@ -199,8 +212,9 @@ npm start                # run the client from source
 npm run server           # run the backend from source
 ```
 
-See **[docs/architecture.md](docs/architecture.md)** for the design (adapters, routing, request flow,
-file layout) and **[MISSING.md](MISSING.md)** for the feature checklist.
+See **[docs/architecture.md](docs/architecture.md)** for the design (adapters, routing, request
+flow, file layout), **[docs/orchestration.md](docs/orchestration.md)** for the agent strategies, and
+**[docs/integrations.md](docs/integrations.md)** for the HTTP API / SDK / ACP.
 
 ## License
 
