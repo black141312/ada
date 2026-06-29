@@ -7,7 +7,7 @@ import { dirname, extname, join, relative, resolve } from "node:path";
 import { green, renderEditDiff } from "./render.ts";
 import * as checkpoint from "./checkpoint.ts";
 import { renderTodos, setTodos, type Todo } from "./todos.ts";
-import { loadSettings } from "./settings.ts";
+import { isTrusted, loadSettings } from "./settings.ts";
 
 const MAX_OUTPUT = 30_000;
 
@@ -48,6 +48,44 @@ export function htmlToText(html: string): string {
     .replace(/[ \t]+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+// Auto-format a just-written file with a discovered project formatter (best-effort).
+// Trust-gated (same gate as extensions/MCP) so a repo can't auto-run a trojan local formatter.
+const FORMATTERS: { exts: string[]; bin: string; args: (f: string) => string[] }[] = [
+  { exts: [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".jsonc", ".css", ".scss", ".less", ".html", ".md", ".mdx", ".yaml", ".yml", ".vue", ".svelte", ".graphql"], bin: "prettier", args: (f) => ["--write", f] },
+  { exts: [".go"], bin: "gofmt", args: (f) => ["-w", f] },
+  { exts: [".rs"], bin: "rustfmt", args: (f) => [f] },
+  { exts: [".py"], bin: "ruff", args: (f) => ["format", "-q", f] },
+  { exts: [".sh", ".bash"], bin: "shfmt", args: (f) => ["-w", f] },
+];
+const binCache = new Map<string, string | null>();
+function findBin(bin: string): string | null {
+  const cached = binCache.get(bin);
+  if (cached !== undefined) return cached;
+  let found: string | null = null;
+  const local = resolve(process.cwd(), "node_modules", ".bin", process.platform === "win32" ? `${bin}.cmd` : bin);
+  if (existsSync(local)) found = local;
+  else {
+    const probe = spawnSync(process.platform === "win32" ? "where" : "which", [bin], { encoding: "utf8" });
+    if (probe.status === 0 && (probe.stdout ?? "").trim()) found = bin;
+  }
+  binCache.set(bin, found);
+  return found;
+}
+
+/** Format `abs` in place with a discovered formatter. No-op (returns false) if untrusted, disabled,
+ *  or no formatter is available for the extension. Never throws. */
+export function formatFile(abs: string): boolean {
+  if (process.env.ADA_NO_FORMAT || !isTrusted(process.cwd())) return false;
+  const ext = extname(abs).toLowerCase();
+  const fmt = FORMATTERS.find((f) => f.exts.includes(ext) && findBin(f.bin));
+  if (!fmt) return false;
+  try {
+    return spawnSync(findBin(fmt.bin)!, fmt.args(abs), { timeout: 10_000, encoding: "utf8", shell: process.platform === "win32" }).status === 0;
+  } catch {
+    return false;
+  }
 }
 
 /** Block localhost / private / metadata hosts (basic SSRF guard for web_fetch). */
@@ -171,9 +209,10 @@ export const tools: Tool[] = [
         try {
           mkdirSync(dirname(abs), { recursive: true });
           writeFileSync(abs, content, "utf8");
+          const formatted = formatFile(abs);
           return {
-            output: `Wrote ${content.length} bytes to ${String(args.path)}`,
-            display: green(`+ ${String(args.path)} (${content.length} bytes written)`),
+            output: `Wrote ${content.length} bytes to ${String(args.path)}${formatted ? " (auto-formatted)" : ""}`,
+            display: green(`+ ${String(args.path)} (${content.length} bytes written)${formatted ? " · formatted" : ""}`),
           };
         } catch (e) {
           return { output: String(e), isError: true };
@@ -244,8 +283,9 @@ export const tools: Tool[] = [
         } catch (e) {
           return { output: String(e), isError: true };
         }
+        const formatted = formatFile(abs);
         const label = list.length > 1 ? `${list.length} changes` : "1 change";
-        return { output: `Edited ${String(args.path)} (${label})`, display: renderEditDiff(String(args.path), list[0]!.old, list[0]!.neu) };
+        return { output: `Edited ${String(args.path)} (${label})${formatted ? " · auto-formatted" : ""}`, display: renderEditDiff(String(args.path), list[0]!.old, list[0]!.neu) };
       });
     },
   },
