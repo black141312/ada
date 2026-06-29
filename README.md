@@ -114,9 +114,13 @@ ada -p "fix the build"   # one-shot: print the answer and exit
 ```
 
 **Slash commands** (in a session): `/model [id]` · `/models` · `/reasoning low|medium|high|off` ·
-`/strategy react|single|plan|multi|toolsmith` · `/plan` · `/run` · `/todos` · `/undo` · `/fork` ·
-`/tree` · `/rewind` · `/compact` · `/context` · `/cost` · `/image <path>` · `/paste` · `/login` ·
-`/logout` · `/exit`.
+`/strategy react|single|plan|multi|toolsmith` · `/agent [name]` · `/plan` · `/run` · `/todos` ·
+`/undo` · `/snapshot` · `/restore` · `/jobs` · `/fork` · `/tree` · `/rewind` · `/compact` ·
+`/context` · `/cost` · `/image <path>` · `/paste` · `/login` · `/logout` · `/exit`.
+
+**Subcommands:** `ada mcp …` (connectors) · `ada skill add <url>` · `ada worktree add <name>` ·
+`ada serve` (HTTP API) · `ada share` (view a session) · `ada acp` (editor bridge). See
+[docs/integrations.md](docs/integrations.md) for the HTTP API, the typed SDK, and ACP.
 
 **Orchestration strategies** — the harness runs pluggable agent architectures (`--strategy <name>`
 or `/strategy`): `react` (default loop), `single` (one shot), `plan` (plan→execute), `multi`

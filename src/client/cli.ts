@@ -62,6 +62,29 @@ interface Flags {
   agent?: string;
 }
 
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c] ?? c);
+}
+
+/** Render a session transcript as a self-contained HTML page (for `ada share`). */
+function renderTranscript(title: string, messages: Array<{ role?: string; content?: unknown }>): string {
+  const body = messages
+    .map((m) => {
+      const c = m.content;
+      const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (p as { text?: string }).text ?? "[image]").join("") : c == null ? "" : JSON.stringify(c);
+      if (!text.trim()) return "";
+      return `<div class="msg ${m.role ?? ""}"><div class="role">${escapeHtml(m.role ?? "")}</div><pre>${escapeHtml(text)}</pre></div>`;
+    })
+    .join("\n");
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)} · ada</title><style>
+body{background:#0d0f12;color:#e6e9ee;font:14px/1.6 ui-sans-serif,system-ui,sans-serif;max-width:820px;margin:0 auto;padding:32px}
+h1{color:#ffaf00;font-size:18px}.msg{margin:16px 0;border-left:3px solid #262b33;padding-left:14px}
+.msg.user{border-color:#ffaf00}.msg.assistant{border-color:#3fb950}.msg.tool{border-color:#82aaff}
+.role{font:600 11px ui-monospace,monospace;color:#9aa3af;text-transform:uppercase;margin-bottom:4px}
+pre{margin:0;white-space:pre-wrap;font:13px/1.6 ui-monospace,monospace;color:#c5cdd6}
+</style></head><body><h1>◆ ${escapeHtml(title)}</h1>${body}</body></html>`;
+}
+
 /** Activate a named agent profile (prompt + permission rules) from settings. Returns false if unknown. */
 function switchAgent(agent: Agent, name: string, settings: Settings): boolean {
   const profile = settings.agents?.[name];
@@ -525,6 +548,76 @@ async function main(): Promise<void> {
     }
     console.error("usage: ada skill [list | add <url>]");
     process.exit(1);
+  }
+  if (sub === "acp") {
+    // Minimal Agent Client Protocol bridge over stdio (JSON-RPC 2.0, newline-delimited). Scaffold:
+    // handles initialize + prompt so an ACP-aware editor can drive ada. Extend method names/framing
+    // to match your client's ACP version.
+    const trusted = isTrusted(process.cwd());
+    const settings = loadSettings(trusted);
+    await loadExtensions(trusted);
+    registerSkillTool(loadSkills(trusted));
+    await loadMcpServers(trusted);
+    const client = makeClient();
+    let model = process.env.ADA_MODEL || settings.model || "";
+    if (!model) {
+      try {
+        model = (await fetchModelIds(client))[0] ?? "";
+      } catch {
+        /* offline */
+      }
+    }
+    const agent = new Agent({ client, model, session: Session.create(), onApprove: async (): Promise<ApprovalDecision> => "yes", autoApprove: true, project: trusted, compactAt: settings.compactAt });
+    const send = (msg: object): void => void stdout.write(`${JSON.stringify(msg)}\n`);
+    let buf = "";
+    stdin.on("data", async (d) => {
+      buf += d.toString("utf8");
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let msg: { id?: number; method?: string; params?: Record<string, unknown> };
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (msg.method === "initialize") send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: {} } } });
+        else if (msg.method === "session/new" || msg.method === "newSession") send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "ada" } });
+        else if (msg.method === "session/prompt" || msg.method === "prompt") {
+          const p = msg.params ?? {};
+          const blocks = (p.prompt ?? p.text) as unknown;
+          const text = Array.isArray(blocks) ? blocks.map((b) => (b as { text?: string }).text ?? "").join("") : String(blocks ?? "");
+          try {
+            const out = await agent.send(text, { quiet: true });
+            send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn", content: [{ type: "text", text: out }] } });
+          } catch (e) {
+            send({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: e instanceof Error ? e.message : String(e) } });
+          }
+        } else if (msg.id != null) send({ jsonrpc: "2.0", id: msg.id, result: {} });
+      }
+    });
+    await new Promise(() => {});
+    return;
+  }
+  if (sub === "share") {
+    const arg = process.argv[3];
+    const metas = list();
+    const meta = arg ? metas.find((m) => m.file.includes(arg) || m.title.toLowerCase().includes(arg.toLowerCase())) : metas[0];
+    if (!meta) {
+      console.error(arg ? `no session matching "${arg}"` : "no sessions yet");
+      process.exit(1);
+    }
+    const messages = Session.open(meta.file).load() as Array<{ role?: string; content?: unknown }>;
+    const html = renderTranscript(meta.title, messages);
+    const port = Number(process.env.ADA_SHARE_PORT) || 8790;
+    const { createServer } = await import("node:http");
+    createServer((_req, res) => res.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(html)).listen(port, () =>
+      console.log(`\x1b[38;5;214m◆\x1b[0m session "${meta.title}" → http://localhost:${port}  (local, read-only — Ctrl+C to stop)`),
+    );
+    await new Promise(() => {});
+    return;
   }
   if (sub === "serve") {
     const trusted = isTrusted(process.cwd());
