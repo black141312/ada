@@ -29,6 +29,40 @@ function truncate(s: string): string {
   return s.length > MAX_OUTPUT ? `${s.slice(0, MAX_OUTPUT)}\n… [truncated ${s.length - MAX_OUTPUT} chars]` : s;
 }
 
+/** Strip HTML to readable text (no dependency) — good enough for "read this page". */
+export function htmlToText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<li[^>]*>/gi, "\n- ")
+    .replace(/<\/(?:p|div|section|article|tr|h[1-6])>/gi, "\n")
+    .replace(/<(?:br|h[1-6])[^>]*>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#x?39;|&#x27;/gi, "'")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/** Block localhost / private / metadata hosts (basic SSRF guard for web_fetch). */
+function isBlockedHost(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "localhost" || h.endsWith(".localhost") || h === "::1" || h === "0.0.0.0") return true;
+  const m = h.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (m) {
+    const a = Number(m[1]);
+    const b = Number(m[2]);
+    if (a === 0 || a === 10 || a === 127 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 169 && b === 254)) return true;
+  }
+  return false;
+}
+
 const IMG_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico"]);
 
 // Serialize mutations to the same path so concurrent writes never interleave.
@@ -382,6 +416,69 @@ export const tools: Tool[] = [
       matches.sort();
       const more = matches.length >= MAX ? `\n… (capped at ${MAX})` : "";
       return { output: (matches.join("\n") || "(no matches)") + more };
+    },
+  },
+  {
+    name: "web_fetch",
+    description: "Fetch an http(s) URL and return its content as readable text (HTML is stripped to text). Use to read docs, articles, changelogs, or JSON APIs.",
+    parameters: {
+      type: "object",
+      properties: { url: { type: "string" }, raw: { type: "boolean", description: "return the raw body instead of HTML→text" } },
+      required: ["url"],
+      additionalProperties: false,
+    },
+    needsApproval: false,
+    async run(args) {
+      let url: URL;
+      try {
+        url = new URL(String(args.url));
+      } catch {
+        return { output: `Invalid URL: ${String(args.url)}`, isError: true };
+      }
+      if (url.protocol !== "http:" && url.protocol !== "https:") return { output: "Only http/https URLs are allowed.", isError: true };
+      if (isBlockedHost(url.hostname)) return { output: "Refusing to fetch a localhost/private address.", isError: true };
+      try {
+        const res = await fetch(url, {
+          headers: { "user-agent": "ada/0.0.1 (+https://github.com/black141312/ada)", accept: "text/html,text/plain,application/json,*/*" },
+          redirect: "follow",
+          signal: AbortSignal.timeout(20_000),
+        });
+        const ct = (res.headers.get("content-type") ?? "").split(";")[0]!.trim();
+        const body = await res.text();
+        if (!res.ok) return { output: truncate(`HTTP ${res.status} ${res.statusText} (${url.href})\n\n${body}`), isError: true };
+        const text = args.raw || !/html/i.test(ct) ? body : htmlToText(body);
+        return { output: truncate(`${url.href} — ${res.status} ${ct}\n\n${text}`) };
+      } catch (e) {
+        return { output: `fetch failed: ${e instanceof Error ? e.message : e}`, isError: true };
+      }
+    },
+  },
+  {
+    name: "web_search",
+    description: "Search the web; returns the top results (title, URL, snippet). Requires a Brave Search API key (BRAVE_API_KEY). Use to find docs/answers, then web_fetch a result.",
+    parameters: {
+      type: "object",
+      properties: { query: { type: "string" } },
+      required: ["query"],
+      additionalProperties: false,
+    },
+    needsApproval: false,
+    async run(args) {
+      const key = process.env.BRAVE_API_KEY ?? process.env.ADA_BRAVE_API_KEY;
+      if (!key) return { output: "web_search needs a Brave Search API key — set BRAVE_API_KEY (free tier at brave.com/search/api). For a known page, use web_fetch instead.", isError: true };
+      try {
+        const u = new URL("https://api.search.brave.com/res/v1/web/search");
+        u.searchParams.set("q", String(args.query));
+        u.searchParams.set("count", "8");
+        const res = await fetch(u, { headers: { "x-subscription-token": key, accept: "application/json" }, signal: AbortSignal.timeout(20_000) });
+        if (!res.ok) return { output: `Brave search HTTP ${res.status} ${res.statusText}`, isError: true };
+        const data = (await res.json()) as { web?: { results?: { title: string; url: string; description?: string }[] } };
+        const results = data.web?.results ?? [];
+        if (!results.length) return { output: "(no results)" };
+        return { output: results.map((r) => `- ${r.title}\n  ${r.url}\n  ${htmlToText(r.description ?? "").slice(0, 200)}`).join("\n\n") };
+      } catch (e) {
+        return { output: `search failed: ${e instanceof Error ? e.message : e}`, isError: true };
+      }
     },
   },
 ];

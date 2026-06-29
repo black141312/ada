@@ -15,7 +15,8 @@ model is **zero code**, and a new OpenAI-compatible provider is **two lines**.
 ## Features
 
 - **Agentic loop** — streams, calls tools, feeds results back, repeats until done.
-- **Tools** — `read_file`, `write_file`, `edit_file` (exact-match), `bash`, `ls`, `grep`, `glob`.
+- **Tools** — `read_file`, `write_file`, `edit_file` (exact-match), `bash`, `ls`, `grep`, `glob`,
+  `web_fetch` (URL → text), `web_search` (Brave API).
 - **Two front-ends** — a classic readline REPL and an inline **TUI** (`--tui`) with a live "thinking"
   spinner and Claude-style turn markers.
 - **Plan mode**, **todos**, **checkpoint/undo** (revert the agent's edits), **protected paths** +

@@ -15,7 +15,7 @@ import { parseTextToolCalls, readIntegrationDocs, soleIntegration, writeProjectS
 import { userBar } from "./client/tui.ts";
 import { configuredServers, listConnectors, loadMcpServers } from "./client/mcp.ts";
 import { rankSkills } from "./client/skill-router.ts";
-import { isDestructive, registerTool, toolByName } from "./client/tools.ts";
+import { htmlToText, isDestructive, registerTool, toolByName } from "./client/tools.ts";
 import * as checkpoint from "./client/checkpoint.ts";
 import { renderTodos, setTodos } from "./client/todos.ts";
 import { deleteCredential, getCredential, setCredential } from "./server/credentials.ts";
@@ -206,6 +206,12 @@ async function main(): Promise<void> {
   assert.ok(renderTodos().includes("alpha") && renderTodos().includes("beta"), "todos render");
   assert.ok(isDestructive("rm -rf /tmp/x"), "rm -rf is destructive");
   assert.ok(!isDestructive("ls -la"), "ls is not destructive");
+
+  // --- web_fetch HTML→text + tools registered ---
+  const ht = htmlToText("<h1>Hi</h1><p>a &amp; b</p><script>x()</script><ul><li>one</li></ul>");
+  assert.ok(/Hi/.test(ht) && /a & b/.test(ht) && /- one/.test(ht) && !/x\(\)/.test(ht), "htmlToText strips tags/scripts, decodes entities");
+  assert.ok(toolByName.has("web_fetch") && toolByName.has("web_search"), "web tools registered");
+  assert.equal((await toolByName.get("web_fetch")!.run({ url: "http://127.0.0.1/x" })).isError, true, "web_fetch blocks loopback (SSRF guard)");
 
   // --- leaked tool-call recovery (Ollama-over-stream emits the call as text) ---
   const leaked = parseTextToolCalls('{"name": "update_todos", "arguments": {"todos": []}}');
