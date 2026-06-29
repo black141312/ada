@@ -237,6 +237,9 @@ async function main(): Promise<void> {
   assert.ok(/picked-A/.test((await askTool.run({ question: "?", options: ["picked-A", "B"] })).output), "ask_user with options");
   setAsker(null);
   assert.equal((await askTool.run({ question: "?" })).isError, true, "ask_user errors when no asker is installed");
+
+  // --- grep still works (rg fast path falls back to the JS scan when rg is absent) ---
+  assert.ok(/tools\.ts/.test((await toolByName.get("grep")!.run({ pattern: "export const tools", path: "src/client" })).output), "grep finds matches");
   assert.equal((await toolByName.get("web_fetch")!.run({ url: "http://127.0.0.1/x" })).isError, true, "web_fetch blocks loopback (SSRF guard)");
 
   // --- leaked tool-call recovery (Ollama-over-stream emits the call as text) ---

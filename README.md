@@ -15,8 +15,9 @@ model is **zero code**, and a new OpenAI-compatible provider is **two lines**.
 ## Features
 
 - **Agentic loop** — streams, calls tools, feeds results back, repeats until done.
-- **Tools** — `read_file`, `write_file`, `edit_file` (exact-match), `bash`, `ls`, `grep`, `glob`,
-  `web_fetch` (URL → text), `web_search` (Brave API), `lsp_diagnostics`.
+- **Tools** — `read_file`, `write_file`, `edit_file` (exact-match), `apply_patch` (multi-file),
+  `bash`, `ls`, `grep` (uses `rg` if present), `glob`, `web_fetch`, `web_search`, `lsp_diagnostics`,
+  `ask_user` (clarifying questions).
 - **Auto-format on edit** — written files are formatted with the project's formatter
   (prettier/gofmt/rustfmt/ruff/shfmt) in trusted projects; off via `ADA_NO_FORMAT`.
 - **LSP diagnostics** — `lsp_diagnostics` runs a language server (typescript-language-server,
@@ -144,7 +145,8 @@ Examples: `commit`, `code-review`, `dockerize`, `migration`, `react-hooks`, `ter
 
 Add your own as `SKILL.md` files under `.ada/skills/<name>/` (project) or `~/.ada/skills/<name>/`
 (global) — `---\ndescription: …\ncategory: …\n---` front-matter is all that's required. Project
-skills override global, which override the built-ins.
+skills override global, which override the built-ins. Install remote ones with
+`ada skill add <url>` (a `SKILL.md` or a JSON index); `ada skill list` shows them.
 
 ## Connectors (MCP)
 

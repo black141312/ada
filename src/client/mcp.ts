@@ -168,6 +168,31 @@ export async function loadMcpServers(includeProject: boolean): Promise<string[]>
           },
         });
       }
+      // Resources (optional): expose a read_resource tool listing the server's resource URIs.
+      try {
+        const rl = await rpc.call("resources/list", {});
+        const resources = (rl.resources as Array<{ uri: string; name?: string }>) ?? [];
+        if (resources.length) {
+          registerTool({
+            name: `${name}__read_resource`,
+            description: `Read a resource from ${name}. Available URIs: ${resources.slice(0, 30).map((r) => (r.name ? `${r.uri} (${r.name})` : r.uri)).join("; ")}`,
+            parameters: { type: "object", properties: { uri: { type: "string" } }, required: ["uri"], additionalProperties: false },
+            needsApproval: true,
+            async run(args) {
+              try {
+                const res = await rpc.call("resources/read", { uri: String(args.uri) });
+                const contents = (res.contents as Array<{ text?: string; blob?: string }>) ?? [];
+                return { output: contents.map((c) => c.text ?? (c.blob ? "[binary content]" : "")).join("\n") || "(empty)" };
+              } catch (e) {
+                return { output: String(e), isError: true };
+              }
+            },
+          });
+          loaded.push(`${name} (+${resources.length} resources)`);
+        }
+      } catch {
+        /* server doesn't support resources */
+      }
       loaded.push(`${name} (${mcpTools.length} tools)`);
     } catch (e) {
       console.error(`mcp ${name} failed: ${e instanceof Error ? e.message : e}`);

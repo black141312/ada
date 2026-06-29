@@ -14,7 +14,7 @@ import { deviceLogin, oauthConfig } from "../server/oauth.ts";
 import { addTrust, isTrusted, loadSettings } from "./settings.ts";
 import { getCommands, loadExtensions } from "./extensions.ts";
 import { registerTool, setAsker } from "./tools.ts";
-import { loadSkills, registerSkillTool } from "./skills.ts";
+import { addRemoteSkill, loadSkills, registerSkillTool } from "./skills.ts";
 import { addConnector, listConnectors, loadMcpServers, removeConnector } from "./mcp.ts";
 import { addExtension, selfUpdate } from "./pkg.ts";
 import { runTui } from "./tui-mode.ts";
@@ -443,6 +443,30 @@ async function main(): Promise<void> {
       return;
     }
     console.error("usage: ada mcp [list | add <name> | remove <name>]");
+    process.exit(1);
+  }
+  if (sub === "skill") {
+    const action = process.argv[3] ?? "list";
+    if (action === "add") {
+      const url = process.argv[4];
+      if (!url) {
+        console.error("usage: ada skill add <url>   (a SKILL.md, or a JSON index of them)");
+        process.exit(1);
+      }
+      try {
+        const added = await addRemoteSkill(url);
+        console.log(added.length ? `\x1b[38;5;214m✓\x1b[0m installed: ${added.join(", ")} → ~/.ada/skills/` : "no skills found at that URL");
+      } catch (e) {
+        console.error(e instanceof Error ? e.message : e);
+        process.exit(1);
+      }
+      return;
+    }
+    if (action === "list" || action === "ls") {
+      for (const s of loadSkills(true)) console.log(`  ${s.name.padEnd(22)} ${s.description}`);
+      return;
+    }
+    console.error("usage: ada skill [list | add <url>]");
     process.exit(1);
   }
   const flags = parseArgs(process.argv.slice(2));

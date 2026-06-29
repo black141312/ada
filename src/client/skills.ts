@@ -3,8 +3,7 @@
 // (so the per-request tool surface stays small even with hundreds of skills); `use_skill` then
 // returns the full instructions for one by name.
 
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,6 +15,45 @@ let LOADED: Skill[] = []; // the skills registered this session — for routeSki
 /** Rank the loaded skills by relevance to a request (used by find_skill + the agent's auto-suggest). */
 export function routeSkills(query: string, n = 5): { name: string; description: string; score: number }[] {
   return rankSkills(query, LOADED, n);
+}
+
+function frontName(md: string, fallback: string): string {
+  const m = md.match(/^---\n([\s\S]*?)\n---/);
+  const name = m?.[1]?.match(/^name:\s*(.+)$/m)?.[1]?.trim() || fallback;
+  return name.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "skill";
+}
+
+/** Install skill(s) from a URL into ~/.ada/skills/. The URL is a SKILL.md, or a JSON index
+ *  ({ skills: [{ name?, url }] }) of them. Returns the names installed. */
+export async function addRemoteSkill(url: string): Promise<string[]> {
+  const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+  if (!res.ok) throw new Error(`fetch ${url}: HTTP ${res.status}`);
+  const ct = res.headers.get("content-type") ?? "";
+  const body = await res.text();
+  const global = resolve(homedir(), ".ada", "skills");
+  const added: string[] = [];
+  const write = (md: string, fallback: string): void => {
+    const name = frontName(md, fallback);
+    const dir = resolve(global, name);
+    mkdirSync(dir, { recursive: true });
+    const content = md.trimStart().startsWith("---") ? md : `---\nname: ${name}\ndescription: imported skill\ncategory: imported\n---\n\n${md}`;
+    writeFileSync(resolve(dir, "SKILL.md"), content);
+    added.push(name);
+  };
+  if (/json/.test(ct) || (body.trimStart().startsWith("{") && !body.trimStart().startsWith("---"))) {
+    const idx = JSON.parse(body) as { skills?: { name?: string; url: string }[] };
+    for (const s of idx.skills ?? []) {
+      try {
+        const r = await fetch(new URL(s.url, url), { signal: AbortSignal.timeout(20_000) });
+        if (r.ok) write(await r.text(), s.name ?? "skill");
+      } catch {
+        /* skip a failed entry */
+      }
+    }
+  } else {
+    write(body, url.split(/[/?#]/).filter(Boolean).pop()?.replace(/\.md$/i, "") ?? "skill");
+  }
+  return added;
 }
 
 // Skills bundled with ada (committed, shipped). src/client/skills.ts → <package>/skills.

@@ -434,15 +434,32 @@ export const tools: Tool[] = [
     },
     needsApproval: false,
     async run(args) {
+      const pattern = String(args.pattern);
+      const searchPath = String(args.path ?? ".");
+      const root = resolve(process.cwd(), searchPath);
+      if (!existsSync(root)) return { output: `Not found: ${searchPath}`, isError: true };
+      const MAX = 200;
+      // Fast path: ripgrep if available (much faster on big trees; respects .gitignore).
+      const rg = findBin("rg");
+      if (rg) {
+        const rgArgs = ["--no-heading", "--line-number", "--color", "never"];
+        if (args.ignore_case) rgArgs.push("-i");
+        rgArgs.push("-e", pattern, searchPath);
+        const r = spawnSync(rg, rgArgs, { cwd: process.cwd(), encoding: "utf8", maxBuffer: 10 * 1024 * 1024, timeout: 30_000 });
+        if (r.status === 0 || r.status === 1) {
+          // 0 = matches, 1 = no matches
+          const out = (r.stdout || "").split("\n").filter(Boolean).slice(0, MAX);
+          const more = out.length >= MAX ? `\n… (capped at ${MAX})` : "";
+          return { output: (out.join("\n") || "(no matches)") + more };
+        }
+        // rg failed (e.g. its regex dialect rejected the pattern) → fall through to the JS scan
+      }
       let re: RegExp;
       try {
-        re = new RegExp(String(args.pattern), args.ignore_case ? "i" : "");
+        re = new RegExp(pattern, args.ignore_case ? "i" : "");
       } catch (e) {
         return { output: `Invalid regex: ${e instanceof Error ? e.message : e}`, isError: true };
       }
-      const root = resolve(process.cwd(), String(args.path ?? "."));
-      if (!existsSync(root)) return { output: `Not found: ${String(args.path ?? ".")}`, isError: true };
-      const MAX = 200;
       const SKIP = new Set(["node_modules", ".git", "dist", ".ada", ".next", "build", "coverage"]);
       const results: string[] = [];
       const walk = (p: string): void => {
