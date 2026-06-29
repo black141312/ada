@@ -1,5 +1,9 @@
 # ada
 
+[![CI](https://github.com/black141312/ada/actions/workflows/ci.yml/badge.svg)](https://github.com/black141312/ada/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Node ≥ 18](https://img.shields.io/badge/node-%E2%89%A518-green.svg)](package.json)
+
 A coding agent built from zero — a terminal client in the spirit of pi / Codex / Cursor,
 that holds every provider key and speaks one wire
 format to the client.
@@ -215,6 +219,12 @@ npm run server           # run the backend from source
 See **[docs/architecture.md](docs/architecture.md)** for the design (adapters, routing, request
 flow, file layout), **[docs/orchestration.md](docs/orchestration.md)** for the agent strategies, and
 **[docs/integrations.md](docs/integrations.md)** for the HTTP API / SDK / ACP.
+
+## Contributing
+
+Issues and PRs welcome — it's a small, no-build codebase. Run `npm run typecheck && npm run selfcheck`
+before a PR and keep changes lean. See **[CONTRIBUTING.md](CONTRIBUTING.md)**; report vulnerabilities
+via **[SECURITY.md](SECURITY.md)**.
 
 ## License
 
