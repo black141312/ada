@@ -1,6 +1,6 @@
 # ada
 
-[![npm](https://img.shields.io/npm/v/@rose141312/ada)](https://www.npmjs.com/package/@rose141312/ada)
+[![npm](https://img.shields.io/npm/v/ada-code)](https://www.npmjs.com/package/ada-code)
 [![CI](https://github.com/black141312/ada/actions/workflows/ci.yml/badge.svg)](https://github.com/black141312/ada/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Node ≥ 18](https://img.shields.io/badge/node-%E2%89%A518-green.svg)](package.json)
@@ -74,8 +74,8 @@ Requires **Node ≥ 18** (and a C toolchain, since `node-pty` builds natively).
 **Run it without installing — `npx`:**
 
 ```bash
-npx @rose141312/ada                        # the client   (published to npm)
-npx -p @rose141312/ada ada-server          # the backend  (second bin in the same package)
+npx ada-code                       # the client   (published to npm)
+npx -p ada-code ada-server         # the backend  (second bin in the same package)
 # straight from source, no publish needed:
 npx github:black141312/ada
 ```
@@ -83,7 +83,7 @@ npx github:black141312/ada
 **Install globally** (puts `ada` and `ada-server` on your PATH):
 
 ```bash
-npm install -g @rose141312/ada
+npm install -g ada-code
 ada
 ```
 

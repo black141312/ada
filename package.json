@@ -1,5 +1,5 @@
 {
-  "name": "@rose141312/ada",
+  "name": "ada-code",
   "version": "0.1.0",
   "description": "A from-zero terminal coding agent with a Cursor-style routing backend, ~285 skills, MCP connectors, and ask/plan/auto modes",
   "type": "module",
@@ -43,9 +43,6 @@
   ],
   "engines": {
     "node": ">=18"
-  },
-  "publishConfig": {
-    "access": "public"
   },
   "scripts": {
     "start": "tsx src/client/cli.ts",
