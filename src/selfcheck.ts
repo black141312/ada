@@ -14,6 +14,7 @@ import { loadSkills, registerSkillTool } from "./client/skills.ts";
 import { parseTextToolCalls, readIntegrationDocs, soleIntegration, writeProjectSkills } from "./client/agent.ts";
 import { userBar } from "./client/tui.ts";
 import { configuredServers, listConnectors, loadMcpServers } from "./client/mcp.ts";
+import { rankSkills } from "./client/skill-router.ts";
 import { isDestructive, registerTool, toolByName } from "./client/tools.ts";
 import * as checkpoint from "./client/checkpoint.ts";
 import { renderTodos, setTodos } from "./client/todos.ts";
@@ -234,6 +235,13 @@ async function main(): Promise<void> {
   const filtered = (await listSkills.run({ filter: "docker" })).output;
   assert.ok(/dockerize/.test(filtered) && !/migration/.test(filtered), "list_skills filter narrows results");
   assert.ok(/categories/.test((await listSkills.run({})).output), "list_skills overview lists categories");
+
+  // --- skill routing (lexical relevance ranker behind find_skill + auto-suggest) ---
+  assert.ok(rankSkills("write a database migration", allSkills, 5).some((r) => r.name === "migration"), "routing surfaces migration");
+  assert.ok(rankSkills("set up a dark mode theme", allSkills, 5).some((r) => r.name === "dark-mode"), "routing surfaces dark-mode");
+  const dockerTop = rankSkills("build a docker image for the app", allSkills, 5).map((r) => r.name);
+  assert.ok(dockerTop.includes("dockerize") || dockerTop.includes("docker-compose"), `routing surfaces a docker skill (got ${dockerTop.join(",")})`);
+  assert.equal(rankSkills("", allSkills).length, 0, "empty query → no matches");
 
   // --- connector catalog (read-only; does not touch .ada/mcp.json) ---
   const catalog = listConnectors();

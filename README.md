@@ -121,9 +121,11 @@ enter the device code in your browser. The token is stored locally and sent as y
 ## Skills
 
 ada ships with **~200 built-in skills** across 28 categories — specialized instructions the model
-pulls in only when a task needs them (progressive disclosure). It browses them with the
-**`list_skills`** tool (by `category` or `filter`) and loads one with **`use_skill`**, so nothing
-bloats the prompt until it's actually used. A sample of the categories:
+pulls in only when a task needs them (progressive disclosure). ada **routes** each request to the
+likely skills (a relevance ranker over names + descriptions) and surfaces them automatically; the
+model can also browse with **`list_skills`** (by `category`/`filter`), search with **`find_skill`**
+(ranked), and load one with **`use_skill`** — so nothing bloats the prompt until it's used. A sample
+of the categories:
 
 `git` · `review` · `testing` · `debugging` · `refactoring` · `docs` · `security` · `ci-cd` ·
 `performance` · `database` · `api` · `frontend` · `ui-design` · `html` · `pptx` · `image` ·

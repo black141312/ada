@@ -9,6 +9,14 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { registerTool } from "./tools.ts";
+import { rankSkills } from "./skill-router.ts";
+
+let LOADED: Skill[] = []; // the skills registered this session — for routeSkills()
+
+/** Rank the loaded skills by relevance to a request (used by find_skill + the agent's auto-suggest). */
+export function routeSkills(query: string, n = 5): { name: string; description: string; score: number }[] {
+  return rankSkills(query, LOADED, n);
+}
 
 // Skills bundled with ada (committed, shipped). src/client/skills.ts → <package>/skills.
 const BUNDLED = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "skills");
@@ -63,8 +71,21 @@ export function loadSkills(includeProject: boolean): Skill[] {
 /** Register `list_skills` (browse on demand) + `use_skill` (load one's full instructions). */
 export function registerSkillTool(skills: Skill[]): void {
   if (!skills.length) return;
+  LOADED = skills;
   const byName = new Map(skills.map((s) => [s.name, s]));
   const catOf = (s: Skill): string => s.category ?? "other";
+
+  registerTool({
+    name: "find_skill",
+    description: "Find the skills most relevant to a task, ranked. Better than list_skills' substring filter for fuzzy matches. Returns the top matches; load one with use_skill.",
+    parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"], additionalProperties: false },
+    needsApproval: false,
+    async run(args) {
+      const ranked = routeSkills(String(args.query ?? ""), 8);
+      if (!ranked.length) return { output: "No relevant skills found. Try list_skills for the full catalog." };
+      return { output: ranked.map((r) => `- ${r.name} — ${r.description}`).join("\n") };
+    },
+  });
 
   registerTool({
     name: "list_skills",

@@ -9,6 +9,7 @@ import { MarkdownStreamer } from "./render.ts";
 import { type Tool, type ToolResult, isDestructive, toolByName, tools } from "./tools.ts";
 import { afterTool, beforeTool, transformInput } from "./hooks.ts";
 import { configuredServers } from "./mcp.ts";
+import { routeSkills } from "./skills.ts";
 import { Session } from "./session.ts";
 
 type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
@@ -266,6 +267,13 @@ const toolsmith: Orchestrator = {
 
 const ORCHESTRATORS: Record<string, Orchestrator> = { react: reAct, single: singleShot, plan: planExecute, multi: multiAgent, toolsmith };
 
+/** A short, transient hint naming the most relevant skills for a request (or null if none stand out). */
+function suggestSkillNote(query: string): string | null {
+  const top = routeSkills(query, 3).filter((r) => r.score >= 2);
+  if (!top.length) return null;
+  return `Possibly relevant skills for this request — call use_skill to load one if it helps, otherwise ignore: ${top.map((r) => `${r.name} (${r.description})`).join("; ")}`;
+}
+
 /** The only integration configured in .ada/mcp.json, or null if zero or several. */
 export function soleIntegration(): string | null {
   const servers = configuredServers();
@@ -357,6 +365,7 @@ export class Agent {
   private completionTokens = 0;
   private lastAssistant = "";
   private strategy = "react"; // orchestration architecture (see ORCHESTRATORS)
+  private pendingNote: string | null = null; // transient skill-routing hint for the next model turn
 
   constructor(opts: {
     client: OpenAI;
@@ -453,6 +462,7 @@ export class Agent {
     this.session.append(userMsg);
 
     if (estimateTokens(this.messages) > this.compactAt) await this.autoCompact("size threshold");
+    if (!ctrl?.quiet) this.pendingNote = suggestSkillNote(input); // route the request to likely skills
 
     const engine = this.makeEngine(ctrl, say, interrupted, drainSteer);
     await (ORCHESTRATORS[this.strategy] ?? reAct).run(engine);
@@ -496,7 +506,9 @@ export class Agent {
       interrupted();
       return null;
     }
-    const note = opts?.note ?? (this.planMode ? PLAN_NOTE : null);
+    const suggest = this.pendingNote;
+    this.pendingNote = null; // consume once — the routing hint applies to this turn only
+    const note = [opts?.note ?? (this.planMode ? PLAN_NOTE : null), suggest].filter(Boolean).join("\n\n") || null;
     let overflowRetried = false;
     for (;;) {
       const create = () =>
