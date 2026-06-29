@@ -73,8 +73,8 @@ Requires **Node ≥ 18** (and a C toolchain, since `node-pty` builds natively).
 **Run it without installing — `npx`:**
 
 ```bash
-npx @black141312/ada                       # the client   (published to npm)
-npx -p @black141312/ada ada-server         # the backend  (second bin in the same package)
+npx @rose141312/ada                        # the client   (published to npm)
+npx -p @rose141312/ada ada-server          # the backend  (second bin in the same package)
 # straight from source, no publish needed:
 npx github:black141312/ada
 ```
@@ -82,7 +82,7 @@ npx github:black141312/ada
 **Install globally** (puts `ada` and `ada-server` on your PATH):
 
 ```bash
-npm install -g @black141312/ada
+npm install -g @rose141312/ada
 ada
 ```
 
@@ -236,6 +236,13 @@ npm run server           # run the backend from source
 See **[docs/architecture.md](docs/architecture.md)** for the design (adapters, routing, request
 flow, file layout), **[docs/orchestration.md](docs/orchestration.md)** for the agent strategies, and
 **[docs/integrations.md](docs/integrations.md)** for the HTTP API / SDK / ACP.
+
+## Benchmarks
+
+ada can run **SWE-bench Verified** — it generates patches for real GitHub issues (one isolated repo
+clone per task), emitting an official-format `predictions.jsonl` that the official `swebench` Docker
+harness scores. `node bench/swebench.mjs --dataset … --model … --out runs/x`. See
+**[bench/README.md](bench/README.md)** for the full flow (dataset, prereqs, scoring command).
 
 ## Contributing
 

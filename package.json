@@ -1,5 +1,5 @@
 {
-  "name": "@black141312/ada",
+  "name": "@rose141312/ada",
   "version": "0.1.0",
   "description": "A from-zero terminal coding agent with a Cursor-style routing backend, ~285 skills, MCP connectors, and ask/plan/auto modes",
   "type": "module",
@@ -36,6 +36,7 @@
     "src/",
     "skills/",
     "docs/",
+    "bench/",
     "tsconfig.json",
     "README.md",
     "LICENSE"
@@ -50,7 +51,8 @@
     "start": "tsx src/client/cli.ts",
     "server": "tsx src/server/index.ts",
     "typecheck": "tsc --noEmit",
-    "selfcheck": "tsx src/selfcheck.ts"
+    "selfcheck": "tsx src/selfcheck.ts",
+    "bench:swebench": "node bench/swebench.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.106.0",
