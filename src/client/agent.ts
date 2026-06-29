@@ -11,7 +11,7 @@ import { afterTool, beforeTool, transformInput } from "./hooks.ts";
 import { configuredServers } from "./mcp.ts";
 import { priceOf } from "./models-dev.ts";
 import { permissionFor } from "./settings.ts";
-import { routeSkills } from "./skills.ts";
+import { routeConfident, routeSkills } from "./skills.ts";
 import { Session } from "./session.ts";
 
 type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
@@ -473,7 +473,19 @@ export class Agent {
     this.session.append(userMsg);
 
     if (estimateTokens(this.messages) > this.compactAt) await this.autoCompact("size threshold");
-    if (!ctrl?.quiet) this.pendingNote = suggestSkillNote(input); // route the request to likely skills
+    if (!ctrl?.quiet) {
+      // Orchestrate skills: when one clearly fits, apply it (inject its procedure into context so
+      // even a weak model follows it, persisted across the tool loop). Otherwise, a soft hint.
+      const fit = routeConfident(input);
+      if (fit) {
+        const sys: Msg = { role: "system", content: `A skill fits this request: "${fit.name}". Follow its procedure for this task unless it clearly doesn't fit what was asked, in which case ignore it and proceed.\n\n${fit.body}` };
+        this.messages.push(sys);
+        this.session.append(sys);
+        say(`\x1b[2m↳ skill: ${fit.name}\x1b[0m\n`);
+      } else {
+        this.pendingNote = suggestSkillNote(input);
+      }
+    }
 
     const engine = this.makeEngine(ctrl, say, interrupted, drainSteer);
     await (ORCHESTRATORS[this.strategy] ?? reAct).run(engine);

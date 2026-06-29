@@ -16,7 +16,7 @@ const STOP = new Set(
   "a an and are as at be build by can create do for from how in into is it make of on or set the this to up use using with without your you".split(" "),
 );
 
-function tokenize(s: string): string[] {
+export function tokenize(s: string): string[] {
   return s
     .toLowerCase()
     .split(/[^a-z0-9]+/)
@@ -60,4 +60,20 @@ export function rankSkills(query: string, items: RankItem[], n = 5): { name: str
     .filter((x) => x.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, n);
+}
+
+/**
+ * The single clearly-dominant skill for a query, or null when the match is weak/ambiguous.
+ * Three gates, all required: a score floor, dominance over the runner-up, and — crucially — an
+ * EXACT whole-token overlap with the skill NAME. That last gate is the precision guard against
+ * lexical false positives: "make a powerpoint" prefix-matches "low-power" and even dominates, but
+ * "powerpoint" never equals the name token "power", so it's correctly rejected.
+ */
+export function confidentSkill(query: string, items: RankItem[]): string | null {
+  const ranked = rankSkills(query, items, 2);
+  const top = ranked[0];
+  if (!top || top.score < 4) return null;
+  if (ranked[1] && top.score < ranked[1].score * 1.5) return null;
+  const q = new Set(tokenize(query));
+  return tokenize(top.name).some((t) => q.has(t)) ? top.name : null;
 }

@@ -8,13 +8,35 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { registerTool } from "./tools.ts";
-import { rankSkills } from "./skill-router.ts";
+import { confidentSkill, rankSkills } from "./skill-router.ts";
 
 let LOADED: Skill[] = []; // the skills registered this session — for routeSkills()
 
 /** Rank the loaded skills by relevance to a request (used by find_skill + the agent's auto-suggest). */
 export function routeSkills(query: string, n = 5): { name: string; description: string; score: number }[] {
   return rankSkills(query, LOADED, n);
+}
+
+/** A skill's instructions (the SKILL.md body, front-matter stripped), or null if not loaded. */
+export function skillBody(name: string): string | null {
+  const s = LOADED.find((x) => x.name === name);
+  if (!s) return null;
+  try {
+    return readFileSync(s.path, "utf8")
+      .replace(/^---\n[\s\S]*?\n---\n*/, "")
+      .trim();
+  } catch {
+    return null;
+  }
+}
+
+/** When one skill confidently fits a request, return its name + body so the agent can apply it
+ *  proactively (instead of merely suggesting it). Null when the match is weak/ambiguous. */
+export function routeConfident(query: string): { name: string; body: string } | null {
+  const name = confidentSkill(query, LOADED);
+  if (!name) return null;
+  const body = skillBody(name);
+  return body ? { name, body } : null;
 }
 
 function frontName(md: string, fallback: string): string {
