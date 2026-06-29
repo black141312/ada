@@ -324,6 +324,52 @@ function summarize(args: unknown): string {
   return s.length > 80 ? `${s.slice(0, 80)}…` : s;
 }
 
+/** Human-readable (label, detail) for a tool call — clearer than dumping the raw args JSON. */
+export function describeCall(name: string, args: Record<string, unknown>): { label: string; detail: string } {
+  const a = args ?? {};
+  const s = (v: unknown): string => (v == null ? "" : String(v));
+  switch (name) {
+    case "bash":
+      return { label: "shell", detail: s(a.command) };
+    case "read_file":
+      return { label: "read", detail: s(a.path) };
+    case "write_file":
+      return { label: "write", detail: s(a.path) };
+    case "edit_file":
+      return { label: "edit", detail: s(a.path) };
+    case "apply_patch":
+      return { label: "patch", detail: "" };
+    case "ls":
+      return { label: "list", detail: s(a.path) || "." };
+    case "glob":
+      return { label: "find", detail: s(a.pattern) };
+    case "grep":
+      return { label: "search", detail: s(a.pattern) };
+    case "web_fetch":
+      return { label: "fetch", detail: s(a.url) };
+    case "web_search":
+      return { label: "web", detail: s(a.query) };
+    case "use_skill":
+      return { label: "skill", detail: s(a.name) };
+    case "spawn_agent":
+      return { label: "sub-agent", detail: s(a.task) };
+    case "background_task":
+      return { label: "background", detail: s(a.task) };
+    default:
+      if (name.includes("__")) return { label: name.split("__")[0]!, detail: name.split("__").slice(1).join("__") };
+      return { label: name, detail: summarize(a) };
+  }
+}
+
+/** What permission the call is asking for, in plain words (for the approval prompt). */
+export function permPhrase(name: string, destructive: boolean): string {
+  if (name === "bash") return destructive ? "⚠ run a shell command that may modify your system" : "run a shell command on your machine";
+  if (name === "write_file" || name === "edit_file" || name === "apply_patch") return "create or modify files on disk";
+  if (name === "web_fetch" || name === "web_search") return "make a network request";
+  if (name.includes("__")) return `use the ${name.split("__")[0]} connector`;
+  return `run the ${name} tool`;
+}
+
 async function safeRun(tool: Tool, args: Record<string, unknown>): Promise<ToolResult> {
   try {
     return await tool.run(args);
@@ -418,6 +464,10 @@ export class Agent {
 
   setReasoning(r: "low" | "medium" | "high" | undefined): void {
     this.reasoning = r;
+  }
+
+  setAutoApprove(on: boolean): void {
+    this.autoApprove = on;
   }
 
   setPlanMode(on: boolean): void {
@@ -638,7 +688,9 @@ export class Agent {
   private async execTools(toolCalls: ToolCall[], ctrl: SendCtrl | undefined, say: (s: string) => void): Promise<void> {
     const signal = ctrl?.signal;
     const printCall = (name: string, args: Record<string, unknown>): void => {
-      say(`\n\x1b[2m• ${name} ${summarize(args)}\x1b[0m\n`);
+      const d = describeCall(name, args);
+      const detail = d.detail ? ` ${d.detail.length > 100 ? `${d.detail.slice(0, 99)}…` : d.detail}` : "";
+      say(`\n\x1b[2m• ${name}${detail}\x1b[0m\n`);
     };
     const printResult = (r: ToolResult): void => {
       if (r.display) say(`${r.display}\n`);
@@ -695,7 +747,7 @@ export class Agent {
       if (autoOk) {
         results[i] = await runTool(tool, c.name, args);
       } else {
-        const decision = await this.onApprove(c.name, forceConfirm ? `⚠ destructive: ${summarize(args)}` : summarize(args));
+        const decision = await this.onApprove(c.name, `${permPhrase(c.name, forceConfirm)}\n${describeCall(c.name, args).detail}`);
         if (decision === "all") {
           this.autoApprove = true;
           results[i] = await runTool(tool, c.name, args);

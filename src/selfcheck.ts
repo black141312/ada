@@ -11,7 +11,7 @@ import { expandPrompt } from "./client/prompts.ts";
 import { MarkdownStreamer, highlight, renderEditDiff } from "./client/render.ts";
 import { Session, list } from "./client/session.ts";
 import { loadSkills, registerSkillTool, routeConfident } from "./client/skills.ts";
-import { parseTextToolCalls, readIntegrationDocs, soleIntegration, writeProjectSkills } from "./client/agent.ts";
+import { describeCall, parseTextToolCalls, permPhrase, readIntegrationDocs, soleIntegration, writeProjectSkills } from "./client/agent.ts";
 import { userBar } from "./client/tui.ts";
 import { configuredServers, listConnectors, loadMcpServers } from "./client/mcp.ts";
 import { confidentSkill, rankSkills } from "./client/skill-router.ts";
@@ -246,6 +246,14 @@ async function main(): Promise<void> {
   // --- workspace snapshot returns a git tree SHA (or null outside a repo); never throws ---
   const snap = snapshot();
   assert.ok(snap === null || /^[0-9a-f]{40}$/.test(snap), "snapshot returns a tree SHA");
+
+  // --- approval context: readable call descriptions + plain-words permission phrases ---
+  assert.equal(describeCall("bash", { command: 'dir "C:\\x" /b' }).detail, 'dir "C:\\x" /b', "bash → shows the command, not JSON");
+  assert.equal(describeCall("read_file", { path: "a.ts" }).label, "read", "read_file → 'read'");
+  assert.equal(describeCall("merchant__list_products", {}).label, "merchant", "MCP tool → connector name as label");
+  assert.ok(permPhrase("bash", true).startsWith("⚠"), "destructive bash phrase is flagged");
+  assert.equal(permPhrase("write_file", false), "create or modify files on disk", "write phrase");
+  assert.ok(permPhrase("merchant__x", false).includes("connector"), "MCP phrase mentions the connector");
 
   // --- background job runs and reports ---
   const jid = startJob("selfcheck job", async () => "job-done-ok");

@@ -290,67 +290,36 @@ async function select(rl: RL, title: string, items: string[]): Promise<number | 
   });
 }
 
-const APPROVE_OPTS: Array<{ label: string; value: ApprovalDecision; key: string }> = [
-  { label: "Yes, run it  \x1b[2m(y)\x1b[0m", value: "yes", key: "y" },
-  { label: "Yes, and don't ask again this session  \x1b[2m(a)\x1b[0m", value: "all", key: "a" },
-  { label: "No, stop and let me redirect  \x1b[2m(n)\x1b[0m", value: "no", key: "n" },
-];
+type PermMode = "ask" | "plan" | "auto";
+type ApproveChoice = "yes" | "auto" | "plan" | "no";
 
 /**
- * Interactive tool-approval prompt: arrow keys (or j/k) to move, Enter to choose, or hit a hotkey
- * (y/a/n) directly; Esc / Ctrl+C = no. Falls back to a one-line text prompt when stdin isn't a TTY.
- * `summary` arrives as `⚠ destructive: <args>` or plain `<args>` from the agent.
+ * Tool-approval prompt. A fixed single-key prompt (no scrolling redraw — that fought the streaming
+ * transcript and glitched): it states in plain words what permission is being requested + the actual
+ * target, then reads one key — [y]es · [a]uto (run the rest without asking) · [p]lan (switch to plan
+ * mode, skip this) · [n]o/Esc. `summary` is "<permission phrase>\n<detail>" from the agent.
  */
-async function approveMenu(rl: RL, name: string, summary: string): Promise<ApprovalDecision> {
-  const destructive = summary.startsWith("⚠");
-  const body = summary.replace(/^⚠ destructive:\s*/, "");
+async function approvePrompt(rl: RL, name: string, summary: string): Promise<ApproveChoice> {
+  const nl = summary.indexOf("\n");
+  const risk = (nl >= 0 ? summary.slice(0, nl) : summary) || `run the ${name} tool`;
+  const detail = nl >= 0 ? summary.slice(nl + 1).trim() : "";
+  const danger = risk.startsWith("⚠");
   if (!stdin.isTTY) {
-    const ans = (await rl.question(`\x1b[33m? run ${name} ${summary}  [y]es / [a]ll / [N]o \x1b[0m`)).trim().toLowerCase();
-    return ans === "a" || ans === "all" ? "all" : ans === "y" || ans === "yes" ? "yes" : "no";
+    const ans = (await rl.question(`\x1b[33m? ${risk}  [y]es / [a]uto / [p]lan / [N]o \x1b[0m`)).trim().toLowerCase();
+    return ans[0] === "y" ? "yes" : ans[0] === "a" ? "auto" : ans[0] === "p" ? "plan" : "no";
   }
-  const clamp = (stdout.columns || 80) - 4; // keep the arg on one physical row so the cursor math holds
-  const header = `${destructive ? "\x1b[31m⚠ destructive\x1b[0m " : ""}run \x1b[1m${name}\x1b[0m`;
-  const arg = `\x1b[2m${body.length > clamp ? `${body.slice(0, clamp - 1)}…` : body}\x1b[0m`;
-  const LINES = APPROVE_OPTS.length + 2;
-  let idx = 0;
-  const draw = (first: boolean): void => {
-    if (!first) stdout.write(`\x1b[${LINES}A`);
-    stdout.write(`\x1b[2K\x1b[33m?\x1b[0m ${header}\n\x1b[2K  ${arg}\n`);
-    for (let i = 0; i < APPROVE_OPTS.length; i++) {
-      stdout.write(i === idx ? `\x1b[2K\x1b[38;5;214m❯ ${APPROVE_OPTS[i]!.label}\x1b[0m\n` : `\x1b[2K  ${APPROVE_OPTS[i]!.label}\n`);
-    }
-  };
-  stdout.write(`${"\n".repeat(LINES)}\x1b[${LINES}A`); // reserve rows up front so a bottom-of-screen scroll doesn't skew the redraw
-  draw(true);
-  return await new Promise<ApprovalDecision>((res) => {
-    const collapse = (val: ApprovalDecision): void => {
-      stdout.write(`\x1b[${LINES}A\x1b[0J`); // erase the menu, leave one summary line
-      const mark = val === "no" ? "\x1b[31m✗\x1b[0m" : "\x1b[32m✓\x1b[0m";
-      stdout.write(`${mark} ${name} \x1b[2m${val === "all" ? "(won't ask again)" : val}\x1b[0m\n`);
-    };
+  const cols = (stdout.columns || 80) - 2;
+  const head = `${danger ? "\x1b[31m" : "\x1b[33m"}ada wants to ${risk.replace(/^⚠ /, "")}\x1b[0m`;
+  const det = detail ? `  \x1b[2m${detail.length > cols ? `${detail.slice(0, cols - 1)}…` : detail}\x1b[0m\n` : "";
+  stdout.write(`\n${danger ? "\x1b[31m⚠\x1b[0m " : ""}${head}\n${det}\x1b[2m[\x1b[0my\x1b[2m]es  [\x1b[0ma\x1b[2m]uto  [\x1b[0mp\x1b[2m]lan  [\x1b[0mn\x1b[2m]o ›\x1b[0m `);
+  return await new Promise<ApproveChoice>((res) => {
     readKeys(rl, (key, done) => {
-      if (key === "up") {
-        idx = (idx - 1 + APPROVE_OPTS.length) % APPROVE_OPTS.length;
-        draw(false);
-      } else if (key === "down") {
-        idx = (idx + 1) % APPROVE_OPTS.length;
-        draw(false);
-      } else if (key === "enter") {
-        done();
-        collapse(APPROVE_OPTS[idx]!.value);
-        res(APPROVE_OPTS[idx]!.value);
-      } else if (key === "esc" || key === "ctrl-c") {
-        done();
-        collapse("no");
-        res("no");
-      } else {
-        const hit = APPROVE_OPTS.find((o) => o.key === key.toLowerCase());
-        if (hit) {
-          done();
-          collapse(hit.value);
-          res(hit.value);
-        }
-      }
+      const k = key.length === 1 ? key.toLowerCase() : key;
+      const val: ApproveChoice | null = k === "y" || key === "enter" ? "yes" : k === "a" ? "auto" : k === "p" ? "plan" : k === "n" || key === "esc" || key === "ctrl-c" ? "no" : null;
+      if (!val) return;
+      done();
+      stdout.write(`\r\x1b[2K${val === "no" ? "\x1b[31m✗\x1b[0m skipped" : `\x1b[32m✓\x1b[0m ${val === "auto" ? "auto (won't ask again)" : val === "plan" ? "→ plan mode" : "ran"}`}\n`);
+      res(val);
     });
   });
 }
@@ -911,10 +880,23 @@ async function main(): Promise<void> {
   }
 
   const autoApprove = !!flags.yolo || process.env.ADA_AUTO_APPROVE === "1" || !!settings.autoApprove;
+  // Permission mode: ask = confirm each tool, plan = read-only (plan, don't run), auto = run freely.
+  let mode = "ask" as PermMode; // `as` keeps the CFA type PermMode (it's mutated via setMode, a closure)
+  let setMode = (_m: PermMode): void => {}; // reassigned once `agent` exists
   const onApprove: OnApprove = async (name, summary): Promise<ApprovalDecision> => {
+    if (mode === "auto") return "yes";
     if (turn && stdin.isTTY) rawOff(rl, turn.onData); // detach the turn's raw key listener first
     try {
-      return await approveMenu(rl, name, summary);
+      const choice = await approvePrompt(rl, name, summary);
+      if (choice === "auto") {
+        setMode("auto");
+        return "all";
+      }
+      if (choice === "plan") {
+        setMode("plan");
+        return "no";
+      }
+      return choice; // "yes" | "no"
     } finally {
       if (turn && stdin.isTTY) rawOn(rl, turn.onData);
     }
@@ -1008,6 +990,13 @@ async function main(): Promise<void> {
   if (flags.strategy) agent.setStrategy(flags.strategy);
   if (flags.agent && !switchAgent(agent, flags.agent, settings)) console.error(`unknown agent: ${flags.agent} (configure in .ada/settings.json)`);
 
+  setMode = (m: PermMode): void => {
+    mode = m;
+    agent.setPlanMode(m === "plan");
+    agent.setAutoApprove(m === "auto");
+  };
+  setMode(autoApprove ? "auto" : "ask"); // apply the initial mode (e.g. --yolo → auto) consistently
+
   if (flags.tui && stdin.isTTY) {
     rl.close(); // hand stdin to the TUI so readline doesn't echo keystrokes too
     await runTui(agent, model);
@@ -1016,7 +1005,7 @@ async function main(): Promise<void> {
 
   console.log(`\nada — model ${model} via ${BACKEND}`);
   console.log("commands: /model [id]  /models  /next  /reasoning [low|medium|high|off]  /compact  /context  /exit");
-  console.log("          /plan  /run  /fork (branch)  /tree  /rewind  /undo  /todos  /cost  /image <path>  /paste");
+  console.log("          \x1b[1mmode:\x1b[0m /ask /plan /auto (or /mode to cycle)  ·  /run  /fork  /tree  /rewind  /undo  /todos  /cost  /image  /paste");
   if (prompts.size) console.log(`prompt templates: ${[...prompts.keys()].map((k) => `/${k}`).join("  ")}`);
   if (exts.length) console.log(`extensions: ${exts.join("  ")}`);
   if (skills.length) console.log(`skills: ${skills.map((s) => s.name).join("  ")}`);
@@ -1025,7 +1014,10 @@ async function main(): Promise<void> {
 
   const pendingImages: string[] = []; // images attached via /image or /paste, sent with the next message
   for (;;) {
-    if (stdin.isTTY) process.stdout.write(`\x1b[2m${model}${agent.planMode ? " · \x1b[33mplan\x1b[0m\x1b[2m" : ""} · ~${agent.contextTokens()} tok\x1b[0m\n`);
+    if (stdin.isTTY) {
+      const modeTag = mode === "plan" ? " · \x1b[33mplan\x1b[0m\x1b[2m" : mode === "auto" ? " · \x1b[31mauto\x1b[0m\x1b[2m" : " · ask";
+      process.stdout.write(`\x1b[2m${model}${modeTag} · ~${agent.contextTokens()} tok\x1b[0m\n`);
+    }
     let line: string;
     try {
       line = (await rl.question("\x1b[38;5;214m›\x1b[0m ")).trim();
@@ -1084,17 +1076,19 @@ async function main(): Promise<void> {
       console.log(renderTodos());
       continue;
     }
-    if (line === "/plan") {
-      agent.setPlanMode(!agent.planMode);
-      console.log(agent.planMode ? "\x1b[33mplan mode ON\x1b[0m — ada plans but won't edit. /run to execute · /plan to exit." : "plan mode off");
+    if (line === "/ask" || line === "/auto" || line === "/plan" || line === "/mode") {
+      const next: PermMode = line === "/mode" ? (mode === "ask" ? "plan" : mode === "plan" ? "auto" : "ask") : (line.slice(1) as PermMode);
+      setMode(next);
+      const blurb = { ask: "confirm each tool before it runs", plan: "ada plans but won't edit — /run to execute", auto: "run tools without asking (destructive bash still confirms)" }[next];
+      console.log(`mode → \x1b[1m${next}\x1b[0m \x1b[2m(${blurb})\x1b[0m`);
       continue;
     }
     if (line === "/run") {
-      if (!agent.planMode) {
+      if (mode !== "plan") {
         console.log("not in plan mode.");
         continue;
       }
-      agent.setPlanMode(false);
+      setMode("ask");
       console.log("\x1b[2mplan approved — executing…\x1b[0m");
       line = "Proceed and implement the plan above.";
     }
