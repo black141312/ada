@@ -209,6 +209,56 @@ function rawOff(rl: RL, onData: (b: Buffer) => void): void {
   rl.resume();
 }
 
+/** Decode a raw stdin chunk to a logical key: arrows (or j/k/Tab), enter, esc, ctrl-c, or the literal char. */
+function decodeKey(s: string): string {
+  if (s === "\x1b[A" || s === "k") return "up";
+  if (s === "\x1b[B" || s === "j" || s === "\t") return "down";
+  if (s === "\r" || s === "\n") return "enter";
+  if (s === "\x03") return "ctrl-c";
+  if (s === "\x1b") return "esc";
+  return s;
+}
+
+/**
+ * Read decoded keypresses in raw mode until a handler calls done(). Two robustness points the
+ * naive version got wrong: (1) a bare ESC may be the head of a split "\x1b[A" arrow sequence on
+ * Windows/slow ptys, so it's held ~50ms and re-joined with the next chunk before being treated as
+ * Esc; (2) teardown (listener removal + raw-mode restore + rl.resume) is guaranteed exactly once.
+ */
+function readKeys(rl: RL, onKey: (key: string, done: () => void) => void): void {
+  let settled = false;
+  let escTimer: ReturnType<typeof setTimeout> | null = null;
+  const done = (): void => {
+    if (settled) return;
+    settled = true;
+    if (escTimer) clearTimeout(escTimer);
+    stdin.off("data", handler);
+    if (stdin.isTTY) stdin.setRawMode(false);
+    rl.resume();
+  };
+  const emit = (s: string): void => onKey(decodeKey(s), done);
+  const handler = (buf: Buffer): void => {
+    let s = buf.toString("utf8");
+    if (escTimer) {
+      clearTimeout(escTimer);
+      escTimer = null;
+      s = `\x1b${s}`; // re-join the ESC we were holding with this follow-up chunk (arrow keys)
+    }
+    if (s === "\x1b") {
+      escTimer = setTimeout(() => {
+        escTimer = null;
+        emit("\x1b");
+      }, 50);
+      return;
+    }
+    emit(s);
+  };
+  rl.pause();
+  if (stdin.isTTY) stdin.setRawMode(true);
+  stdin.on("data", handler);
+  stdin.resume();
+}
+
 /** Arrow-key list selector. Returns the chosen index, or null on Esc / non-TTY (caller falls back). */
 async function select(rl: RL, title: string, items: string[]): Promise<number | null> {
   if (!stdin.isTTY || !items.length) return null;
@@ -221,32 +271,87 @@ async function select(rl: RL, title: string, items: string[]): Promise<number | 
   };
   stdout.write(`${title}\n`);
   draw(true);
-  rl.pause();
-  if (stdin.isTTY) stdin.setRawMode(true);
   return await new Promise<number | null>((res) => {
-    const cleanup = (): void => {
-      stdin.off("data", onKey);
-      if (stdin.isTTY) stdin.setRawMode(false);
-      rl.resume();
-    };
-    const onKey = (buf: Buffer): void => {
-      const s = buf.toString("utf8");
-      if (s === "\x1b[A" || s === "k") {
+    readKeys(rl, (key, done) => {
+      if (key === "up") {
         idx = (idx - 1 + items.length) % items.length;
         draw(false);
-      } else if (s === "\x1b[B" || s === "j") {
+      } else if (key === "down") {
         idx = (idx + 1) % items.length;
         draw(false);
-      } else if (s === "\r" || s === "\n") {
-        cleanup();
+      } else if (key === "enter") {
+        done();
         res(idx);
-      } else if (s === "\x03" || s === "\x1b") {
-        cleanup();
+      } else if (key === "esc" || key === "ctrl-c") {
+        done();
         res(null);
       }
+    });
+  });
+}
+
+const APPROVE_OPTS: Array<{ label: string; value: ApprovalDecision; key: string }> = [
+  { label: "Yes, run it  \x1b[2m(y)\x1b[0m", value: "yes", key: "y" },
+  { label: "Yes, and don't ask again this session  \x1b[2m(a)\x1b[0m", value: "all", key: "a" },
+  { label: "No, stop and let me redirect  \x1b[2m(n)\x1b[0m", value: "no", key: "n" },
+];
+
+/**
+ * Interactive tool-approval prompt: arrow keys (or j/k) to move, Enter to choose, or hit a hotkey
+ * (y/a/n) directly; Esc / Ctrl+C = no. Falls back to a one-line text prompt when stdin isn't a TTY.
+ * `summary` arrives as `⚠ destructive: <args>` or plain `<args>` from the agent.
+ */
+async function approveMenu(rl: RL, name: string, summary: string): Promise<ApprovalDecision> {
+  const destructive = summary.startsWith("⚠");
+  const body = summary.replace(/^⚠ destructive:\s*/, "");
+  if (!stdin.isTTY) {
+    const ans = (await rl.question(`\x1b[33m? run ${name} ${summary}  [y]es / [a]ll / [N]o \x1b[0m`)).trim().toLowerCase();
+    return ans === "a" || ans === "all" ? "all" : ans === "y" || ans === "yes" ? "yes" : "no";
+  }
+  const clamp = (stdout.columns || 80) - 4; // keep the arg on one physical row so the cursor math holds
+  const header = `${destructive ? "\x1b[31m⚠ destructive\x1b[0m " : ""}run \x1b[1m${name}\x1b[0m`;
+  const arg = `\x1b[2m${body.length > clamp ? `${body.slice(0, clamp - 1)}…` : body}\x1b[0m`;
+  const LINES = APPROVE_OPTS.length + 2;
+  let idx = 0;
+  const draw = (first: boolean): void => {
+    if (!first) stdout.write(`\x1b[${LINES}A`);
+    stdout.write(`\x1b[2K\x1b[33m?\x1b[0m ${header}\n\x1b[2K  ${arg}\n`);
+    for (let i = 0; i < APPROVE_OPTS.length; i++) {
+      stdout.write(i === idx ? `\x1b[2K\x1b[38;5;214m❯ ${APPROVE_OPTS[i]!.label}\x1b[0m\n` : `\x1b[2K  ${APPROVE_OPTS[i]!.label}\n`);
+    }
+  };
+  stdout.write(`${"\n".repeat(LINES)}\x1b[${LINES}A`); // reserve rows up front so a bottom-of-screen scroll doesn't skew the redraw
+  draw(true);
+  return await new Promise<ApprovalDecision>((res) => {
+    const collapse = (val: ApprovalDecision): void => {
+      stdout.write(`\x1b[${LINES}A\x1b[0J`); // erase the menu, leave one summary line
+      const mark = val === "no" ? "\x1b[31m✗\x1b[0m" : "\x1b[32m✓\x1b[0m";
+      stdout.write(`${mark} ${name} \x1b[2m${val === "all" ? "(won't ask again)" : val}\x1b[0m\n`);
     };
-    stdin.on("data", onKey);
-    stdin.resume();
+    readKeys(rl, (key, done) => {
+      if (key === "up") {
+        idx = (idx - 1 + APPROVE_OPTS.length) % APPROVE_OPTS.length;
+        draw(false);
+      } else if (key === "down") {
+        idx = (idx + 1) % APPROVE_OPTS.length;
+        draw(false);
+      } else if (key === "enter") {
+        done();
+        collapse(APPROVE_OPTS[idx]!.value);
+        res(APPROVE_OPTS[idx]!.value);
+      } else if (key === "esc" || key === "ctrl-c") {
+        done();
+        collapse("no");
+        res("no");
+      } else {
+        const hit = APPROVE_OPTS.find((o) => o.key === key.toLowerCase());
+        if (hit) {
+          done();
+          collapse(hit.value);
+          res(hit.value);
+        }
+      }
+    });
   });
 }
 
@@ -807,26 +912,34 @@ async function main(): Promise<void> {
 
   const autoApprove = !!flags.yolo || process.env.ADA_AUTO_APPROVE === "1" || !!settings.autoApprove;
   const onApprove: OnApprove = async (name, summary): Promise<ApprovalDecision> => {
-    if (turn && stdin.isTTY) rawOff(rl, turn.onData); // hand stdin back to readline for the prompt
-    const ans = (await rl.question(`\x1b[33m? run ${name} ${summary}  [y]es / [a]ll / [N]o \x1b[0m`)).trim().toLowerCase();
-    if (turn && stdin.isTTY) rawOn(rl, turn.onData);
-    if (ans === "a" || ans === "all") return "all";
-    if (ans === "y" || ans === "yes") return "yes";
-    return "no";
+    if (turn && stdin.isTTY) rawOff(rl, turn.onData); // detach the turn's raw key listener first
+    try {
+      return await approveMenu(rl, name, summary);
+    } finally {
+      if (turn && stdin.isTTY) rawOn(rl, turn.onData);
+    }
   };
 
   setAsker(async (question, options) => {
     if (turn && stdin.isTTY) rawOff(rl, turn.onData);
-    let prompt = `\x1b[36m? ${question}\x1b[0m`;
-    if (options?.length) prompt += `\n${options.map((o, i) => `  ${i + 1}. ${o}`).join("\n")}\n› `;
-    else prompt += " ";
-    const ans = (await rl.question(prompt)).trim();
-    if (turn && stdin.isTTY) rawOn(rl, turn.onData);
-    if (options?.length) {
-      const n = Number(ans);
-      if (Number.isInteger(n) && n >= 1 && n <= options.length) return options[n - 1]!;
+    try {
+      // Multiple-choice → arrow-key selector; free-text → a plain line.
+      if (options?.length && stdin.isTTY) {
+        const i = await select(rl, `\x1b[36m? ${question}\x1b[0m`, options);
+        return i == null ? "" : options[i]!;
+      }
+      let prompt = `\x1b[36m? ${question}\x1b[0m`;
+      if (options?.length) prompt += `\n${options.map((o, i) => `  ${i + 1}. ${o}`).join("\n")}\n› `;
+      else prompt += " ";
+      const ans = (await rl.question(prompt)).trim();
+      if (options?.length) {
+        const n = Number(ans);
+        if (Number.isInteger(n) && n >= 1 && n <= options.length) return options[n - 1]!;
+      }
+      return ans;
+    } finally {
+      if (turn && stdin.isTTY) rawOn(rl, turn.onData);
     }
-    return ans;
   });
 
   // Subagent: delegate an isolated subtask to a fresh ada agent (registered before the agent

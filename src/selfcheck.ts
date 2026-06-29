@@ -10,11 +10,11 @@ import { loadImage } from "./client/image.ts";
 import { expandPrompt } from "./client/prompts.ts";
 import { MarkdownStreamer, highlight, renderEditDiff } from "./client/render.ts";
 import { Session, list } from "./client/session.ts";
-import { loadSkills, registerSkillTool } from "./client/skills.ts";
+import { loadSkills, registerSkillTool, routeConfident } from "./client/skills.ts";
 import { parseTextToolCalls, readIntegrationDocs, soleIntegration, writeProjectSkills } from "./client/agent.ts";
 import { userBar } from "./client/tui.ts";
 import { configuredServers, listConnectors, loadMcpServers } from "./client/mcp.ts";
-import { rankSkills } from "./client/skill-router.ts";
+import { confidentSkill, rankSkills } from "./client/skill-router.ts";
 import { getDiagnostics } from "./client/lsp.ts";
 import { snapshot } from "./client/snapshot.ts";
 import { renderJobs, startJob } from "./client/background.ts";
@@ -253,6 +253,16 @@ async function main(): Promise<void> {
   assert.ok(renderJobs().includes(jid) && /job-done-ok/.test(renderJobs()), "background job runs and reports its result");
   assert.equal((await toolByName.get("web_fetch")!.run({ url: "http://127.0.0.1/x" })).isError, true, "web_fetch blocks loopback (SSRF guard)");
 
+  // --- destructive classifier: real dangers flagged; everyday redirects are not (2>/dev/null bug) ---
+  // The /dev/ sink allow-list is boundary-anchored, so device writes whose name starts with a sink
+  // token (ttyS0, tty1) are still caught — they were a confirmed bypass before the fix.
+  for (const c of ["rm -rf /", "dd if=/dev/zero of=/dev/sda", "git push --force origin main", "git reset --hard", "> /dev/sda", "> /dev/ttyS0", "echo x > /dev/tty1"]) {
+    assert.ok(isDestructive(c), `should be destructive: ${c}`);
+  }
+  for (const c of ['ls "/some/dir" 2>/dev/null', "cat x >/dev/null", "echo hi > /dev/stdout", "grep foo bar 2> /dev/null", "node app.js &>/dev/null", "x >/dev/null 2>&1", "cat >/dev/tty"]) {
+    assert.ok(!isDestructive(c), `should NOT be destructive: ${c}`);
+  }
+
   // --- leaked tool-call recovery (Ollama-over-stream emits the call as text) ---
   const leaked = parseTextToolCalls('{"name": "update_todos", "arguments": {"todos": []}}');
   assert.equal(leaked?.[0]?.name, "update_todos", "plain JSON tool call recovered");
@@ -288,6 +298,16 @@ async function main(): Promise<void> {
   const dockerTop = rankSkills("build a docker image for the app", allSkills, 5).map((r) => r.name);
   assert.ok(dockerTop.includes("dockerize") || dockerTop.includes("docker-compose"), `routing surfaces a docker skill (got ${dockerTop.join(",")})`);
   assert.equal(rankSkills("", allSkills).length, 0, "empty query → no matches");
+
+  // --- confident skill orchestration: auto-apply only on a dominant, name-exact match ---
+  assert.equal(confidentSkill("describe the project", allSkills), "project-overview", "confident: describe the project → project-overview");
+  assert.equal(confidentSkill("draw an architecture diagram of this project", allSkills), "architecture-diagram", "confident: → architecture-diagram");
+  assert.equal(confidentSkill("make a powerpoint about Q3 results", allSkills), null, "precision guard: 'powerpoint' must NOT auto-apply 'low-power'");
+  assert.equal(confidentSkill("what is 2 + 2", allSkills), null, "ambiguous query → no auto-apply");
+  // LOADED was set by registerSkillTool(allSkills) above, so routeConfident/skillBody resolve a body.
+  const applied = routeConfident("describe the project");
+  assert.ok(applied?.name === "project-overview" && /purpose/i.test(applied.body), "routeConfident returns the skill body to inject");
+  assert.equal(routeConfident("make a powerpoint about Q3 results"), null, "routeConfident respects the precision guard");
 
   // --- connector catalog (read-only; does not touch .ada/mcp.json) ---
   const catalog = listConnectors();

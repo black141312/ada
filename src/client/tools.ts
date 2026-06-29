@@ -200,7 +200,9 @@ function isProtected(abs: string): boolean {
   return pats.some((g) => rel.includes(g) || abs.includes(g) || globMatch(rel, g));
 }
 
-const DESTRUCTIVE = /\brm\s+-[a-z]*[rf]|\brmdir\b|\bdd\b|mkfs|>\s*\/dev\/|:\(\)\s*\{|git\s+push\b[^\n]*--force|git\s+reset\s+--hard|\bshutdown\b|\breboot\b|\bkillall\b|chmod\s+-R|chown\s+-R/i;
+// Note the /dev/ rule excludes the standard sinks (>/dev/null, 2>/dev/null, /dev/stdout, …) — those
+// are everyday redirects, not device-overwrites like `> /dev/sda`.
+const DESTRUCTIVE = /\brm\s+-[a-z]*[rf]|\brmdir\b|\bdd\b|mkfs|>\s*\/dev\/(?!(?:null|stdout|stderr|tty|zero|u?random)(?:$|[\s>;&|])|fd\/)|:\(\)\s*\{|git\s+push\b[^\n]*--force|git\s+reset\s+--hard|\bshutdown\b|\breboot\b|\bkillall\b|chmod\s+-R|chown\s+-R/i;
 /** True for shell commands dangerous enough to always confirm, even in auto-approve. */
 export function isDestructive(command: string): boolean {
   return DESTRUCTIVE.test(command);
