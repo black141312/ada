@@ -73,7 +73,7 @@ export function confidentSkill(query: string, items: RankItem[]): string | null 
   const ranked = rankSkills(query, items, 2);
   const top = ranked[0];
   if (!top || top.score < 4) return null;
-  if (ranked[1] && top.score < ranked[1].score * 1.5) return null;
+  if (ranked[1] && top.score < ranked[1].score * 1.3) return null; // reject ties/near-ties; the name-exact gate below is the real precision guard
   const q = new Set(tokenize(query));
   return tokenize(top.name).some((t) => q.has(t)) ? top.name : null;
 }
