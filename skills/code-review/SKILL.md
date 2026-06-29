@@ -1,6 +1,7 @@
 ---
 name: code-review
 description: Review the current git diff for correctness bugs and quality/simplification issues.
+category: review
 ---
 
 # Code review

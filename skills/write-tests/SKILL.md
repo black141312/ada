@@ -1,6 +1,7 @@
 ---
 name: write-tests
 description: Write and run focused tests for a change — find the runner, add cases, run, report.
+category: testing
 ---
 
 # Write tests

@@ -1,6 +1,7 @@
 ---
 name: ponytail
 description: Force the laziest solution that actually works — YAGNI, stdlib before deps, shortest diff.
+category: meta
 ---
 
 # Ponytail

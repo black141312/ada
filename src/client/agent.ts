@@ -37,6 +37,7 @@ function systemPrompt(includeProject: boolean): string {
       `Working directory: ${process.cwd()}`,
       `Platform: ${process.platform}`,
       "Tools: read_file, write_file, edit_file, bash, ls, grep, glob. Use grep/glob/ls to explore the codebase; read a file before editing it; prefer edit_file for changes to existing files.",
+      "Specialized skills are available: call list_skills to browse them (by category or filter), then use_skill to load one before a specialized task.",
       "Be concise. Don't narrate routine actions or pad with preamble. When you have enough information to act, act. Ask only when genuinely blocked or before destructive, irreversible actions.",
     ].join("\n") + (includeProject ? projectContext() : "")
   );

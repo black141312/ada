@@ -1,6 +1,7 @@
 ---
 name: commit
 description: Stage changes and write a clean Conventional Commits message, then commit.
+category: git
 ---
 
 # Commit

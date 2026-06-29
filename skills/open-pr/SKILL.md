@@ -1,6 +1,7 @@
 ---
 name: open-pr
 description: Push the current branch and open a GitHub PR with a structured title and body.
+category: git
 ---
 
 # Open a PR

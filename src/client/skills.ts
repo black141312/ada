@@ -1,6 +1,7 @@
 // Skills: SKILL.md files in .ada/skills/<name>/SKILL.md (or .ada/skills/<name>.md), project or
-// global. Their name+description are advertised to the model; a `use_skill` tool returns the full
-// instructions on demand, so the model pulls in specialized guidance only when it needs it.
+// global, plus the ones bundled with ada. A `list_skills` tool lets the model browse them on demand
+// (so the per-request tool surface stays small even with hundreds of skills); `use_skill` then
+// returns the full instructions for one by name.
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { readdirSync } from "node:fs";
@@ -16,6 +17,7 @@ export interface Skill {
   name: string;
   description: string;
   path: string;
+  category?: string;
 }
 
 function skillDirs(includeProject: boolean): string[] {
@@ -24,9 +26,10 @@ function skillDirs(includeProject: boolean): string[] {
   return includeProject ? [resolve(process.cwd(), ".ada", "skills"), global, BUNDLED] : [global, BUNDLED];
 }
 
-function frontDescription(md: string): string | undefined {
+/** Read one `key: value` line from a SKILL.md's `---` front-matter. */
+function frontField(md: string, key: string): string | undefined {
   const m = md.match(/^---\n([\s\S]*?)\n---/);
-  return m?.[1]?.match(/description:\s*(.*)/)?.[1]?.trim();
+  return m?.[1]?.match(new RegExp(`^${key}:\\s*(.*)$`, "m"))?.[1]?.trim();
 }
 
 export function loadSkills(includeProject: boolean): Skill[] {
@@ -45,9 +48,10 @@ export function loadSkills(includeProject: boolean): Skill[] {
       const file = existsSync(nested) ? nested : entry.endsWith(".md") && existsSync(flat) && statSync(flat).isFile() ? flat : null;
       if (!file) continue;
       const name = entry.replace(/\.md$/, "");
-      if (skills.some((s) => s.name === name)) continue; // project wins over global
+      if (skills.some((s) => s.name === name)) continue; // project wins over global wins over bundled
       try {
-        skills.push({ name, description: frontDescription(readFileSync(file, "utf8")) ?? "(no description)", path: file });
+        const md = readFileSync(file, "utf8");
+        skills.push({ name, description: frontField(md, "description") ?? "(no description)", path: file, category: frontField(md, "category") });
       } catch {
         /* ignore */
       }
@@ -56,18 +60,54 @@ export function loadSkills(includeProject: boolean): Skill[] {
   return skills;
 }
 
-/** Register a `use_skill` tool that returns a skill's full instructions on demand. */
+/** Register `list_skills` (browse on demand) + `use_skill` (load one's full instructions). */
 export function registerSkillTool(skills: Skill[]): void {
   if (!skills.length) return;
   const byName = new Map(skills.map((s) => [s.name, s]));
+  const catOf = (s: Skill): string => s.category ?? "other";
+
+  registerTool({
+    name: "list_skills",
+    description:
+      "Browse available skills. Optional `category` to list one category, or `filter` substring to search names + descriptions. With no args, returns the categories and their counts. Then load one with use_skill.",
+    parameters: { type: "object", properties: { category: { type: "string" }, filter: { type: "string" } }, additionalProperties: false },
+    needsApproval: false,
+    async run(args) {
+      const cat = args.category ? String(args.category).toLowerCase() : "";
+      const filt = args.filter ? String(args.filter).toLowerCase() : "";
+      if (!cat && !filt) {
+        const counts = new Map<string, number>();
+        for (const s of skills) counts.set(catOf(s), (counts.get(catOf(s)) ?? 0) + 1);
+        const lines = [...counts.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([c, n]) => `${c} (${n})`);
+        return { output: `${skills.length} skills across ${counts.size} categories. Pass {category} or {filter} to list them.\n${lines.join(" · ")}` };
+      }
+      let matched = skills;
+      if (cat) matched = matched.filter((s) => catOf(s).toLowerCase() === cat);
+      if (filt) matched = matched.filter((s) => `${s.name} ${s.description}`.toLowerCase().includes(filt));
+      if (!matched.length) return { output: `No skills match${cat ? ` category=${cat}` : ""}${filt ? ` filter=${filt}` : ""}.` };
+      const byCat = new Map<string, Skill[]>();
+      for (const s of matched) {
+        const c = catOf(s);
+        const arr = byCat.get(c) ?? [];
+        if (!byCat.has(c)) byCat.set(c, arr);
+        arr.push(s);
+      }
+      const out = [...byCat.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([c, list]) => `## ${c}\n${list.map((s) => `- ${s.name} — ${s.description}`).join("\n")}`)
+        .join("\n\n");
+      return { output: out };
+    },
+  });
+
   registerTool({
     name: "use_skill",
-    description: `Load a skill's full instructions before a specialized task. Available: ${skills.map((s) => `${s.name} — ${s.description}`).join("; ")}`,
+    description: "Load a skill's full instructions by name before a specialized task. Call list_skills first to see what's available (~200 skills across many categories).",
     parameters: { type: "object", properties: { name: { type: "string" } }, required: ["name"], additionalProperties: false },
     needsApproval: false,
     async run(args) {
       const s = byName.get(String(args.name));
-      if (!s) return { output: `Unknown skill: ${String(args.name)}. Available: ${[...byName.keys()].join(", ")}`, isError: true };
+      if (!s) return { output: `Unknown skill: ${String(args.name)}. Call list_skills to see available skills.`, isError: true };
       try {
         return { output: readFileSync(s.path, "utf8") };
       } catch (e) {

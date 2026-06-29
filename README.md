@@ -114,20 +114,21 @@ enter the device code in your browser. The token is stored locally and sent as y
 
 ## Skills
 
-ada ships with built-in **skills** — specialized instructions the model pulls in only when a task
-needs them (progressive disclosure). The model loads one via the `use_skill` tool:
+ada ships with **~200 built-in skills** across 28 categories — specialized instructions the model
+pulls in only when a task needs them (progressive disclosure). It browses them with the
+**`list_skills`** tool (by `category` or `filter`) and loads one with **`use_skill`**, so nothing
+bloats the prompt until it's actually used. A sample of the categories:
 
-| Skill | What it does |
-|---|---|
-| `commit` | Stage changes and write a clean Conventional Commits message |
-| `code-review` | Review the current diff for correctness bugs + quality issues |
-| `write-tests` | Find the test runner, add focused cases, run them, report |
-| `open-pr` | Push the branch and open a GitHub PR (`gh`) with a structured body |
-| `ponytail` | Force the laziest solution that works — YAGNI, stdlib before deps, shortest diff |
+`git` · `review` · `testing` · `debugging` · `refactoring` · `docs` · `security` · `ci-cd` ·
+`performance` · `database` · `api` · `frontend` · `languages` · `frameworks` · `mobile` · `cloud` ·
+`observability` · `data-ml` · `agent-llm` · `web3` · `networking` · `shell` · `compliance` · …
+
+Examples: `commit`, `code-review`, `dockerize`, `migration`, `react-hooks`, `terraform-module`,
+`rag-pipeline`, `security-audit`, `ponytail`.
 
 Add your own as `SKILL.md` files under `.ada/skills/<name>/` (project) or `~/.ada/skills/<name>/`
-(global) — a `---\ndescription: …\n---` front-matter line is all that's required. Project skills
-override global, which override the built-ins.
+(global) — `---\ndescription: …\ncategory: …\n---` front-matter is all that's required. Project
+skills override global, which override the built-ins.
 
 ## Configuration
 

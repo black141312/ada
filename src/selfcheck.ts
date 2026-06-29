@@ -219,11 +219,20 @@ async function main(): Promise<void> {
   assert.ok(bar.includes("\x1b[48;5;238m"), "user bar has a full-width background");
   assert.ok(userBar("x".repeat(200), 40).length > 40, "over-long input does not crash padding");
 
-  // --- bundled skills load (commit, code-review, write-tests, open-pr) ---
-  const skillNames = loadSkills(true).map((s) => s.name);
-  for (const want of ["commit", "code-review", "write-tests", "open-pr", "ponytail"]) {
+  // --- bundled skills load + scalable discovery (list_skills / slim use_skill) ---
+  const allSkills = loadSkills(true);
+  const skillNames = allSkills.map((s) => s.name);
+  assert.ok(skillNames.length >= 200, `>=200 skills load (got ${skillNames.length})`);
+  for (const want of ["commit", "ponytail", "dockerize", "migration", "react-hooks", "terraform-module"]) {
     assert.ok(skillNames.includes(want), `bundled skill present: ${want}`);
   }
+  registerSkillTool(allSkills);
+  const useSkill = toolByName.get("use_skill")!;
+  assert.ok(useSkill.description.length < 400, `use_skill description is slim (got ${useSkill.description.length})`);
+  const listSkills = toolByName.get("list_skills")!;
+  const filtered = (await listSkills.run({ filter: "docker" })).output;
+  assert.ok(/dockerize/.test(filtered) && !/migration/.test(filtered), "list_skills filter narrows results");
+  assert.ok(/categories/.test((await listSkills.run({})).output), "list_skills overview lists categories");
 
   // --- login allowlist ---
   assert.ok(isAllowed("anyone"), "no allowlist → allow any authenticated user");
