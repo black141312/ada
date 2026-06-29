@@ -217,6 +217,18 @@ async function main(): Promise<void> {
   assert.deepEqual(await getDiagnostics(join(tmpdir(), "x.ts")), [], "getDiagnostics no-ops when untrusted/no server (never throws)");
   const bashRun = await toolByName.get("bash")!.run({ command: "echo pty-probe-123" });
   assert.ok(/pty-probe-123/.test(bashRun.output) && /exit 0/.test(bashRun.output), `bash runs a command (PTY): ${bashRun.output.slice(0, 60)}`);
+
+  // --- apply_patch: create → update → delete across files ---
+  const ap = toolByName.get("apply_patch")!;
+  const apDir = join(tmpdir(), `ada-ap-${process.pid}`);
+  mkdirSync(apDir, { recursive: true });
+  const apFile = join(apDir, "a.txt");
+  assert.ok(!(await ap.run({ files: [{ path: apFile, action: "create", content: "hello\n" }] })).isError && existsSync(apFile), "apply_patch create");
+  await ap.run({ files: [{ path: apFile, action: "update", edits: [{ old_text: "hello", new_text: "world" }] }] });
+  assert.ok(/world/.test(readFileSync(apFile, "utf8")), "apply_patch update");
+  await ap.run({ files: [{ path: apFile, action: "delete" }] });
+  assert.ok(!existsSync(apFile), "apply_patch delete");
+  rmSync(apDir, { recursive: true, force: true });
   assert.equal((await toolByName.get("web_fetch")!.run({ url: "http://127.0.0.1/x" })).isError, true, "web_fetch blocks loopback (SSRF guard)");
 
   // --- leaked tool-call recovery (Ollama-over-stream emits the call as text) ---

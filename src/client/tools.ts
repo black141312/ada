@@ -2,7 +2,7 @@
 
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { glob as fsGlob } from "node:fs/promises";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import type * as PtyType from "node-pty";
@@ -313,7 +313,7 @@ export const tools: Tool[] = [
         } catch (e) {
           return { output: String(e), isError: true };
         }
-        const bom = raw.startsWith("\uFEFF");
+        const bom = raw.charCodeAt(0) === 0xfeff;
         if (bom) raw = raw.slice(1);
         const eol = raw.includes("\r\n") ? "\r\n" : "\n";
         let content = norm(raw);
@@ -326,7 +326,7 @@ export const tools: Tool[] = [
           content = content.replace(old, neu);
         }
         let out = eol === "\r\n" ? content.replace(/\n/g, "\r\n") : content;
-        if (bom) out = `\uFEFF${out}`;
+        if (bom) out = String.fromCharCode(0xfeff) + out;
         checkpoint.record(abs);
         try {
           writeFileSync(abs, out, "utf8");
@@ -568,6 +568,111 @@ export const tools: Tool[] = [
       } catch (e) {
         return { output: `search failed: ${e instanceof Error ? e.message : e}`, isError: true };
       }
+    },
+  },
+  {
+    name: "apply_patch",
+    description: "Apply a coordinated change across multiple files in one call. Each file has an action: create (full content), update (exact-match edits), or delete. Prefer this over many edit_file calls for multi-file changes.",
+    parameters: {
+      type: "object",
+      properties: {
+        files: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              action: { type: "string", enum: ["create", "update", "delete"] },
+              content: { type: "string", description: "create: the full file content" },
+              edits: {
+                type: "array",
+                description: "update: exact-match replacements applied in order",
+                items: { type: "object", properties: { old_text: { type: "string" }, new_text: { type: "string" } }, required: ["old_text", "new_text"], additionalProperties: false },
+              },
+            },
+            required: ["path", "action"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["files"],
+      additionalProperties: false,
+    },
+    needsApproval: true,
+    async run(args) {
+      const files = Array.isArray(args.files) ? (args.files as Array<Record<string, unknown>>) : [];
+      if (!files.length) return { output: "No files in patch.", isError: true };
+      const lines: string[] = [];
+      let anyErr = false;
+      const norm = (s: string): string => s.replace(/\r\n/g, "\n");
+      for (const f of files) {
+        const p = String(f.path ?? "");
+        const abs = resolve(process.cwd(), p);
+        const action = String(f.action);
+        if (isProtected(abs)) {
+          lines.push(`✗ ${p}: protected path`);
+          anyErr = true;
+          continue;
+        }
+        try {
+          if (action === "delete") {
+            if (!existsSync(abs)) {
+              lines.push(`✗ ${p}: not found`);
+              anyErr = true;
+              continue;
+            }
+            checkpoint.record(abs);
+            rmSync(abs);
+            lines.push(`− ${p} (deleted)`);
+          } else if (action === "create") {
+            checkpoint.record(abs);
+            mkdirSync(dirname(abs), { recursive: true });
+            const content = String(f.content ?? "");
+            writeFileSync(abs, content, "utf8");
+            const fmt = formatFile(abs);
+            lines.push(`+ ${p} (${content.length} bytes${fmt ? ", formatted" : ""})`);
+          } else if (action === "update") {
+            if (!existsSync(abs)) {
+              lines.push(`✗ ${p}: not found`);
+              anyErr = true;
+              continue;
+            }
+            let raw = readFileSync(abs, "utf8");
+            const bom = raw.charCodeAt(0) === 0xfeff;
+            if (bom) raw = raw.slice(1);
+            const eol = raw.includes("\r\n") ? "\r\n" : "\n";
+            let content = norm(raw);
+            const edits = Array.isArray(f.edits) ? (f.edits as Array<Record<string, unknown>>) : [];
+            let ok = true;
+            for (const e of edits) {
+              const old = norm(String(e.old_text ?? ""));
+              const neu = norm(String(e.new_text ?? ""));
+              const count = old ? content.split(old).length - 1 : 0;
+              if (count !== 1) {
+                lines.push(`✗ ${p}: an edit matched ${count} times (must be exactly 1)`);
+                anyErr = true;
+                ok = false;
+                break;
+              }
+              content = content.replace(old, neu);
+            }
+            if (!ok) continue;
+            checkpoint.record(abs);
+            let out = eol === "\r\n" ? content.replace(/\n/g, "\r\n") : content;
+            if (bom) out = String.fromCharCode(0xfeff) + out;
+            writeFileSync(abs, out, "utf8");
+            const fmt = formatFile(abs);
+            lines.push(`~ ${p} (${edits.length} edit${edits.length === 1 ? "" : "s"}${fmt ? ", formatted" : ""})`);
+          } else {
+            lines.push(`✗ ${p}: unknown action "${action}"`);
+            anyErr = true;
+          }
+        } catch (e) {
+          lines.push(`✗ ${p}: ${e instanceof Error ? e.message : e}`);
+          anyErr = true;
+        }
+      }
+      return { output: lines.join("\n"), isError: anyErr };
     },
   },
   {
