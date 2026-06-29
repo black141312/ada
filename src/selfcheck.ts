@@ -16,6 +16,7 @@ import { userBar } from "./client/tui.ts";
 import { configuredServers, listConnectors, loadMcpServers } from "./client/mcp.ts";
 import { rankSkills } from "./client/skill-router.ts";
 import { getDiagnostics } from "./client/lsp.ts";
+import { snapshot } from "./client/snapshot.ts";
 import { formatFile, htmlToText, isDestructive, registerTool, setAsker, toolByName } from "./client/tools.ts";
 import * as checkpoint from "./client/checkpoint.ts";
 import { renderTodos, setTodos } from "./client/todos.ts";
@@ -240,6 +241,10 @@ async function main(): Promise<void> {
 
   // --- grep still works (rg fast path falls back to the JS scan when rg is absent) ---
   assert.ok(/tools\.ts/.test((await toolByName.get("grep")!.run({ pattern: "export const tools", path: "src/client" })).output), "grep finds matches");
+
+  // --- workspace snapshot returns a git tree SHA (or null outside a repo); never throws ---
+  const snap = snapshot();
+  assert.ok(snap === null || /^[0-9a-f]{40}$/.test(snap), "snapshot returns a tree SHA");
   assert.equal((await toolByName.get("web_fetch")!.run({ url: "http://127.0.0.1/x" })).isError, true, "web_fetch blocks loopback (SSRF guard)");
 
   // --- leaked tool-call recovery (Ollama-over-stream emits the call as text) ---

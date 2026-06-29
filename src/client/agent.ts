@@ -402,6 +402,13 @@ export class Agent {
     return this.strategy;
   }
 
+  /** Inject a system message (used by named-agent profiles). */
+  pushSystem(text: string): void {
+    const m: Msg = { role: "system", content: text };
+    this.messages.push(m);
+    this.session.append(m);
+  }
+
   setOnApprove(fn: OnApprove): void {
     this.onApprove = fn;
   }

@@ -22,6 +22,7 @@ export interface Settings {
   protectedPaths?: string[];
   confirmDestructive?: boolean;
   permissions?: PermRule[]; // per-tool allow/ask/deny rules; last match wins
+  agents?: Record<string, { description?: string; prompt?: string; permissions?: PermRule[] }>; // named agent profiles
 }
 
 const GLOBAL = join(homedir(), ".ada", "settings.json");
@@ -59,9 +60,15 @@ function globMatch(pat: string, s: string): boolean {
   return re.test(s);
 }
 
+// A named agent's permission rules override the configured ones while it's active.
+let activeAgentPerms: PermRule[] | null = null;
+export function setActiveAgentPermissions(rules: PermRule[] | null): void {
+  activeAgentPerms = rules;
+}
+
 /** Evaluate the configured permission rules for a tool call. null = no matching rule (use defaults). */
 export function permissionFor(toolName: string, summary: string): PermAction | null {
-  const rules = loadSettings(isTrusted(process.cwd())).permissions ?? [];
+  const rules = activeAgentPerms ?? loadSettings(isTrusted(process.cwd())).permissions ?? [];
   let result: PermAction | null = null;
   for (const r of rules) {
     const toolOk = !r.tool || r.tool === toolName || globMatch(r.tool, toolName);

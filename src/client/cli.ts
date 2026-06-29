@@ -1,7 +1,8 @@
 // ada client REPL. Talks only to the ada backend.
 
 import { createInterface } from "node:readline/promises";
-import { basename, dirname, join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { basename, dirname, join, resolve } from "node:path";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { stdin, stdout } from "node:process";
@@ -11,7 +12,7 @@ import { expandPrompt, loadPrompts } from "./prompts.ts";
 import { Session, list, type SessionMeta } from "./session.ts";
 import { deleteCredential, getCredential, listCredentials } from "../server/credentials.ts";
 import { deviceLogin, oauthConfig } from "../server/oauth.ts";
-import { addTrust, isTrusted, loadSettings } from "./settings.ts";
+import { addTrust, isTrusted, loadSettings, setActiveAgentPermissions, type Settings } from "./settings.ts";
 import { getCommands, loadExtensions } from "./extensions.ts";
 import { registerTool, setAsker } from "./tools.ts";
 import { addRemoteSkill, loadSkills, registerSkillTool } from "./skills.ts";
@@ -21,6 +22,7 @@ import { runTui } from "./tui-mode.ts";
 import { loadImage } from "./image.ts";
 import { notify, readClipboard, readClipboardImage } from "./platform.ts";
 import { undoAll } from "./checkpoint.ts";
+import { restore as restoreSnapshot, snapshot } from "./snapshot.ts";
 import { renderTodos } from "./todos.ts";
 import { track } from "./telemetry.ts";
 
@@ -55,6 +57,16 @@ interface Flags {
   rpc?: boolean;
   tui?: boolean;
   strategy?: string;
+  agent?: string;
+}
+
+/** Activate a named agent profile (prompt + permission rules) from settings. Returns false if unknown. */
+function switchAgent(agent: Agent, name: string, settings: Settings): boolean {
+  const profile = settings.agents?.[name];
+  if (!profile) return false;
+  setActiveAgentPermissions(profile.permissions ?? null);
+  if (profile.prompt) agent.pushSystem(`You are now acting as the "${name}" agent. ${profile.prompt}`);
+  return true;
 }
 
 function parseArgs(argv: string[]): Flags {
@@ -80,6 +92,8 @@ function parseArgs(argv: string[]): Flags {
       f.tui = true;
     } else if (a === "--strategy") {
       f.strategy = argv[++i];
+    } else if (a === "--agent") {
+      f.agent = argv[++i];
     }
   }
   return f;
@@ -445,6 +459,47 @@ async function main(): Promise<void> {
     console.error("usage: ada mcp [list | add <name> | remove <name>]");
     process.exit(1);
   }
+  if (sub === "worktree" || sub === "wt") {
+    const action = process.argv[3] ?? "list";
+    const git = (...a: string[]): { status: number | null; out: string } => {
+      const r = spawnSync("git", a, { encoding: "utf8", cwd: process.cwd() });
+      return { status: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() };
+    };
+    if (action === "list" || action === "ls") {
+      const r = git("worktree", "list");
+      console.log(r.status === 0 ? r.out : "(not a git repo or no worktrees)");
+      return;
+    }
+    if (action === "add" || action === "new") {
+      const name = process.argv[4];
+      if (!name) {
+        console.error("usage: ada worktree add <name>");
+        process.exit(1);
+      }
+      const branch = `ada/${name}`;
+      const dir = resolve(process.cwd(), "..", `${basename(process.cwd())}-${name}`);
+      const r = git("worktree", "add", "-b", branch, dir);
+      if (r.status !== 0) {
+        console.error(r.out || "git worktree add failed");
+        process.exit(1);
+      }
+      console.log(`\x1b[38;5;214m✓\x1b[0m worktree ${dir}\n  branch ${branch} — cd "${dir}" && ada`);
+      return;
+    }
+    if (action === "remove" || action === "rm") {
+      const name = process.argv[4];
+      if (!name) {
+        console.error("usage: ada worktree remove <name>");
+        process.exit(1);
+      }
+      const dir = resolve(process.cwd(), "..", `${basename(process.cwd())}-${name}`);
+      const r = git("worktree", "remove", dir);
+      console.log(r.status === 0 ? `removed ${dir}` : r.out);
+      return;
+    }
+    console.error("usage: ada worktree [list | add <name> | remove <name>]");
+    process.exit(1);
+  }
   if (sub === "skill") {
     const action = process.argv[3] ?? "list";
     if (action === "add") {
@@ -680,6 +735,7 @@ async function main(): Promise<void> {
     history,
   });
   if (flags.strategy) agent.setStrategy(flags.strategy);
+  if (flags.agent && !switchAgent(agent, flags.agent, settings)) console.error(`unknown agent: ${flags.agent} (configure in .ada/settings.json)`);
 
   if (flags.tui && stdin.isTTY) {
     rl.close(); // hand stdin to the TUI so readline doesn't echo keystrokes too
@@ -738,6 +794,15 @@ async function main(): Promise<void> {
     }
     if (line === "/undo") {
       console.log(undoAll());
+      continue;
+    }
+    if (line === "/snapshot") {
+      const t = snapshot();
+      console.log(t ? `\x1b[38;5;214m✓\x1b[0m snapshot saved (${t.slice(0, 8)}) — /restore to roll back the whole tree` : "snapshot failed (not a git repo?)");
+      continue;
+    }
+    if (line === "/restore") {
+      console.log(restoreSnapshot() ? "\x1b[38;5;214m✓\x1b[0m restored the working tree to the last snapshot" : "nothing to restore (take a /snapshot first)");
       continue;
     }
     if (line === "/todos") {
@@ -804,6 +869,13 @@ async function main(): Promise<void> {
       } else {
         console.log(`strategy: ${agent.getStrategy()} (react | single | plan | multi | toolsmith)`);
       }
+      continue;
+    }
+    if (line === "/agent" || line.startsWith("/agent ")) {
+      const name = line.slice("/agent".length).trim();
+      if (!name) console.log(`agents: ${Object.keys(settings.agents ?? {}).join(", ") || "(none — configure in .ada/settings.json)"}`);
+      else if (switchAgent(agent, name, settings)) console.log(`agent → ${name}`);
+      else console.log(`unknown agent: ${name}`);
       continue;
     }
     if (line === "/image" || line.startsWith("/image ")) {
