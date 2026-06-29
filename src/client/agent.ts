@@ -9,6 +9,7 @@ import { MarkdownStreamer } from "./render.ts";
 import { type Tool, type ToolResult, isDestructive, toolByName, tools } from "./tools.ts";
 import { afterTool, beforeTool, transformInput } from "./hooks.ts";
 import { configuredServers } from "./mcp.ts";
+import { permissionFor } from "./settings.ts";
 import { routeSkills } from "./skills.ts";
 import { Session } from "./session.ts";
 
@@ -649,19 +650,27 @@ export class Agent {
         results[i] = { output: `Unknown tool: ${c.name}`, isError: true };
         continue;
       }
-      if (!tool.needsApproval) {
+      const perm = permissionFor(c.name, summarize(args)); // configured allow/ask/deny rule, if any
+      if (perm === "deny") {
+        printCall(c.name, args);
+        results[i] = { output: "Denied by permission policy.", isError: true };
+        printResult(results[i]!);
+        continue;
+      }
+      if (!tool.needsApproval && perm !== "ask") {
         parallel.push(i);
         continue;
       }
-      // gated tool → sequential (so approval prompts and same-file writes don't race)
+      // gated tool (or a rule forces "ask") → sequential (so prompts and same-file writes don't race)
       printCall(c.name, args);
-      if (this.planMode) {
+      if (this.planMode && tool.needsApproval) {
         results[i] = { output: "Plan mode: not executing — finish the plan; the user approves with /run." };
         printResult(results[i]!);
         continue;
       }
       const forceConfirm = c.name === "bash" && isDestructive(String(args.command ?? ""));
-      if (this.autoApprove && !forceConfirm) {
+      const autoOk = (this.autoApprove || perm === "allow") && !forceConfirm && perm !== "ask";
+      if (autoOk) {
         results[i] = await runTool(tool, c.name, args);
       } else {
         const decision = await this.onApprove(c.name, forceConfirm ? `⚠ destructive: ${summarize(args)}` : summarize(args));
