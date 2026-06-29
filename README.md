@@ -68,17 +68,34 @@ field always wins. Set only the keys you have — the rest stay dormant (vendor 
 
 ## Install
 
-Requires **Node ≥ 18**.
+Requires **Node ≥ 18** (and a C toolchain, since `node-pty` builds natively).
+
+**Run it without installing — `npx`:**
+
+```bash
+npx @black141312/ada                       # the client   (published to npm)
+npx -p @black141312/ada ada-server         # the backend  (second bin in the same package)
+# straight from source, no publish needed:
+npx github:black141312/ada
+```
+
+**Install globally** (puts `ada` and `ada-server` on your PATH):
+
+```bash
+npm install -g @black141312/ada
+ada
+```
+
+**From a clone** (for hacking on it):
 
 ```bash
 git clone https://github.com/black141312/ada.git
-cd ada
-npm install
-npm link          # puts `ada` and `ada-server` on your PATH
+cd ada && npm install
+npm link            # global `ada` / `ada-server`  ·  or `npm start`
 ```
 
-`npm link` makes `ada` a global command. (Prefer not to link? Use `npm start` from the repo, or
-`npm install -g .`.) To remove it later: `npm unlink -g ada`.
+> The published-npm commands work once a maintainer has run `npm publish`; the `github:` form works
+> against the repo today.
 
 ## Quickstart
 
