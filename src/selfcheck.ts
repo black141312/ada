@@ -224,7 +224,7 @@ async function main(): Promise<void> {
   const allSkills = loadSkills(true);
   const skillNames = allSkills.map((s) => s.name);
   assert.ok(skillNames.length >= 200, `>=200 skills load (got ${skillNames.length})`);
-  for (const want of ["commit", "ponytail", "dockerize", "migration", "react-hooks", "terraform-module", "pixel-diff", "canvas-debug", "connect-github"]) {
+  for (const want of ["commit", "ponytail", "dockerize", "migration", "react-hooks", "terraform-module", "pixel-diff", "canvas-debug", "connect-github", "design-system"]) {
     assert.ok(skillNames.includes(want), `bundled skill present: ${want}`);
   }
   registerSkillTool(allSkills);

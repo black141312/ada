@@ -120,8 +120,9 @@ pulls in only when a task needs them (progressive disclosure). It browses them w
 bloats the prompt until it's actually used. A sample of the categories:
 
 `git` · `review` · `testing` · `debugging` · `refactoring` · `docs` · `security` · `ci-cd` ·
-`performance` · `database` · `api` · `frontend` · `languages` · `frameworks` · `mobile` · `cloud` ·
-`observability` · `data-ml` · `agent-llm` · `web3` · `networking` · `shell` · `compliance` · …
+`performance` · `database` · `api` · `frontend` · `ui-design` · `html` · `pptx` · `image` ·
+`graphics` · `languages` · `frameworks` · `mobile` · `cloud` · `observability` · `data-ml` ·
+`agent-llm` · `web3` · `networking` · `shell` · `connectors` · `compliance` · …
 
 Examples: `commit`, `code-review`, `dockerize`, `migration`, `react-hooks`, `terraform-module`,
 `rag-pipeline`, `security-audit`, `ponytail`.
