@@ -16,9 +16,11 @@ model is **zero code**, and a new OpenAI-compatible provider is **two lines**.
 
 - **Agentic loop** — streams, calls tools, feeds results back, repeats until done.
 - **Tools** — `read_file`, `write_file`, `edit_file` (exact-match), `bash`, `ls`, `grep`, `glob`,
-  `web_fetch` (URL → text), `web_search` (Brave API).
+  `web_fetch` (URL → text), `web_search` (Brave API), `lsp_diagnostics`.
 - **Auto-format on edit** — written files are formatted with the project's formatter
   (prettier/gofmt/rustfmt/ruff/shfmt) in trusted projects; off via `ADA_NO_FORMAT`.
+- **LSP diagnostics** — `lsp_diagnostics` runs a language server (typescript-language-server,
+  pyright, gopls, rust-analyzer) and returns errors/warnings; servers are reused, trusted-project only.
 - **Two front-ends** — a classic readline REPL and an inline **TUI** (`--tui`) with a live "thinking"
   spinner and Claude-style turn markers.
 - **Plan mode**, **todos**, **checkpoint/undo** (revert the agent's edits), **protected paths** +

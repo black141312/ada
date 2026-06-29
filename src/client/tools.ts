@@ -8,6 +8,7 @@ import { green, renderEditDiff } from "./render.ts";
 import * as checkpoint from "./checkpoint.ts";
 import { renderTodos, setTodos, type Todo } from "./todos.ts";
 import { isTrusted, loadSettings } from "./settings.ts";
+import { getDiagnostics } from "./lsp.ts";
 
 const MAX_OUTPUT = 30_000;
 
@@ -518,6 +519,27 @@ export const tools: Tool[] = [
         return { output: results.map((r) => `- ${r.title}\n  ${r.url}\n  ${htmlToText(r.description ?? "").slice(0, 200)}`).join("\n\n") };
       } catch (e) {
         return { output: `search failed: ${e instanceof Error ? e.message : e}`, isError: true };
+      }
+    },
+  },
+  {
+    name: "lsp_diagnostics",
+    description: "Get language-server diagnostics (errors/warnings) for a file — call after editing to check it compiles/type-checks. Needs the language server installed (typescript-language-server, pyright, gopls, rust-analyzer) in a trusted project.",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+      additionalProperties: false,
+    },
+    needsApproval: false,
+    async run(args) {
+      const abs = resolve(process.cwd(), String(args.path));
+      if (!existsSync(abs)) return { output: `File not found: ${String(args.path)}`, isError: true };
+      try {
+        const diags = await getDiagnostics(abs);
+        return { output: diags.length ? diags.join("\n") : "No diagnostics (clean, or no language server available for this file)." };
+      } catch (e) {
+        return { output: String(e), isError: true };
       }
     },
   },

@@ -15,6 +15,7 @@ import { parseTextToolCalls, readIntegrationDocs, soleIntegration, writeProjectS
 import { userBar } from "./client/tui.ts";
 import { configuredServers, listConnectors, loadMcpServers } from "./client/mcp.ts";
 import { rankSkills } from "./client/skill-router.ts";
+import { getDiagnostics } from "./client/lsp.ts";
 import { formatFile, htmlToText, isDestructive, registerTool, toolByName } from "./client/tools.ts";
 import * as checkpoint from "./client/checkpoint.ts";
 import { renderTodos, setTodos } from "./client/todos.ts";
@@ -212,6 +213,8 @@ async function main(): Promise<void> {
   assert.ok(/Hi/.test(ht) && /a & b/.test(ht) && /- one/.test(ht) && !/x\(\)/.test(ht), "htmlToText strips tags/scripts, decodes entities");
   assert.ok(toolByName.has("web_fetch") && toolByName.has("web_search"), "web tools registered");
   assert.equal(formatFile(join(tmpdir(), "x.go")), false, "formatFile is a safe no-op when untrusted/no formatter (never throws)");
+  assert.ok(toolByName.has("lsp_diagnostics"), "lsp_diagnostics tool registered");
+  assert.deepEqual(await getDiagnostics(join(tmpdir(), "x.ts")), [], "getDiagnostics no-ops when untrusted/no server (never throws)");
   assert.equal((await toolByName.get("web_fetch")!.run({ url: "http://127.0.0.1/x" })).isError, true, "web_fetch blocks loopback (SSRF guard)");
 
   // --- leaked tool-call recovery (Ollama-over-stream emits the call as text) ---
