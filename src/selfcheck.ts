@@ -2,7 +2,7 @@
 // Run with: npm run selfcheck
 
 import assert from "node:assert/strict";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { estimateTokens, isContextOverflowError, planCut } from "./client/compaction.ts";
@@ -11,9 +11,9 @@ import { expandPrompt } from "./client/prompts.ts";
 import { MarkdownStreamer, highlight, renderEditDiff } from "./client/render.ts";
 import { Session, list } from "./client/session.ts";
 import { loadSkills, registerSkillTool } from "./client/skills.ts";
-import { parseTextToolCalls } from "./client/agent.ts";
+import { parseTextToolCalls, readIntegrationDocs, soleIntegration, writeProjectSkills } from "./client/agent.ts";
 import { userBar } from "./client/tui.ts";
-import { listConnectors } from "./client/mcp.ts";
+import { configuredServers, listConnectors, loadMcpServers } from "./client/mcp.ts";
 import { isDestructive, registerTool, toolByName } from "./client/tools.ts";
 import * as checkpoint from "./client/checkpoint.ts";
 import { renderTodos, setTodos } from "./client/todos.ts";
@@ -240,6 +240,31 @@ async function main(): Promise<void> {
   assert.ok(catalog.length >= 8 && catalog.some((c) => c.name === "github"), "connector catalog populated");
   assert.ok(catalog.find((c) => c.name === "github")?.needsEnv.includes("GITHUB_PERSONAL_ACCESS_TOKEN"), "github connector declares its env var");
 
+  // --- toolsmith path end-to-end via a real stub MCP server (skips if a real .ada/mcp.json exists) ---
+  const adaDir = join(process.cwd(), ".ada");
+  const mcpCfg = join(adaDir, "mcp.json");
+  if (!existsSync(mcpCfg) && existsSync(join(process.cwd(), "test", "stub-mcp.mjs"))) {
+    mkdirSync(adaDir, { recursive: true });
+    writeFileSync(mcpCfg, JSON.stringify({ servers: { stub: { command: "node", args: ["test/stub-mcp.mjs"] } } }));
+    try {
+      const loaded = await loadMcpServers(true);
+      assert.ok(loaded.some((l) => l.startsWith("stub")), "stub MCP server connected + tools registered");
+      assert.deepEqual(configuredServers(), ["stub"], "configuredServers sees the stub");
+      assert.equal(soleIntegration(), "stub", "soleIntegration → stub");
+      const docs = readIntegrationDocs("stub");
+      assert.ok(/stub__echo/.test(docs) && /stub__add/.test(docs), "readDocs lists the stub's tools");
+      const n = writeProjectSkills([
+        { name: "stub-echo", content: "---\nname: stub-echo\ndescription: echo via the stub\ncategory: integration-stub\n---\n# Echo\n1. call stub__echo\n## Rules\n- keep it short" },
+        { name: "stub-junk", content: "not a skill file" },
+      ]);
+      assert.equal(n, 1, "writeProjectSkills writes valid skills and skips junk");
+      assert.ok(existsSync(join(adaDir, "skills", "stub-echo", "SKILL.md")), "stub-echo SKILL.md written");
+    } finally {
+      rmSync(mcpCfg, { force: true });
+      rmSync(join(adaDir, "skills", "stub-echo"), { recursive: true, force: true });
+    }
+  }
+
   // --- login allowlist ---
   assert.ok(isAllowed("anyone"), "no allowlist → allow any authenticated user");
   process.env.ADA_ALLOWED_USERS = "alice, bob";
@@ -248,6 +273,7 @@ async function main(): Promise<void> {
   delete process.env.ADA_ALLOWED_USERS;
 
   console.log("selfcheck OK");
+  process.exit(0); // a spawned stub MCP subprocess can hold stdin open — exit cleanly
 }
 
 main().catch((e) => {

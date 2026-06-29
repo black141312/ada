@@ -267,20 +267,20 @@ const toolsmith: Orchestrator = {
 const ORCHESTRATORS: Record<string, Orchestrator> = { react: reAct, single: singleShot, plan: planExecute, multi: multiAgent, toolsmith };
 
 /** The only integration configured in .ada/mcp.json, or null if zero or several. */
-function soleIntegration(): string | null {
+export function soleIntegration(): string | null {
   const servers = configuredServers();
   return servers.length === 1 ? servers[0]! : null;
 }
 
 /** "Docs" for an integration = the descriptions + schemas of its registered <name>__* tools. */
-function readIntegrationDocs(name: string): string {
+export function readIntegrationDocs(name: string): string {
   const tools_ = [...toolByName.values()].filter((t) => t.name.startsWith(`${name}__`));
   if (!tools_.length) return `(no tools registered for "${name}" — connect it in a trusted project first)`;
   return tools_.map((t) => `## ${t.name}\n${t.description}\nparameters: ${JSON.stringify(t.parameters)}`).join("\n\n");
 }
 
 /** Persist subagent-authored skills under the project's .ada/skills/. Returns how many were written. */
-function writeProjectSkills(drafts: { name: string; content: string }[]): number {
+export function writeProjectSkills(drafts: { name: string; content: string }[]): number {
   let n = 0;
   for (const d of drafts) {
     const body = String(d.content ?? "").trim();
