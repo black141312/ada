@@ -3,11 +3,25 @@
 Thanks for your interest. ada is deliberately small and dependency-light: TypeScript run straight
 through `tsx`, **no build step**. The whole thing is meant to stay readable in an afternoon.
 
+## Branches
+
+- **`dev`** is the default integration branch — **branch from it and open your PR against it.**
+- **`main`** holds tagged releases only. Maintainers merge `dev` → `main` and tag (`vX.Y.Z`) to cut
+  a release; please don't PR directly to `main`.
+- CI (`typecheck` + `selfcheck`) runs on every push and PR to both `dev` and `main`.
+
+```bash
+git switch dev && git pull
+git switch -c my-change      # work, commit
+# open a PR with base = dev
+```
+
 ## Setup
 
 ```bash
 git clone https://github.com/black141312/ada.git
 cd ada
+git switch dev      # contribute from dev, not main
 npm install
 npm link            # puts `ada` / `ada-server` on PATH (or just `npm start`)
 ```
