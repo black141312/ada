@@ -11,18 +11,23 @@ import type { Adapter, ChatRequest } from "./adapter.ts";
 
 function authHeaders(provider: ProviderName): Record<string, string> {
   const key = providerKey(provider);
-  return key ? { authorization: `Bearer ${key}` } : {};
+  const base: Record<string, string> = key ? { authorization: `Bearer ${key}` } : {};
+  // GitHub Copilot's endpoint requires these editor-identification headers.
+  if (provider === "copilot") return { ...base, "Copilot-Integration-Id": "vscode-chat", "Editor-Version": "ada/0.0.1", "Editor-Plugin-Version": "ada/0.0.1" };
+  return base;
 }
 
 export const openAICompatAdapter: Adapter = {
   async chat({ provider, body, res }: ChatRequest): Promise<void> {
     const def = PROVIDERS[provider];
+    // Copilot is addressed as "copilot/<model>" but the endpoint wants the bare model id.
+    const outBody = provider === "copilot" && typeof body.model === "string" && body.model.startsWith("copilot/") ? { ...body, model: body.model.slice("copilot/".length) } : body;
     let upstream: Awaited<ReturnType<typeof fetch>>;
     try {
       upstream = await fetch(`${def.baseURL}/chat/completions`, {
         method: "POST",
         headers: { "content-type": "application/json", ...authHeaders(provider) },
-        body: JSON.stringify(body),
+        body: JSON.stringify(outBody),
       });
     } catch (e) {
       res.writeHead(502, { "content-type": "application/json" });

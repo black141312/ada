@@ -22,6 +22,7 @@ const ADAPTERS: Record<ProviderName, Adapter> = {
   together: openAICompatAdapter,
   xai: openAICompatAdapter,
   dashscope: openAICompatAdapter, // Alibaba Qwen via DashScope's OpenAI-compatible endpoint
+  copilot: openAICompatAdapter, // GitHub Copilot's OpenAI-compatible endpoint (+ custom headers in the adapter)
   ollama: openAICompatAdapter,
 };
 

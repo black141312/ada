@@ -23,6 +23,8 @@ import { loadImage } from "./image.ts";
 import { notify, readClipboard, readClipboardImage } from "./platform.ts";
 import { undoAll } from "./checkpoint.ts";
 import { restore as restoreSnapshot, snapshot } from "./snapshot.ts";
+import { prefetch } from "./models-dev.ts";
+import { renderJobs, startJob } from "./background.ts";
 import { renderTodos } from "./todos.ts";
 import { track } from "./telemetry.ts";
 
@@ -524,7 +526,50 @@ async function main(): Promise<void> {
     console.error("usage: ada skill [list | add <url>]");
     process.exit(1);
   }
+  if (sub === "serve") {
+    const trusted = isTrusted(process.cwd());
+    const settings = loadSettings(trusted);
+    await loadExtensions(trusted);
+    registerSkillTool(loadSkills(trusted));
+    await loadMcpServers(trusted);
+    const client = makeClient();
+    let model = (process.argv[3] && !process.argv[3].startsWith("--") ? process.argv[3] : "") || process.env.ADA_MODEL || settings.model || "";
+    if (!model) {
+      try {
+        model = (await fetchModelIds(client))[0] ?? "";
+      } catch {
+        /* offline */
+      }
+    }
+    const port = Number(process.env.ADA_HTTP_PORT) || 8788;
+    const { createServer } = await import("node:http");
+    createServer((req, res) => {
+      if (req.method === "GET" && (req.url === "/health" || req.url === "/")) {
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, model }));
+        return;
+      }
+      if (req.method === "POST" && req.url === "/v1/prompt") {
+        let body = "";
+        req.on("data", (c) => (body += c));
+        req.on("end", async () => {
+          try {
+            const j = JSON.parse(body || "{}") as { text?: string; model?: string };
+            const agent = new Agent({ client, model: j.model || model, session: Session.create(), onApprove: async (): Promise<ApprovalDecision> => "yes", autoApprove: true, project: trusted, compactAt: settings.compactAt });
+            const text = await agent.send(String(j.text ?? ""), { quiet: true });
+            res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ text, usage: agent.usageReport() }));
+          } catch (e) {
+            res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }));
+          }
+        });
+        return;
+      }
+      res.writeHead(404).end();
+    }).listen(port, () => console.log(`ada HTTP API on http://localhost:${port}  ·  POST /v1/prompt {"text":"…"}  ·  model ${model || "(none — set one)"}`));
+    await new Promise(() => {}); // keep the process alive for the server
+    return;
+  }
   const flags = parseArgs(process.argv.slice(2));
+  void prefetch(); // warm the models.dev catalog (pricing/limits) in the background
   let client = makeClient();
 
   if (flags.listModels) {
@@ -723,6 +768,26 @@ async function main(): Promise<void> {
     },
   });
 
+  registerTool({
+    name: "background_task",
+    description: "Start a self-contained subtask in the background and return its job id immediately — don't wait for it. Use for long, independent work. The user checks results with /jobs.",
+    parameters: {
+      type: "object",
+      properties: { task: { type: "string", description: "The subtask, with all the context the sub-agent needs." } },
+      required: ["task"],
+      additionalProperties: false,
+    },
+    needsApproval: false,
+    async run(args) {
+      const task = String(args.task ?? "");
+      const id = startJob(task, async () => {
+        const sub = new Agent({ client, model, session: Session.create(), onApprove, autoApprove: true, project: includeProject, compactAt: settings.compactAt });
+        return sub.send(task, { quiet: true });
+      });
+      return { output: `Started background job ${id}. Check results with /jobs (don't wait on it).` };
+    },
+  });
+
   const agent = new Agent({
     client,
     model,
@@ -803,6 +868,10 @@ async function main(): Promise<void> {
     }
     if (line === "/restore") {
       console.log(restoreSnapshot() ? "\x1b[38;5;214m✓\x1b[0m restored the working tree to the last snapshot" : "nothing to restore (take a /snapshot first)");
+      continue;
+    }
+    if (line === "/jobs") {
+      console.log(renderJobs());
       continue;
     }
     if (line === "/todos") {

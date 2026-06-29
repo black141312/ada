@@ -11,6 +11,7 @@ export type ProviderName =
   | "together"
   | "xai"
   | "dashscope"
+  | "copilot"
   | "ollama";
 
 export interface ModelInfo {

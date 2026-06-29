@@ -9,6 +9,7 @@ import { MarkdownStreamer } from "./render.ts";
 import { type Tool, type ToolResult, isDestructive, toolByName, tools } from "./tools.ts";
 import { afterTool, beforeTool, transformInput } from "./hooks.ts";
 import { configuredServers } from "./mcp.ts";
+import { priceOf } from "./models-dev.ts";
 import { permissionFor } from "./settings.ts";
 import { routeSkills } from "./skills.ts";
 import { Session } from "./session.ts";
@@ -312,6 +313,8 @@ const PRICES: Record<string, [number, number]> = {
   "deepseek": [0.27, 1.1],
 };
 function priceFor(model: string): [number, number] | null {
+  const md = priceOf(model); // models.dev catalog (prefetched), if available
+  if (md) return md;
   for (const k of Object.keys(PRICES)) if (model.includes(k)) return PRICES[k]!;
   return null;
 }

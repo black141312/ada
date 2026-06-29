@@ -23,6 +23,10 @@ export const PROVIDERS: Record<ProviderName, ProviderDef> = {
     baseURL: process.env.DASHSCOPE_BASE_URL ?? "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     keyEnv: "DASHSCOPE_API_KEY",
   },
+  // GitHub Copilot — OpenAI-compatible chat endpoint. COPILOT_API_KEY must be a Copilot *bearer*
+  // token (exchanged from a GitHub OAuth token at /copilot_internal/v2/token — that exchange is not
+  // implemented here; it needs a Copilot subscription). Required headers are added in the adapter.
+  copilot: { baseURL: process.env.COPILOT_BASE_URL ?? "https://api.githubcopilot.com", keyEnv: "COPILOT_API_KEY" },
   ollama: { baseURL: process.env.OLLAMA_BASE_URL ?? "http://localhost:11434/v1", keyEnv: "" },
 };
 

@@ -11,6 +11,8 @@ export function route(model: string, explicit?: string): ProviderName {
 
   // "vendor/model" → OpenRouter's namespacing convention. Checked before base-name prefixes
   // so e.g. "mistralai/…" routes to OpenRouter, not the Mistral API.
+  // "copilot/<model>" → GitHub Copilot (checked before the OpenRouter "/" rule).
+  if (m.startsWith("copilot/")) return "copilot";
   if (m.includes("/")) return "openrouter";
   // "model:tag" → a local Ollama model (e.g. gemma4:latest).
   if (m.includes(":")) return "ollama";

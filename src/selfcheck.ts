@@ -17,6 +17,7 @@ import { configuredServers, listConnectors, loadMcpServers } from "./client/mcp.
 import { rankSkills } from "./client/skill-router.ts";
 import { getDiagnostics } from "./client/lsp.ts";
 import { snapshot } from "./client/snapshot.ts";
+import { renderJobs, startJob } from "./client/background.ts";
 import { formatFile, htmlToText, isDestructive, registerTool, setAsker, toolByName } from "./client/tools.ts";
 import * as checkpoint from "./client/checkpoint.ts";
 import { renderTodos, setTodos } from "./client/todos.ts";
@@ -245,6 +246,11 @@ async function main(): Promise<void> {
   // --- workspace snapshot returns a git tree SHA (or null outside a repo); never throws ---
   const snap = snapshot();
   assert.ok(snap === null || /^[0-9a-f]{40}$/.test(snap), "snapshot returns a tree SHA");
+
+  // --- background job runs and reports ---
+  const jid = startJob("selfcheck job", async () => "job-done-ok");
+  await new Promise((r) => setTimeout(r, 30));
+  assert.ok(renderJobs().includes(jid) && /job-done-ok/.test(renderJobs()), "background job runs and reports its result");
   assert.equal((await toolByName.get("web_fetch")!.run({ url: "http://127.0.0.1/x" })).isError, true, "web_fetch blocks loopback (SSRF guard)");
 
   // --- leaked tool-call recovery (Ollama-over-stream emits the call as text) ---
