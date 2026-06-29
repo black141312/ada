@@ -13,6 +13,7 @@ import { Session, list } from "./client/session.ts";
 import { loadSkills, registerSkillTool } from "./client/skills.ts";
 import { parseTextToolCalls } from "./client/agent.ts";
 import { userBar } from "./client/tui.ts";
+import { listConnectors } from "./client/mcp.ts";
 import { isDestructive, registerTool, toolByName } from "./client/tools.ts";
 import * as checkpoint from "./client/checkpoint.ts";
 import { renderTodos, setTodos } from "./client/todos.ts";
@@ -223,7 +224,7 @@ async function main(): Promise<void> {
   const allSkills = loadSkills(true);
   const skillNames = allSkills.map((s) => s.name);
   assert.ok(skillNames.length >= 200, `>=200 skills load (got ${skillNames.length})`);
-  for (const want of ["commit", "ponytail", "dockerize", "migration", "react-hooks", "terraform-module", "pixel-diff", "canvas-debug"]) {
+  for (const want of ["commit", "ponytail", "dockerize", "migration", "react-hooks", "terraform-module", "pixel-diff", "canvas-debug", "connect-github"]) {
     assert.ok(skillNames.includes(want), `bundled skill present: ${want}`);
   }
   registerSkillTool(allSkills);
@@ -233,6 +234,11 @@ async function main(): Promise<void> {
   const filtered = (await listSkills.run({ filter: "docker" })).output;
   assert.ok(/dockerize/.test(filtered) && !/migration/.test(filtered), "list_skills filter narrows results");
   assert.ok(/categories/.test((await listSkills.run({})).output), "list_skills overview lists categories");
+
+  // --- connector catalog (read-only; does not touch .ada/mcp.json) ---
+  const catalog = listConnectors();
+  assert.ok(catalog.length >= 8 && catalog.some((c) => c.name === "github"), "connector catalog populated");
+  assert.ok(catalog.find((c) => c.name === "github")?.needsEnv.includes("GITHUB_PERSONAL_ACCESS_TOKEN"), "github connector declares its env var");
 
   // --- login allowlist ---
   assert.ok(isAllowed("anyone"), "no allowlist → allow any authenticated user");

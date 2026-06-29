@@ -15,7 +15,7 @@ import { addTrust, isTrusted, loadSettings } from "./settings.ts";
 import { getCommands, loadExtensions } from "./extensions.ts";
 import { registerTool } from "./tools.ts";
 import { loadSkills, registerSkillTool } from "./skills.ts";
-import { loadMcpServers } from "./mcp.ts";
+import { addConnector, listConnectors, loadMcpServers, removeConnector } from "./mcp.ts";
 import { addExtension, selfUpdate } from "./pkg.ts";
 import { runTui } from "./tui-mode.ts";
 import { loadImage } from "./image.ts";
@@ -402,6 +402,45 @@ async function main(): Promise<void> {
   if (sub === "update") {
     selfUpdate();
     return;
+  }
+  if (sub === "mcp") {
+    const action = process.argv[3] ?? "list";
+    const name = process.argv[4];
+    if (action === "list" || action === "ls") {
+      console.log("Connector catalog (● configured · ○ available):\n");
+      for (const c of listConnectors()) {
+        const dot = c.configured ? "\x1b[38;5;214m●\x1b[0m" : "○";
+        const env = c.needsEnv.length ? `  \x1b[2m(set: ${c.needsEnv.join(", ")})\x1b[0m` : "";
+        console.log(`  ${dot} ${c.name.padEnd(14)} ${c.description}${env}`);
+      }
+      console.log("\n  ada mcp add <name>   ·   ada mcp remove <name>");
+      console.log("  custom server: edit .ada/mcp.json — a { command,args } (stdio) or { url } (http) entry");
+      return;
+    }
+    if (action === "add") {
+      if (!name) {
+        console.error("usage: ada mcp add <name>");
+        process.exit(1);
+      }
+      const r = addConnector(name);
+      if (!r.ok) {
+        console.error(r.error);
+        process.exit(1);
+      }
+      console.log(`\x1b[38;5;214m✓\x1b[0m added "${name}" to .ada/mcp.json`);
+      if (r.envVars.length) console.log(`  set before use: ${r.envVars.join(", ")}`);
+      return;
+    }
+    if (action === "remove" || action === "rm") {
+      if (!name) {
+        console.error("usage: ada mcp remove <name>");
+        process.exit(1);
+      }
+      console.log(removeConnector(name) ? `removed "${name}" from .ada/mcp.json` : `"${name}" was not configured`);
+      return;
+    }
+    console.error("usage: ada mcp [list | add <name> | remove <name>]");
+    process.exit(1);
   }
   const flags = parseArgs(process.argv.slice(2));
   let client = makeClient();

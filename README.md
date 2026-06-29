@@ -130,6 +130,19 @@ Add your own as `SKILL.md` files under `.ada/skills/<name>/` (project) or `~/.ad
 (global) — `---\ndescription: …\ncategory: …\n---` front-matter is all that's required. Project
 skills override global, which override the built-ins.
 
+## Connectors (MCP)
+
+ada reaches external tools and data through MCP servers. Browse the catalog and add one:
+
+```bash
+ada mcp                  # list the catalog (filesystem, github, postgres, slack, sentry, …)
+ada mcp add github       # write it into .ada/mcp.json, then set the token it prints
+```
+
+Both **local stdio** servers (`{ command, args }`) and **remote HTTP** servers (`{ url, headers }`)
+are supported; their tools appear as `<server>__<tool>`, approval-gated, in trusted projects. See
+[docs/connectors.md](docs/connectors.md), or the `connectors` skill category for per-connector setup.
+
 ## Configuration
 
 **Client** (`ada`):
