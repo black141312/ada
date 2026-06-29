@@ -1,9 +1,11 @@
 // The built-in tools, in OpenAI function-tool shape. read_file is safe; the rest are gated.
 
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { glob as fsGlob } from "node:fs/promises";
 import { dirname, extname, join, relative, resolve } from "node:path";
+import type * as PtyType from "node-pty";
 import { green, renderEditDiff } from "./render.ts";
 import * as checkpoint from "./checkpoint.ts";
 import { renderTodos, setTodos, type Todo } from "./todos.ts";
@@ -87,6 +89,53 @@ export function formatFile(abs: string): boolean {
   } catch {
     return false;
   }
+}
+
+// node-pty gives the bash tool a real terminal. It's a required dependency; if the native build is
+// ever broken on a platform, fall back to spawnSync so bash still works.
+const pty: typeof PtyType | null = (() => {
+  try {
+    return createRequire(import.meta.url)("node-pty") as typeof PtyType;
+  } catch {
+    return null;
+  }
+})();
+
+// Built via new RegExp (string escapes) so no literal ESC/BEL bytes live in the source.
+const ANSI = new RegExp("[\\u001B\\u009B][\\[\\]()#;?]*(?:(?:[a-zA-Z\\d]*(?:;[a-zA-Z\\d]*)*)?\\u0007|(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PR-TZcf-ntqry=><~])", "g");
+function stripAnsi(s: string): string {
+  return s.replace(ANSI, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+/** Run a command in a PTY (real terminal); resolves with combined output + exit code. */
+function runPty(command: string, timeoutMs = 120_000): Promise<{ output: string; code: number | null }> {
+  return new Promise((res) => {
+    const win = process.platform === "win32";
+    const shell = win ? process.env.COMSPEC ?? "cmd.exe" : process.env.SHELL ?? "/bin/bash";
+    const shellArgs = win ? ["/c", command] : ["-lc", command];
+    const p = pty!.spawn(shell, shellArgs, { name: "xterm-256color", cols: 120, rows: 30, cwd: process.cwd(), env: process.env as Record<string, string> });
+    let out = "";
+    const cap = 10 * 1024 * 1024;
+    p.onData((d) => {
+      if (out.length < cap) out += d;
+    });
+    let done = false;
+    const finish = (code: number | null): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      res({ output: out, code });
+    };
+    const timer = setTimeout(() => {
+      try {
+        p.kill();
+      } catch {
+        /* already gone */
+      }
+      finish(null);
+    }, timeoutMs);
+    p.onExit(({ exitCode }) => finish(exitCode));
+  });
 }
 
 /** Block localhost / private / metadata hosts (basic SSRF guard for web_fetch). */
@@ -292,7 +341,7 @@ export const tools: Tool[] = [
   },
   {
     name: "bash",
-    description: "Run a shell command in the working directory; returns exit code + combined stdout/stderr.",
+    description: "Run a shell command in the working directory through a real PTY (terminal); returns exit code + combined output.",
     parameters: {
       type: "object",
       properties: { command: { type: "string" } },
@@ -301,16 +350,15 @@ export const tools: Tool[] = [
     },
     needsApproval: true,
     async run(args) {
-      const res = spawnSync(String(args.command), {
-        shell: true,
-        encoding: "utf8",
-        timeout: 120_000,
-        maxBuffer: 10 * 1024 * 1024,
-        cwd: process.cwd(),
-      });
+      const command = String(args.command);
+      if (pty) {
+        const { output, code } = await runPty(command);
+        return { output: `exit ${code ?? "null"}\n${spillIfHuge(stripAnsi(output).trim() || "(no output)")}`, isError: code !== 0 };
+      }
+      // fallback: native PTY unavailable on this platform
+      const res = spawnSync(command, { shell: true, encoding: "utf8", timeout: 120_000, maxBuffer: 10 * 1024 * 1024, cwd: process.cwd() });
       const out = [res.stdout, res.stderr].filter(Boolean).join("\n").trim() || "(no output)";
-      const code = res.status;
-      return { output: `exit ${code ?? "null"}\n${spillIfHuge(out)}`, isError: code !== 0 };
+      return { output: `exit ${res.status ?? "null"}\n${spillIfHuge(out)}`, isError: res.status !== 0 };
     },
   },
   {

@@ -21,6 +21,8 @@ model is **zero code**, and a new OpenAI-compatible provider is **two lines**.
   (prettier/gofmt/rustfmt/ruff/shfmt) in trusted projects; off via `ADA_NO_FORMAT`.
 - **LSP diagnostics** — `lsp_diagnostics` runs a language server (typescript-language-server,
   pyright, gopls, rust-analyzer) and returns errors/warnings; servers are reused, trusted-project only.
+- **Real PTY shell** — `bash` runs in a pseudo-terminal (node-pty), so TTY-only programs, colour, and
+  progress output behave; ANSI is stripped from what the model sees.
 - **Two front-ends** — a classic readline REPL and an inline **TUI** (`--tui`) with a live "thinking"
   spinner and Claude-style turn markers.
 - **Plan mode**, **todos**, **checkpoint/undo** (revert the agent's edits), **protected paths** +

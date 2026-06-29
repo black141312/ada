@@ -865,7 +865,10 @@ async function main(): Promise<void> {
   rl.close();
 }
 
-main().catch((e) => {
-  console.error(e instanceof Error ? e.message : e);
-  process.exit(1);
-});
+main().then(
+  () => process.exit(0), // explicit exit: node-pty (bash) and stdin can keep the loop alive otherwise
+  (e) => {
+    console.error(e instanceof Error ? e.message : e);
+    process.exit(1);
+  },
+);
