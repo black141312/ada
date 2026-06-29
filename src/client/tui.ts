@@ -74,6 +74,20 @@ export class Tui {
     return new Promise((res) => (this.lineResolve = res));
   }
 
+  /** Ask the user a question mid-turn (for the ask_user tool); returns their answer. */
+  async ask(question: string, options?: string[]): Promise<string> {
+    this.stopThinking();
+    stdout.write(`\x1b[36m? ${question}\x1b[0m\n`);
+    if (options?.length) stdout.write(`${options.map((o, i) => `  ${i + 1}. ${o}`).join("\n")}\n`);
+    const ans = ((await this.readLine()) ?? "").trim();
+    this.mode = "turn";
+    if (options?.length) {
+      const n = Number(ans);
+      if (Number.isInteger(n) && n >= 1 && n <= options.length) return options[n - 1]!;
+    }
+    return ans;
+  }
+
   beginTurn(abort: AbortController, steer: string[]): void {
     this.mode = "turn";
     this.abort = abort;

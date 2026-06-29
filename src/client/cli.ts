@@ -13,7 +13,7 @@ import { deleteCredential, getCredential, listCredentials } from "../server/cred
 import { deviceLogin, oauthConfig } from "../server/oauth.ts";
 import { addTrust, isTrusted, loadSettings } from "./settings.ts";
 import { getCommands, loadExtensions } from "./extensions.ts";
-import { registerTool } from "./tools.ts";
+import { registerTool, setAsker } from "./tools.ts";
 import { loadSkills, registerSkillTool } from "./skills.ts";
 import { addConnector, listConnectors, loadMcpServers, removeConnector } from "./mcp.ts";
 import { addExtension, selfUpdate } from "./pkg.ts";
@@ -597,6 +597,20 @@ async function main(): Promise<void> {
     if (ans === "y" || ans === "yes") return "yes";
     return "no";
   };
+
+  setAsker(async (question, options) => {
+    if (turn && stdin.isTTY) rawOff(rl, turn.onData);
+    let prompt = `\x1b[36m? ${question}\x1b[0m`;
+    if (options?.length) prompt += `\n${options.map((o, i) => `  ${i + 1}. ${o}`).join("\n")}\n› `;
+    else prompt += " ";
+    const ans = (await rl.question(prompt)).trim();
+    if (turn && stdin.isTTY) rawOn(rl, turn.onData);
+    if (options?.length) {
+      const n = Number(ans);
+      if (Number.isInteger(n) && n >= 1 && n <= options.length) return options[n - 1]!;
+    }
+    return ans;
+  });
 
   // Subagent: delegate an isolated subtask to a fresh ada agent (registered before the agent
   // snapshots its tool list, so it appears in the registry).

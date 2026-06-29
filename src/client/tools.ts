@@ -32,6 +32,13 @@ function truncate(s: string): string {
   return s.length > MAX_OUTPUT ? `${s.slice(0, MAX_OUTPUT)}\n… [truncated ${s.length - MAX_OUTPUT} chars]` : s;
 }
 
+// The front-end (CLI/TUI) installs an asker so the ask_user tool can prompt the user mid-task.
+type Asker = (question: string, options?: string[]) => Promise<string>;
+let asker: Asker | null = null;
+export function setAsker(fn: Asker | null): void {
+  asker = fn;
+}
+
 /** Strip HTML to readable text (no dependency) — good enough for "read this page". */
 export function htmlToText(html: string): string {
   return html
@@ -567,6 +574,27 @@ export const tools: Tool[] = [
         return { output: results.map((r) => `- ${r.title}\n  ${r.url}\n  ${htmlToText(r.description ?? "").slice(0, 200)}`).join("\n\n") };
       } catch (e) {
         return { output: `search failed: ${e instanceof Error ? e.message : e}`, isError: true };
+      }
+    },
+  },
+  {
+    name: "ask_user",
+    description: "Ask the user a clarifying question and wait for their answer. Use only when you're genuinely blocked or a decision is the user's to make — not for routine choices. Optionally provide a list of options.",
+    parameters: {
+      type: "object",
+      properties: { question: { type: "string" }, options: { type: "array", items: { type: "string" } } },
+      required: ["question"],
+      additionalProperties: false,
+    },
+    needsApproval: false,
+    async run(args) {
+      if (!asker) return { output: "(no interactive session — cannot ask the user; proceed with your best judgment)", isError: true };
+      const options = Array.isArray(args.options) ? (args.options as unknown[]).map(String) : undefined;
+      try {
+        const answer = (await asker(String(args.question ?? ""), options)).trim();
+        return { output: answer ? `User answered: ${answer}` : "(user gave no answer)" };
+      } catch (e) {
+        return { output: String(e), isError: true };
       }
     },
   },

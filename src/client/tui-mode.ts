@@ -3,11 +3,13 @@
 
 import { stdout } from "node:process";
 import type { Agent } from "./agent.ts";
+import { setAsker } from "./tools.ts";
 import { Tui } from "./tui.ts";
 
 export async function runTui(agent: Agent, model: string): Promise<void> {
   const tui = new Tui();
   agent.setOnApprove(async (name, summary) => tui.confirm(`run ${name} ${summary}`));
+  setAsker((question, options) => tui.ask(question, options));
   tui.start();
   // Header as the first lines (scrolls away naturally as the conversation grows).
   stdout.write(

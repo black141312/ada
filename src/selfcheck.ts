@@ -16,7 +16,7 @@ import { userBar } from "./client/tui.ts";
 import { configuredServers, listConnectors, loadMcpServers } from "./client/mcp.ts";
 import { rankSkills } from "./client/skill-router.ts";
 import { getDiagnostics } from "./client/lsp.ts";
-import { formatFile, htmlToText, isDestructive, registerTool, toolByName } from "./client/tools.ts";
+import { formatFile, htmlToText, isDestructive, registerTool, setAsker, toolByName } from "./client/tools.ts";
 import * as checkpoint from "./client/checkpoint.ts";
 import { renderTodos, setTodos } from "./client/todos.ts";
 import { deleteCredential, getCredential, setCredential } from "./server/credentials.ts";
@@ -229,6 +229,14 @@ async function main(): Promise<void> {
   await ap.run({ files: [{ path: apFile, action: "delete" }] });
   assert.ok(!existsSync(apFile), "apply_patch delete");
   rmSync(apDir, { recursive: true, force: true });
+
+  // --- ask_user via a stub asker ---
+  const askTool = toolByName.get("ask_user")!;
+  setAsker(async (_q, opts) => (opts ? opts[0]! : "the-answer"));
+  assert.ok(/the-answer/.test((await askTool.run({ question: "?" })).output), "ask_user returns the answer");
+  assert.ok(/picked-A/.test((await askTool.run({ question: "?", options: ["picked-A", "B"] })).output), "ask_user with options");
+  setAsker(null);
+  assert.equal((await askTool.run({ question: "?" })).isError, true, "ask_user errors when no asker is installed");
   assert.equal((await toolByName.get("web_fetch")!.run({ url: "http://127.0.0.1/x" })).isError, true, "web_fetch blocks loopback (SSRF guard)");
 
   // --- leaked tool-call recovery (Ollama-over-stream emits the call as text) ---
