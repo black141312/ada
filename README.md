@@ -1,7 +1,7 @@
 # ada
 
 A coding agent built from zero — a terminal client in the spirit of pi / Codex / Cursor,
-backed by a **Cursor-style routing backend** that holds every provider key and speaks one wire
+that holds every provider key and speaks one wire
 format to the client.
 
 ![ada architecture](docs/architecture.svg)
