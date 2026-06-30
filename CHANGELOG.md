@@ -4,6 +4,30 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.2.0] — 2026-06-30
+
+### Added
+- **Cloudflare** provider (Workers AI + AI Gateway, OpenAI-compatible) — env-overridable URL covers
+  both endpoints. New `@cf/*` router rule. `@cf/moonshotai/kimi-k2.7-code` is now runnable.
+- **`groq/<model>`** and **`together/<model>`** routing prefixes — disambiguate shared model names
+  (`llama-3.3`, `gemma2`) that no prefix can.
+- **Curated offline model catalog** snapshotted from models.dev (12 providers, 672 models) — baked
+  `src/client/catalog.json`, used as the offline seed for pricing/limits. Maintained via
+  `npm run catalog:refresh`. New `ada catalog [provider]` subcommand + `/catalog` REPL command.
+- **`bench/swebench.mjs`** — SWE-bench Verified prediction generator driven by ada (resumable,
+  concurrent, isolated repo clones); scoring stays with the official `swebench` Docker harness.
+- **`docs/cloudflare.md`** — Workers AI + AI Gateway step-by-step.
+
+### Changed
+- npm package renamed to unscoped **`ada-agent`** (`npx ada-agent`, `npm i -g ada-agent`); the CLI
+  command stays `ada`. (`ada` / `ada-code` were taken/blocked on npm.)
+- Generalized the OpenAI-compat adapter's model-prefix strip (handles `copilot/` / `groq/` /
+  `together/`); `@cf/…` passes through as-is.
+- Architecture diagram refreshed (richer client card, full provider list); docs refreshed
+  (architecture / integrations / connectors).
+
+[0.2.0]: https://github.com/black141312/ada/releases/tag/v0.2.0
+
 ## [0.1.0] — 2026-06-30
 
 First public release. ada is a from-zero terminal coding agent: a key-holding **routing backend**
