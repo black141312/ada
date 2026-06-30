@@ -52,17 +52,20 @@ The backend proxies any OpenAI-compatible upstream and translates the one that i
 |---|---|---|
 | OpenAI | `gpt-*`, `o*` | `OPENAI_API_KEY` |
 | Anthropic | `claude-*` | `ANTHROPIC_API_KEY` |
-| Google Gemini | `gemini-*` | `GEMINI_API_KEY` |
-| Mistral | `mistral-*` | `MISTRAL_API_KEY` |
-| Groq | — | `GROQ_API_KEY` |
+| Google Gemini | `gemini-*`, `gemma-*` | `GEMINI_API_KEY` |
+| Mistral | `mistral-*`, `codestral-*`, … | `MISTRAL_API_KEY` |
 | DeepSeek | `deepseek-*` | `DEEPSEEK_API_KEY` |
-| Together | — | `TOGETHER_API_KEY` |
 | xAI (Grok) | `grok-*` | `XAI_API_KEY` |
-| DashScope (Qwen) | — | `DASHSCOPE_API_KEY` |
+| DashScope (Qwen) | `qwen-*`, `qwq-*` | `DASHSCOPE_API_KEY` |
+| **Cloudflare** (Workers AI / AI Gateway) | `@cf/*` (e.g. `@cf/moonshotai/kimi-k2.7-code`) | `CLOUDFLARE_API_TOKEN` (+ `CLOUDFLARE_ACCOUNT_ID`) |
+| Groq | `groq/<model>` | `GROQ_API_KEY` |
+| Together | `together/<model>` | `TOGETHER_API_KEY` |
 | OpenRouter | everything else | `OPENROUTER_API_KEY` |
 | **Ollama (local)** | `name:tag` (e.g. `qwen2.5-coder:latest`) | *keyless* |
 
-Routing: a model id containing `:` → local Ollama; otherwise by prefix; an explicit `provider`
+Routing: a model id containing `:` → local Ollama; `@cf/*` → Cloudflare; `groq/…`/`together/…` pick
+those providers (their model names — `llama-3.3`, `gemma2` — are ambiguous, so they're explicit);
+otherwise by prefix; an explicit `provider`
 field always wins. Set only the keys you have — the rest stay dormant (vendor SDKs load lazily).
 
 ---

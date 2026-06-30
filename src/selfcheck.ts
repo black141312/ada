@@ -266,6 +266,21 @@ async function main(): Promise<void> {
     assert.ok(/claude-opus-4-8/.test(catalogText("anthropic")), "catalogText <provider> lists its models");
   }
 
+  // --- provider routing (incl. the new cloudflare + groq/together disambiguation) ---
+  {
+    const { route } = await import("./server/router.ts");
+    const { PROVIDERS } = await import("./server/config.ts");
+    assert.ok("cloudflare" in PROVIDERS, "cloudflare provider is registered");
+    assert.equal(route("@cf/moonshotai/kimi-k2.7-code"), "cloudflare", "@cf/ → cloudflare");
+    assert.equal(route("groq/llama-3.3-70b"), "groq", "groq/ → groq");
+    assert.equal(route("together/x"), "together", "together/ → together");
+    assert.equal(route("claude-opus-4-8"), "anthropic", "claude → anthropic");
+    assert.equal(route("gpt-5"), "openai", "gpt → openai");
+    assert.equal(route("gemini-3-pro"), "google", "gemini → google");
+    assert.equal(route("qwen3-coder"), "dashscope", "qwen → dashscope");
+    assert.equal(route("anything-else"), "openrouter", "unmatched → openrouter");
+  }
+
   // --- background job runs and reports ---
   const jid = startJob("selfcheck job", async () => "job-done-ok");
   await new Promise((r) => setTimeout(r, 30));

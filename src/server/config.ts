@@ -27,6 +27,13 @@ export const PROVIDERS: Record<ProviderName, ProviderDef> = {
   // token (exchanged from a GitHub OAuth token at /copilot_internal/v2/token — that exchange is not
   // implemented here; it needs a Copilot subscription). Required headers are added in the adapter.
   copilot: { baseURL: process.env.COPILOT_BASE_URL ?? "https://api.githubcopilot.com", keyEnv: "COPILOT_API_KEY" },
+  // Cloudflare Workers AI / AI Gateway — OpenAI-compatible. Workers AI: set CLOUDFLARE_ACCOUNT_ID +
+  // CLOUDFLARE_API_TOKEN (default URL). AI Gateway: point CLOUDFLARE_BASE_URL at the gateway URL.
+  // Model ids are `@cf/<vendor>/<model>` (e.g. @cf/moonshotai/kimi-k2.7-code) — sent through as-is.
+  cloudflare: {
+    baseURL: process.env.CLOUDFLARE_BASE_URL ?? `https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID ?? ""}/ai/v1`,
+    keyEnv: "CLOUDFLARE_API_TOKEN",
+  },
   ollama: { baseURL: process.env.OLLAMA_BASE_URL ?? "http://localhost:11434/v1", keyEnv: "" },
 };
 

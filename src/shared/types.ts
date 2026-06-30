@@ -12,6 +12,7 @@ export type ProviderName =
   | "xai"
   | "dashscope"
   | "copilot"
+  | "cloudflare"
   | "ollama";
 
 export interface ModelInfo {
