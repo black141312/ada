@@ -50,7 +50,8 @@
     "typecheck": "tsc --noEmit",
     "selfcheck": "tsx src/selfcheck.ts",
     "bench:swebench": "node bench/swebench.mjs",
-    "catalog:refresh": "node scripts/refresh-catalog.mjs"
+    "catalog:refresh": "node scripts/refresh-catalog.mjs",
+    "release": "node scripts/release.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.106.0",
