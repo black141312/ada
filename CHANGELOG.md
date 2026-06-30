@@ -4,6 +4,15 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.3.1] — 2026-06-30
+
+### Fixed
+- `npx ada-agent` failed with "could not determine executable to run" — the package has two bins
+  (`ada`, `ada-server`) and neither matched the package name after the rename. Added an `ada-agent`
+  bin alias (→ the client) so `npx ada-agent` and `npm i -g ada-agent && ada-agent` work as documented.
+
+[0.3.1]: https://github.com/black141312/ada/releases/tag/v0.3.1
+
 ## [0.3.0] — 2026-06-30
 
 ### Added
