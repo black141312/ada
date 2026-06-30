@@ -108,28 +108,27 @@ npm link            # global `ada` / `ada-server`  ·  or `npm start`
 
 ada is two processes: a **backend** (holds keys, routes) and the **`ada`** client.
 
+`ada` **auto-starts `ada-server`** in the background if it isn't already running — one terminal is
+enough for solo use. (Set `ADA_BACKEND_URL` to a remote URL to skip auto-start, or
+`ADA_NO_AUTOSTART=1` to opt out entirely.)
+
 **Option A — local, no keys (Ollama):**
 
 ```bash
-# terminal 1: backend
-ada-server                              # → http://localhost:8787
-
-# terminal 2: the agent
-ada                                     # pick a local model and chat
+ada                                     # pick a local model and chat (backend auto-spawns)
 ```
 
 **Option B — a cloud provider:**
 
 ```bash
-# terminal 1
 export ANTHROPIC_API_KEY=sk-ant-...     # and/or OPENAI_API_KEY, GEMINI_API_KEY, …
-ada-server
-
-# terminal 2
 ada --model claude-opus-4-8
 ```
 
 Windows PowerShell: `$env:ANTHROPIC_API_KEY="sk-ant-..."`.
+
+To run `ada-server` as a long-lived shared backend (multi-client setups, or just to keep it warm),
+start it manually first — `ada` will detect and reuse it.
 
 ---
 

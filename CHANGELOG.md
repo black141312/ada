@@ -4,6 +4,19 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.3.0] — 2026-06-30
+
+### Added
+- **Auto-start the backend** — `ada` now spawns `ada-server` as a child process if it isn't already
+  reachable. Solo users no longer need two terminals. `ADA_BACKEND_URL` pointing at a remote URL
+  skips the auto-start; `ADA_NO_AUTOSTART=1` opts out. Backend-free subcommands
+  (`mcp`/`skill`/`worktree`/`catalog`/`share`) don't trigger it either.
+- **`.github/workflows/release.yml`** — auto-publish `ada-agent` to npm on a `v*` tag push, with a
+  tag-vs-`package.json` safety check + provenance attestation. The CONTRIBUTING release flow is
+  documented.
+
+[0.3.0]: https://github.com/black141312/ada/releases/tag/v0.3.0
+
 ## [0.2.0] — 2026-06-30
 
 ### Added

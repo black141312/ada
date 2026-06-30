@@ -24,6 +24,7 @@ import { notify, readClipboard, readClipboardImage } from "./platform.ts";
 import { undoAll } from "./checkpoint.ts";
 import { restore as restoreSnapshot, snapshot } from "./snapshot.ts";
 import { catalogText, prefetch } from "./models-dev.ts";
+import { ensureBackend } from "./autostart.ts";
 import { renderJobs, startJob } from "./background.ts";
 import { renderTodos } from "./todos.ts";
 import { track } from "./telemetry.ts";
@@ -495,11 +496,23 @@ async function printBanner(): Promise<void> {
   stdout.write(`  \x1b[2m${TAG}\x1b[0m  \x1b[38;2;214;51;132mv${adaVersion()}\x1b[0m\n\n`);
 }
 
+/** Subcommands that don't touch the backend — no point spawning a server for these. */
+const NO_BACKEND = new Set(["mcp", "skill", "worktree", "wt", "catalog", "share"]);
+
 async function main(): Promise<void> {
   const sub = process.argv[2];
   if (sub === "login" || sub === "logout") {
     await authCommand(sub, process.argv[3]);
     return;
+  }
+  // Auto-start ada-server if the configured backend isn't reachable (and it's local). New users
+  // shouldn't have to run two terminals; `ADA_BACKEND_URL` pointing at a remote skips this.
+  if (!NO_BACKEND.has(sub ?? "") && process.env.ADA_NO_AUTOSTART !== "1") {
+    const status = await ensureBackend(BACKEND);
+    if (status === "failed") {
+      console.error("ada-server failed to come up. Start it manually: `ada-server` (in another terminal).");
+      process.exit(1);
+    }
   }
   if (sub === "add") {
     const spec = process.argv[3];
