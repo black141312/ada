@@ -15,11 +15,14 @@ ada serve            # → http://localhost:8788  (ADA_HTTP_PORT to change)
 ## Typed SDK — `src/sdk`
 
 ```ts
-import { createClient } from "ada/sdk"; // or "./src/sdk/index.ts" in-repo
+import { createClient } from "ada-agent/sdk"; // in-repo: "./src/sdk/index.ts"
 const ada = createClient("http://localhost:8788");
 console.log(await ada.health());
 const { text } = await ada.prompt("list the files in this project");
 ```
+
+It's a ~30-line `fetch` wrapper over the HTTP API above — if you'd rather not pull in the source,
+just POST to `/v1/prompt` directly.
 
 ## ACP bridge — `ada acp`
 
