@@ -68,6 +68,9 @@ those providers (their model names — `llama-3.3`, `gemma2` — are ambiguous, 
 otherwise by prefix; an explicit `provider`
 field always wins. Set only the keys you have — the rest stay dormant (vendor SDKs load lazily).
 
+**Cloudflare** (Workers AI or AI Gateway) is a step-by-step of its own — see
+**[docs/cloudflare.md](docs/cloudflare.md)**.
+
 ---
 
 ## Install
