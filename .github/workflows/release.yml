@@ -1,0 +1,58 @@
+# Auto-publish to npm on a `v*` tag push.
+#
+# Usage from now on: bump package.json + CHANGELOG → merge to main → tag and push → this runs.
+#
+#   git tag -a v0.3.0 -m "ada v0.3.0"
+#   git push origin v0.3.0
+#
+# Requires repo secret NPM_TOKEN (an "automation" / granular token with publish rights for ada-agent).
+# `id-token: write` enables npm provenance attestations (verifiable on npm once the repo is public).
+
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # to create the GitHub release
+  id-token: write # npm provenance attestation
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - run: npm ci
+
+      # Safety: the tag must match the version in package.json. Catches "forgot to bump" before publishing.
+      - name: Verify tag matches package.json
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./package.json').version")
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $PKG — bump it first"
+            exit 1
+          fi
+
+      # Quality gate (same checks as the regular CI workflow).
+      - run: npm run typecheck
+      - run: npm run selfcheck
+
+      # Publish. Unscoped → public by default; --provenance signs the build to this commit.
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Auto-create a GitHub release with notes generated from the commit log since the previous tag.
+      # The CHANGELOG.md entry stays canonical; this is just a nice landing page on the Releases tab.
+      - name: Create GitHub release
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --title "ada $GITHUB_REF_NAME"
+        env:
+          GH_TOKEN: ${{ github.token }}
