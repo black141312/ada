@@ -32,9 +32,26 @@ billing all belong in one place; the client carries only an ada client key. Same
 
 ![ada agent loop](agent-loop.svg)
 
-Each turn streams the model's reply; if it contains tool calls, gated ones prompt for approval,
-the tools run, and one `{role:"tool", tool_call_id, content}` per call is appended before control
-returns to the model — looping until the model stops calling tools.
+Each turn streams the model's reply; if it contains tool calls, gated ones go through the
+**permission mode**, the tools run, and one `{role:"tool", tool_call_id, content}` per call is
+appended before control returns to the model — looping until the model stops calling tools.
+
+**Permission modes** (`/ask` · `/plan` · `/auto`, or `/mode` to cycle; shown in the prompt):
+
+- **ask** (default) — each gated tool shows a plain-words prompt ("ada wants to run a shell command…")
+  and one key: `[y]es` · `[a]uto` · `[p]lan` · `[n]o`. Destructive `bash` always confirms.
+- **plan** — read-only: ada plans but won't edit; `/run` approves and executes.
+- **auto** — runs tools without asking (still confirms destructive `bash`). `--yolo` starts here.
+
+**Skills.** ~285 bundled `SKILL.md` instructions load only on demand. A lexical router
+(`client/skill-router.ts`) ranks every request; on a confident, name-exact match ada **auto-applies**
+the skill (injects its procedure, announced `↳ skill: <name>`), otherwise it suggests them. The model
+can also `list_skills` / `find_skill` / `use_skill`. See [orchestration.md](orchestration.md) for the
+strategies (`react`/`plan`/`multi`/`toolsmith`) layered on the same loop.
+
+**Programmatic surfaces.** Beyond the REPL/TUI, the same agent drives an HTTP API (`ada serve`), a
+typed SDK, an ACP editor bridge (`ada acp`), and read-only session sharing (`ada share`) — see
+[integrations.md](integrations.md). And it can run **SWE-bench Verified** via [bench/](../bench/).
 
 ## Sign in (device flow)
 
@@ -115,25 +132,32 @@ src/
       anthropic.ts    native Anthropic adapter (lazy @anthropic-ai/sdk)
 
   client/             the terminal agent                  (ada | npm start)
-    cli.ts            REPL: flags, model picker, slash commands, approval prompt
-    agent.ts          the agentic loop (stream → tool calls → feed back → repeat)
-    tools.ts          read/write/edit/bash/ls/grep/glob; protected paths; destructive detection
+    cli.ts            REPL: flags, model picker, slash commands, ask/plan/auto modes + approval
+    agent.ts          the agentic loop (stream → tool calls → feed back → repeat) + orchestrators
+    tools.ts          read_file/write_file/edit_file · apply_patch · bash (PTY) · ls/glob/grep (rg)
+                      · web_fetch/web_search · lsp_diagnostics · ask_user; protected paths;
+                      destructive detection; trust-gated auto-format
     tui.ts            inline TUI engine (composer, spinner, user bar)
     tui-mode.ts       the TUI loop
-    session.ts        append-only JSONL session store (.cos0/sessions/)
+    session.ts        append-only JSONL session store (.ada/sessions/)
     compaction.ts     context summarization
-    checkpoint.ts     undo: snapshot files before edits, restore on /undo
-    todos.ts          task tracking + render
-    hooks.ts          extension hooks (before/after tool, input transform)
-    extensions.ts     load extensions (tools + hooks + commands)
-    skills.ts · mcp.ts · prompts.ts   skills, MCP servers, prompt templates
+    checkpoint.ts · snapshot.ts   undo (revert edits) · whole-tree git snapshot/restore
+    skills.ts · skill-router.ts   skills + the relevance router (auto-apply)
+    mcp.ts · prompts.ts · background.ts · models-dev.ts · lsp.ts   connectors, templates,
+                      background jobs, models.dev catalog, LSP client
+    todos.ts · hooks.ts · extensions.ts   tasks; extension hooks + tools + commands
     settings.ts · platform.ts · render.ts · image.ts · telemetry.ts · pkg.ts
 
-  selfcheck.ts        offline checks (tools, sessions, routing, parsers, TUI)
+  sdk/index.ts        typed client for the HTTP API (`ada serve`)
+  selfcheck.ts        offline checks (tools, sessions, routing, parsers, TUI, classifiers)
+
+bench/
+  swebench.mjs        SWE-bench Verified prediction generator (scored by the official harness)
 ```
 
 ## No build step
 
 Everything runs through `tsx` — TypeScript with no compile. The `bin/*.mjs` launchers register the
 tsx ESM loader in-process, then import the relevant `.ts` entrypoint (which self-runs). `tsx` is a
-runtime dependency so the global `ada` command works after `npm link` / `npm install -g`.
+runtime dependency so the global `ada` command works after `npx ada-agent`, `npm install -g ada-agent`,
+or `npm link` from a clone. (`node-pty` is the one native dep, so a C toolchain is needed at install.)

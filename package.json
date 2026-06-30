@@ -1,9 +1,32 @@
 {
-  "name": "ada",
-  "version": "0.0.1",
-  "private": true,
+  "name": "ada-agent",
+  "version": "0.1.0",
+  "description": "A from-zero terminal coding agent with a Cursor-style routing backend, ~285 skills, MCP connectors, and ask/plan/auto modes",
   "type": "module",
-  "description": "A coding agent from zero with a Cursor-style routing backend",
+  "license": "MIT",
+  "author": "Aditya",
+  "homepage": "https://github.com/black141312/ada#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/black141312/ada.git"
+  },
+  "bugs": {
+    "url": "https://github.com/black141312/ada/issues"
+  },
+  "keywords": [
+    "coding-agent",
+    "ai-agent",
+    "llm",
+    "cli",
+    "terminal",
+    "tui",
+    "mcp",
+    "openai",
+    "anthropic",
+    "ollama",
+    "agentic",
+    "developer-tools"
+  ],
   "bin": {
     "ada": "bin/ada.mjs",
     "ada-server": "bin/ada-server.mjs"
@@ -12,8 +35,11 @@
     "bin/",
     "src/",
     "skills/",
+    "docs/",
+    "bench/",
     "tsconfig.json",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=18"
@@ -22,7 +48,9 @@
     "start": "tsx src/client/cli.ts",
     "server": "tsx src/server/index.ts",
     "typecheck": "tsc --noEmit",
-    "selfcheck": "tsx src/selfcheck.ts"
+    "selfcheck": "tsx src/selfcheck.ts",
+    "bench:swebench": "node bench/swebench.mjs",
+    "catalog:refresh": "node scripts/refresh-catalog.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.106.0",

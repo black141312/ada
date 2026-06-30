@@ -23,7 +23,7 @@ import { loadImage } from "./image.ts";
 import { notify, readClipboard, readClipboardImage } from "./platform.ts";
 import { undoAll } from "./checkpoint.ts";
 import { restore as restoreSnapshot, snapshot } from "./snapshot.ts";
-import { prefetch } from "./models-dev.ts";
+import { catalogText, prefetch } from "./models-dev.ts";
 import { renderJobs, startJob } from "./background.ts";
 import { renderTodos } from "./todos.ts";
 import { track } from "./telemetry.ts";
@@ -623,6 +623,11 @@ async function main(): Promise<void> {
     console.error("usage: ada skill [list | add <url>]");
     process.exit(1);
   }
+  if (sub === "catalog") {
+    // Offline model catalog (curated popular providers) — context limits + pricing, no backend/network.
+    console.log(catalogText(process.argv[3]));
+    return;
+  }
   if (sub === "acp") {
     // Minimal Agent Client Protocol bridge over stdio (JSON-RPC 2.0, newline-delimited). Scaffold:
     // handles initialize + prompt so an ACP-aware editor can drive ada. Extend method names/framing
@@ -1094,6 +1099,10 @@ async function main(): Promise<void> {
     }
     if (line === "/models") {
       await printModels(client);
+      continue;
+    }
+    if (line === "/catalog" || line.startsWith("/catalog ")) {
+      console.log(catalogText(line.slice("/catalog".length).trim() || undefined));
       continue;
     }
     if (line === "/model" || line.startsWith("/model ")) {

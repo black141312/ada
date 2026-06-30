@@ -20,8 +20,10 @@ function authHeaders(provider: ProviderName): Record<string, string> {
 export const openAICompatAdapter: Adapter = {
   async chat({ provider, body, res }: ChatRequest): Promise<void> {
     const def = PROVIDERS[provider];
-    // Copilot is addressed as "copilot/<model>" but the endpoint wants the bare model id.
-    const outBody = provider === "copilot" && typeof body.model === "string" && body.model.startsWith("copilot/") ? { ...body, model: body.model.slice("copilot/".length) } : body;
+    // Strip a leading "<provider>/" the router used only to disambiguate (copilot/groq/together) — the
+    // endpoint wants the bare id. (Cloudflare's "@cf/…" ids aren't "cloudflare/…", so they pass through.)
+    const prefix = `${provider}/`;
+    const outBody = typeof body.model === "string" && body.model.startsWith(prefix) ? { ...body, model: body.model.slice(prefix.length) } : body;
     let upstream: Awaited<ReturnType<typeof fetch>>;
     try {
       upstream = await fetch(`${def.baseURL}/chat/completions`, {

@@ -42,7 +42,8 @@ that project — the connector's tools appear automatically.
 
 - MCP servers run code / reach the network, so they load **only in trusted projects** (the same trust
   gate as `.ada` prompts and settings). Untrusted projects skip them.
-- Every MCP tool is **approval-gated** — ada prompts before each call.
+- Every MCP tool is **approval-gated** — ada prompts before each call (in `ask` mode).
+- A server's **resources** are reachable through a generated `<server>__read_resource` tool.
 - Secrets come from **env vars** (referenced in the server's `env`), never committed to `.ada/mcp.json`.
 - See the `connectors` skill category (`list_skills {category: "connectors"}`) for per-connector setup
   walk-throughs, and the `mcp-server` skill to build your own.

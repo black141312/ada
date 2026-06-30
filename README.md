@@ -1,5 +1,6 @@
 # ada
 
+[![npm](https://img.shields.io/npm/v/ada-agent)](https://www.npmjs.com/package/ada-agent)
 [![CI](https://github.com/black141312/ada/actions/workflows/ci.yml/badge.svg)](https://github.com/black141312/ada/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Node ≥ 18](https://img.shields.io/badge/node-%E2%89%A518-green.svg)](package.json)
@@ -51,34 +52,57 @@ The backend proxies any OpenAI-compatible upstream and translates the one that i
 |---|---|---|
 | OpenAI | `gpt-*`, `o*` | `OPENAI_API_KEY` |
 | Anthropic | `claude-*` | `ANTHROPIC_API_KEY` |
-| Google Gemini | `gemini-*` | `GEMINI_API_KEY` |
-| Mistral | `mistral-*` | `MISTRAL_API_KEY` |
-| Groq | — | `GROQ_API_KEY` |
+| Google Gemini | `gemini-*`, `gemma-*` | `GEMINI_API_KEY` |
+| Mistral | `mistral-*`, `codestral-*`, … | `MISTRAL_API_KEY` |
 | DeepSeek | `deepseek-*` | `DEEPSEEK_API_KEY` |
-| Together | — | `TOGETHER_API_KEY` |
 | xAI (Grok) | `grok-*` | `XAI_API_KEY` |
-| DashScope (Qwen) | — | `DASHSCOPE_API_KEY` |
+| DashScope (Qwen) | `qwen-*`, `qwq-*` | `DASHSCOPE_API_KEY` |
+| **Cloudflare** (Workers AI / AI Gateway) | `@cf/*` (e.g. `@cf/moonshotai/kimi-k2.7-code`) | `CLOUDFLARE_API_TOKEN` (+ `CLOUDFLARE_ACCOUNT_ID`) |
+| Groq | `groq/<model>` | `GROQ_API_KEY` |
+| Together | `together/<model>` | `TOGETHER_API_KEY` |
 | OpenRouter | everything else | `OPENROUTER_API_KEY` |
 | **Ollama (local)** | `name:tag` (e.g. `qwen2.5-coder:latest`) | *keyless* |
 
-Routing: a model id containing `:` → local Ollama; otherwise by prefix; an explicit `provider`
+Routing: a model id containing `:` → local Ollama; `@cf/*` → Cloudflare; `groq/…`/`together/…` pick
+those providers (their model names — `llama-3.3`, `gemma2` — are ambiguous, so they're explicit);
+otherwise by prefix; an explicit `provider`
 field always wins. Set only the keys you have — the rest stay dormant (vendor SDKs load lazily).
+
+**Cloudflare** (Workers AI or AI Gateway) is a step-by-step of its own — see
+**[docs/cloudflare.md](docs/cloudflare.md)**.
 
 ---
 
 ## Install
 
-Requires **Node ≥ 18**.
+Requires **Node ≥ 18** (and a C toolchain, since `node-pty` builds natively).
+
+**Run it without installing — `npx`:**
+
+```bash
+npx ada-agent                      # the client   (published to npm)
+npx -p ada-agent ada-server        # the backend  (second bin in the same package)
+# straight from source, no publish needed:
+npx github:black141312/ada
+```
+
+**Install globally** (puts `ada` and `ada-server` on your PATH):
+
+```bash
+npm install -g ada-agent
+ada
+```
+
+**From a clone** (for hacking on it):
 
 ```bash
 git clone https://github.com/black141312/ada.git
-cd ada
-npm install
-npm link          # puts `ada` and `ada-server` on your PATH
+cd ada && npm install
+npm link            # global `ada` / `ada-server`  ·  or `npm start`
 ```
 
-`npm link` makes `ada` a global command. (Prefer not to link? Use `npm start` from the repo, or
-`npm install -g .`.) To remove it later: `npm unlink -g ada`.
+> The published-npm commands work once a maintainer has run `npm publish`; the `github:` form works
+> against the repo today.
 
 ## Quickstart
 
@@ -135,7 +159,8 @@ shows in the prompt line. In **ask** mode each gated tool prompts with what it w
 **auto** runs tools without asking (destructive `bash` still confirms). `--yolo` starts in **auto**.
 
 **Subcommands:** `ada mcp …` (connectors) · `ada skill add <url>` · `ada worktree add <name>` ·
-`ada serve` (HTTP API) · `ada share` (view a session) · `ada acp` (editor bridge). See
+`ada catalog [provider]` (offline model/price catalog) · `ada serve` (HTTP API) · `ada share`
+(view a session) · `ada acp` (editor bridge). See
 [docs/integrations.md](docs/integrations.md) for the HTTP API, the typed SDK, and ACP.
 
 **Orchestration strategies** — the harness runs pluggable agent architectures (`--strategy <name>`
@@ -219,6 +244,13 @@ npm run server           # run the backend from source
 See **[docs/architecture.md](docs/architecture.md)** for the design (adapters, routing, request
 flow, file layout), **[docs/orchestration.md](docs/orchestration.md)** for the agent strategies, and
 **[docs/integrations.md](docs/integrations.md)** for the HTTP API / SDK / ACP.
+
+## Benchmarks
+
+ada can run **SWE-bench Verified** — it generates patches for real GitHub issues (one isolated repo
+clone per task), emitting an official-format `predictions.jsonl` that the official `swebench` Docker
+harness scores. `node bench/swebench.mjs --dataset … --model … --out runs/x`. See
+**[bench/README.md](bench/README.md)** for the full flow (dataset, prereqs, scoring command).
 
 ## Contributing
 

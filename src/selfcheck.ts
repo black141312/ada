@@ -255,6 +255,32 @@ async function main(): Promise<void> {
   assert.equal(permPhrase("write_file", false), "create or modify files on disk", "write phrase");
   assert.ok(permPhrase("merchant__x", false).includes("connector"), "MCP phrase mentions the connector");
 
+  // --- baked offline catalog seeds pricing/limits (no network) ---
+  {
+    const { priceOf, contextOf, catalogSize, catalogText } = await import("./client/models-dev.ts");
+    assert.ok(catalogSize() > 100, `catalog seeded from catalog.json (${catalogSize()} models)`);
+    const op = priceOf("claude-opus-4-8");
+    assert.ok(op && op[0] > 0 && op[1] > 0, "priceOf resolves a baked model offline");
+    assert.ok((contextOf("claude-opus-4-8") ?? 0) >= 200000, "contextOf resolves a baked model offline");
+    assert.ok(/anthropic/.test(catalogText()) && /openai/.test(catalogText()) && /cloudflare/.test(catalogText()), "catalogText lists the popular providers");
+    assert.ok(/claude-opus-4-8/.test(catalogText("anthropic")), "catalogText <provider> lists its models");
+  }
+
+  // --- provider routing (incl. the new cloudflare + groq/together disambiguation) ---
+  {
+    const { route } = await import("./server/router.ts");
+    const { PROVIDERS } = await import("./server/config.ts");
+    assert.ok("cloudflare" in PROVIDERS, "cloudflare provider is registered");
+    assert.equal(route("@cf/moonshotai/kimi-k2.7-code"), "cloudflare", "@cf/ → cloudflare");
+    assert.equal(route("groq/llama-3.3-70b"), "groq", "groq/ → groq");
+    assert.equal(route("together/x"), "together", "together/ → together");
+    assert.equal(route("claude-opus-4-8"), "anthropic", "claude → anthropic");
+    assert.equal(route("gpt-5"), "openai", "gpt → openai");
+    assert.equal(route("gemini-3-pro"), "google", "gemini → google");
+    assert.equal(route("qwen3-coder"), "dashscope", "qwen → dashscope");
+    assert.equal(route("anything-else"), "openrouter", "unmatched → openrouter");
+  }
+
   // --- background job runs and reports ---
   const jid = startJob("selfcheck job", async () => "job-done-ok");
   await new Promise((r) => setTimeout(r, 30));
