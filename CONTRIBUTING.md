@@ -10,6 +10,20 @@ through `tsx`, **no build step**. The whole thing is meant to stay readable in a
   a release; please don't PR directly to `main`.
 - CI (`typecheck` + `selfcheck`) runs on every push and PR to both `dev` and `main`.
 
+### Cutting a release (maintainers)
+
+1. Bump `package.json` `version` and add a `CHANGELOG.md` entry on `dev`.
+2. PR `dev → main` and merge.
+3. From `main`, tag and push:
+   ```bash
+   git switch main && git pull
+   git tag -a v0.X.0 -m "ada v0.X.0"
+   git push origin v0.X.0
+   ```
+4. The **Release** workflow takes over: verifies the tag matches `package.json`, runs the gates,
+   `npm publish`es `ada-agent`, and creates the GitHub release. Requires the repo secret `NPM_TOKEN`
+   (a granular automation token with publish rights for `ada-agent`).
+
 ```bash
 git switch dev && git pull
 git switch -c my-change      # work, commit
