@@ -14,12 +14,12 @@ through `tsx`, **no build step**. The whole thing is meant to stay readable in a
 
 1. Bump `package.json` `version` and add a `CHANGELOG.md` entry on `dev`.
 2. PR `dev → main` and merge.
-3. From `main`, tag and push:
+3. From `main`, run the release script — it tags `v<version>`, pushes, and watches the publish:
    ```bash
    git switch main && git pull
-   git tag -a v0.X.0 -m "ada v0.X.0"
-   git push origin v0.X.0
+   npm run release            # or: npm run release -- --no-watch
    ```
+   It refuses unless you're on a clean `main` and the tag is new, so it can't tag the wrong commit.
 4. The **Release** workflow takes over: verifies the tag matches `package.json`, runs the gates,
    `npm publish`es `ada-agent`, and creates the GitHub release. Requires the repo secret `NPM_TOKEN`
    (a granular automation token with publish rights for `ada-agent`).
