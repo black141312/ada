@@ -153,7 +153,8 @@ shows in the prompt line. In **ask** mode each gated tool prompts with what it w
 **auto** runs tools without asking (destructive `bash` still confirms). `--yolo` starts in **auto**.
 
 **Subcommands:** `ada mcp …` (connectors) · `ada skill add <url>` · `ada worktree add <name>` ·
-`ada serve` (HTTP API) · `ada share` (view a session) · `ada acp` (editor bridge). See
+`ada catalog [provider]` (offline model/price catalog) · `ada serve` (HTTP API) · `ada share`
+(view a session) · `ada acp` (editor bridge). See
 [docs/integrations.md](docs/integrations.md) for the HTTP API, the typed SDK, and ACP.
 
 **Orchestration strategies** — the harness runs pluggable agent architectures (`--strategy <name>`

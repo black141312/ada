@@ -49,7 +49,8 @@
     "server": "tsx src/server/index.ts",
     "typecheck": "tsc --noEmit",
     "selfcheck": "tsx src/selfcheck.ts",
-    "bench:swebench": "node bench/swebench.mjs"
+    "bench:swebench": "node bench/swebench.mjs",
+    "catalog:refresh": "node scripts/refresh-catalog.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.106.0",
