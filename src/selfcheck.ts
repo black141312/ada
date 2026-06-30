@@ -281,6 +281,20 @@ async function main(): Promise<void> {
     assert.equal(route("anything-else"), "openrouter", "unmatched → openrouter");
   }
 
+  // --- autostart helpers: URL classification + /health derivation ---
+  {
+    const { isLocalBackend, healthUrl } = await import("./client/autostart.ts");
+    assert.ok(isLocalBackend("http://localhost:8787/v1"), "localhost is local");
+    assert.ok(isLocalBackend("http://127.0.0.1:8787/v1"), "127.0.0.1 is local");
+    assert.ok(!isLocalBackend("https://ada.example.com/v1"), "remote URL is not local");
+    assert.equal(healthUrl("http://localhost:8787/v1"), "http://localhost:8787/health", "/v1 base → /health");
+    assert.equal(healthUrl("http://localhost:8787"), "http://localhost:8787/health", "bare base → /health");
+    // Remote URL → ensureBackend short-circuits to "remote" without spawning anything.
+    const { ensureBackend } = await import("./client/autostart.ts");
+    const v = await ensureBackend("https://ada.example.com/v1", { quiet: true, waitMs: 200 });
+    assert.equal(v, "remote", "remote URL returns 'remote' without spawning");
+  }
+
   // --- background job runs and reports ---
   const jid = startJob("selfcheck job", async () => "job-done-ok");
   await new Promise((r) => setTimeout(r, 30));
