@@ -2,7 +2,7 @@
 // Cut a release: tag `main` with the package.json version and push it. The Release workflow
 // (.github/workflows/release.yml) then publishes ada-agent to npm and creates the GitHub release.
 //
-// Run this AFTER you've bumped package.json + CHANGELOG on dev and merged dev → main.
+// Run this AFTER you've bumped package.json + added a CHANGELOG entry and merged that to main.
 //
 //   npm run release              # tag v<version>, push, watch the publish
 //   npm run release -- --no-watch
@@ -39,7 +39,7 @@ const tag = `v${version}`;
 
 // --- preflight ---
 const branch = git("rev-parse", "--abbrev-ref", "HEAD");
-if (branch !== "main") die(`releases are cut from main, but you're on "${branch}". Merge dev → main first, then run this on main.`);
+if (branch !== "main") die(`releases are cut from main, but you're on "${branch}". Merge your branch to main first, then run this on main.`);
 if (git("status", "--porcelain")) die("working tree is dirty — commit or stash first.");
 
 git("fetch", "--tags", "--quiet", "origin");
