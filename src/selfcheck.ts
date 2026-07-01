@@ -293,6 +293,27 @@ async function main(): Promise<void> {
     assert.equal(route("anything-else"), "openrouter", "unmatched → openrouter");
   }
 
+  // --- @codebase semantic search: pure parts (no network / no embedding model needed) ---
+  {
+    const { chunkText, cosine, walkFiles } = await import("./client/embed-index.ts");
+    const chunks = chunkText(Array.from({ length: 200 }, (_, i) => `line ${i + 1}`).join("\n"));
+    assert.equal(chunks.length, 3, "200 lines → 3 chunks of 80");
+    assert.equal(chunks[0]!.start, 1);
+    assert.equal(chunks[1]!.start, 81);
+    assert.equal(chunks[2]!.end, 200, "last chunk ends at the last line");
+    assert.equal(chunkText("   \n \n").length, 0, "whitespace-only text → no chunks");
+    assert.ok(chunkText(`x${"y".repeat(50_000)}`)[0]!.text.length <= 6000, "long-line chunks are char-capped");
+    assert.ok(Math.abs(cosine([1, 0], [1, 0]) - 1) < 1e-9, "cosine identical = 1");
+    assert.equal(cosine([1, 0], [0, 1]), 0, "cosine orthogonal = 0");
+    assert.equal(cosine([0, 0], [1, 1]), 0, "zero vector → 0, not NaN");
+    const walked = walkFiles(process.cwd());
+    assert.ok(walked.includes("src/selfcheck.ts"), "walkFiles finds source files");
+    assert.ok(!walked.some((f) => f.includes("node_modules")), "walkFiles skips node_modules");
+    // Offline: the tool must fail with a clear message, not hang or throw
+    const r = await toolByName.get("codebase_search")!.run({ query: "x" });
+    assert.ok(typeof r.output === "string", "codebase_search returns cleanly even when embeddings are unavailable");
+  }
+
   // --- `ada --version` prints the version and exits WITHOUT auto-starting a backend ---
   {
     const { spawnSync } = await import("node:child_process");

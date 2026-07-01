@@ -72,6 +72,25 @@ async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<vo
   await adapterFor(provider).chat({ provider, model, body, res });
 }
 
+/** Embeddings for @codebase semantic search — forwarded to the ollama provider's
+ *  OpenAI-compatible endpoint (embedding models only live there for now). */
+async function handleEmbeddings(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const raw = await readBody(req);
+  try {
+    JSON.parse(raw);
+  } catch {
+    return json(res, 400, { error: { message: "invalid JSON body" } });
+  }
+  const upstream = await fetch(`${PROVIDERS.ollama.baseURL}/embeddings`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: raw,
+  });
+  const text = await upstream.text();
+  res.writeHead(upstream.status, { "content-type": "application/json" });
+  res.end(text);
+}
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? "/", "http://localhost");
@@ -90,6 +109,10 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
       if (!(await authorized(req))) return json(res, 401, { error: { message: "unauthorized — invalid client key or login" } });
       return await handleChat(req, res);
+    }
+    if (req.method === "POST" && url.pathname === "/v1/embeddings") {
+      if (!(await authorized(req))) return json(res, 401, { error: { message: "unauthorized — invalid client key or login" } });
+      return await handleEmbeddings(req, res);
     }
     return json(res, 404, { error: { message: "not found" } });
   } catch (err) {
