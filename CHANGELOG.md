@@ -21,9 +21,15 @@ All notable changes to ada are documented here. The format is based on
   parsing, no dependency) with `.prompt(text, onEvent)`, `.approve(id, decision)`, `.close()`.
 - `src/client/agent-server.ts` — the pure, unit-tested helpers behind the session endpoints
   (SSE framing, id generation, approval correlation).
+- **Session resume across an `ada serve` restart.** `GET /v1/sessions` lists on-disk transcripts;
+  `POST /v1/sessions` accepts `{ resume: "latest" | "<file>" }` to reattach a fresh in-memory Agent
+  to an existing one, replaying its history so the conversation continues where it left off even
+  after the server process died and restarted. SDK: `ada.listSessions()`, `ada.session({ resume })`.
 
 Verified live end-to-end against a local Ollama model: session create → tool_call →
 approval_request → approve → tool_result → done, with the file actually written only after approval.
+Resume verified by killing and restarting the `ada serve` process mid-conversation (a fresh,
+empty in-memory session map) and confirming the model still recalled a fact from before the restart.
 
 [0.4.0]: https://github.com/black141312/ada/releases/tag/v0.4.0
 

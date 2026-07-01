@@ -11,7 +11,7 @@ import { expandPrompt } from "./client/prompts.ts";
 import { MarkdownStreamer, highlight, renderEditDiff } from "./client/render.ts";
 import { Session, list } from "./client/session.ts";
 import { loadSkills, registerSkillTool, routeConfident } from "./client/skills.ts";
-import { describeCall, parseTextToolCalls, permPhrase, readIntegrationDocs, soleIntegration, writeProjectSkills } from "./client/agent.ts";
+import { Agent, describeCall, parseTextToolCalls, permPhrase, readIntegrationDocs, soleIntegration, writeProjectSkills } from "./client/agent.ts";
 import { userBar } from "./client/tui.ts";
 import { configuredServers, listConnectors, loadMcpServers } from "./client/mcp.ts";
 import { confidentSkill, rankSkills } from "./client/skill-router.ts";
@@ -116,6 +116,18 @@ async function main(): Promise<void> {
   assert.ok(bm?.parent === parent.file, "branch records its parent");
   rmSync(parent.file, { force: true });
   rmSync(branch.file, { force: true });
+
+  // --- resume: a session's on-disk history seeds a fresh Agent's context (no live model needed) ---
+  {
+    const s = Session.create();
+    s.append({ role: "user", content: "remember: the secret word is PINEAPPLE97" });
+    s.append({ role: "assistant", content: "got it" });
+    const history = s.load() as never[];
+    const bare = new Agent({ client: {} as never, model: "x", session: Session.create(), onApprove: async () => "yes" });
+    const resumed = new Agent({ client: {} as never, model: "x", session: s, onApprove: async () => "yes", history });
+    assert.ok(resumed.contextTokens() > bare.contextTokens(), "resuming with history seeds more context than a bare session");
+    rmSync(s.file, { force: true });
+  }
 
   // --- router prefix mapping ---
   assert.equal(route("gpt-4o"), "openai");

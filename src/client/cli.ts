@@ -735,14 +735,20 @@ async function main(): Promise<void> {
       agent: Agent;
       registry: ApprovalRegistry;
       emit: ((frame: string) => void) | null; // set only while a /prompt request's SSE stream is open
+      file: string; // the on-disk transcript — survives an `ada serve` restart; resume with it
     }
     const sessions = new Map<string, AgentSession>();
-    const makeSession = (m: string): { id: string; rec: AgentSession } => {
-      const rec: AgentSession = { agent: undefined as unknown as Agent, registry: new ApprovalRegistry(), emit: null };
+    // `resumeFile` reattaches to an existing on-disk transcript (e.g. after `ada serve` restarted) —
+    // its history replays into the new in-memory Agent so the conversation picks up where it left off.
+    const makeSession = (m: string, resumeFile?: string): { id: string; rec: AgentSession } => {
+      const session = resumeFile ? Session.open(resumeFile) : Session.create();
+      const history = resumeFile ? (session.load() as unknown as Msg[]) : undefined;
+      const rec: AgentSession = { agent: undefined as unknown as Agent, registry: new ApprovalRegistry(), emit: null, file: session.file };
       rec.agent = new Agent({
         client,
         model: m,
-        session: Session.create(),
+        session,
+        history,
         project: trusted,
         compactAt: settings.compactAt,
         autoApprove: false,
@@ -782,18 +788,30 @@ async function main(): Promise<void> {
         return;
       }
       // Interactive: persistent session, streamed events, approval round-trip.
+      // List on-disk transcripts (survive an `ada serve` restart) so an IDE can offer "resume".
+      if (req.method === "GET" && url.pathname === "/v1/sessions") {
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessions: list() }));
+        return;
+      }
       if (req.method === "POST" && url.pathname === "/v1/sessions") {
         let body = "";
         req.on("data", (c) => (body += c));
         req.on("end", () => {
           let m = model;
+          let resume: string | undefined;
           try {
-            m = (JSON.parse(body || "{}") as { model?: string }).model || model;
+            const j = JSON.parse(body || "{}") as { model?: string; resume?: string };
+            m = j.model || model;
+            // "latest" picks the most recently modified transcript; otherwise resume expects one of
+            // the `file` values from GET /v1/sessions (a restarted `ada serve` has no memory of which
+            // in-memory sessionIds existed before, so the IDE re-resolves by transcript file instead).
+            if (j.resume === "latest") resume = list()[0]?.file;
+            else if (j.resume && list().some((s) => s.file === j.resume)) resume = j.resume;
           } catch {
-            /* ignore, use default model */
+            /* ignore, use default model + no resume */
           }
-          const { id } = makeSession(m);
-          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: id, model: m }));
+          const { id, rec } = makeSession(m, resume);
+          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: id, model: m, file: rec.file, resumed: !!resume }));
         });
         return;
       }

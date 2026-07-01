@@ -31,19 +31,38 @@ export type SessionEvent =
 
 export interface AdaSession {
   readonly id: string;
+  /** The on-disk transcript backing this session — survives an `ada serve` restart. Pass this (or
+   *  `"latest"`) as `resume` to a later `session()` call to reattach after one. */
+  readonly file: string;
+  /** True if this session's history was seeded from an existing transcript. */
+  readonly resumed: boolean;
   /** Send a prompt; `onEvent` fires for every event as the turn streams. Resolves once it's done. */
   prompt(text: string, onEvent: (e: SessionEvent) => void): Promise<void>;
   /** Answer a pending `approval_request` event by its id. */
   approve(id: string, decision: "yes" | "all" | "no"): Promise<void>;
-  /** Free the session's resources server-side. */
+  /** Free the session's resources server-side. (Does not delete the on-disk transcript.) */
   close(): Promise<void>;
+}
+
+/** One on-disk session transcript, as returned by `listSessions()`. */
+export interface SessionMeta {
+  file: string;
+  mtime: number;
+  title: string;
+  parent?: string;
 }
 
 export interface AdaClient {
   /** One-shot: runs a fresh agent turn server-side (no memory between calls) and returns its final text. */
   prompt(text: string, opts?: { model?: string }): Promise<PromptResult>;
-  /** Start a persistent, streaming session — the Cursor-style integration point for an IDE. */
-  session(opts?: { model?: string }): Promise<AdaSession>;
+  /**
+   * Start a persistent, streaming session — the Cursor-style integration point for an IDE.
+   * Pass `resume: "latest"` or a `file` from `listSessions()` to reattach an existing conversation
+   * (e.g. after `ada serve` restarted and the old in-memory sessionId is gone).
+   */
+  session(opts?: { model?: string; resume?: string }): Promise<AdaSession>;
+  /** On-disk session transcripts, newest first — for building a "resume which conversation?" picker. */
+  listSessions(): Promise<SessionMeta[]>;
   /** Server health + the default model. */
   health(): Promise<{ ok: boolean; model?: string }>;
 }
@@ -83,12 +102,14 @@ export function createClient(baseUrl = "http://localhost:8788"): AdaClient {
       const res = await fetch(`${url}/v1/sessions`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: opts?.model }),
+        body: JSON.stringify({ model: opts?.model, resume: opts?.resume }),
       });
       if (!res.ok) throw new Error(`ada ${res.status}: ${await res.text().catch(() => res.statusText)}`);
-      const { sessionId } = (await res.json()) as { sessionId: string };
+      const { sessionId, file, resumed } = (await res.json()) as { sessionId: string; file: string; resumed: boolean };
       return {
         id: sessionId,
+        file,
+        resumed,
         async prompt(text, onEvent) {
           const r = await fetch(`${url}/v1/sessions/${sessionId}/prompt`, {
             method: "POST",
@@ -109,6 +130,11 @@ export function createClient(baseUrl = "http://localhost:8788"): AdaClient {
           await fetch(`${url}/v1/sessions/${sessionId}`, { method: "DELETE" });
         },
       };
+    },
+    async listSessions() {
+      const res = await fetch(`${url}/v1/sessions`);
+      if (!res.ok) throw new Error(`ada ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+      return ((await res.json()) as { sessions: SessionMeta[] }).sessions;
     },
     async health() {
       const res = await fetch(`${url}/health`);
