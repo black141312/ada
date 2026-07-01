@@ -4,6 +4,29 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.4.0] — 2026-07-01
+
+### Added
+- **Interactive agent sessions on `ada serve`** — the integration point for building a Cursor-style
+  agent panel into your own IDE, from any language, over HTTP + Server-Sent Events:
+  `POST /v1/sessions` → persistent session, `POST /v1/sessions/:id/prompt` → streamed
+  `text`/`tool_call`/`tool_result`/`approval_request`/`done` events, `POST /v1/sessions/:id/approve`
+  to answer a pending approval from your own UI, `DELETE /v1/sessions/:id` to free it. Sessions
+  default to real approval gating (`autoApprove: false`) — edits pause until you decide, they never
+  auto-run silently.
+- `Agent.send()` gained an `onEvent` option (`AgentEvent`: text/tool_call/tool_result/done) — the
+  structured alternative to writing ANSI text to stdout, additive and opt-in (existing CLI/TUI
+  behavior is unchanged when it isn't set).
+- The typed SDK (`src/sdk`) gained `ada.session()` — a small wrapper around the above (manual SSE
+  parsing, no dependency) with `.prompt(text, onEvent)`, `.approve(id, decision)`, `.close()`.
+- `src/client/agent-server.ts` — the pure, unit-tested helpers behind the session endpoints
+  (SSE framing, id generation, approval correlation).
+
+Verified live end-to-end against a local Ollama model: session create → tool_call →
+approval_request → approve → tool_result → done, with the file actually written only after approval.
+
+[0.4.0]: https://github.com/black141312/ada/releases/tag/v0.4.0
+
 ## [0.3.1] — 2026-06-30
 
 ### Fixed

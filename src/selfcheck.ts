@@ -299,6 +299,23 @@ async function main(): Promise<void> {
   const jid = startJob("selfcheck job", async () => "job-done-ok");
   await new Promise((r) => setTimeout(r, 30));
   assert.ok(renderJobs().includes(jid) && /job-done-ok/.test(renderJobs()), "background job runs and reports its result");
+
+  // --- agent-server helpers: SSE framing, id uniqueness, approval correlation (no live model needed) ---
+  {
+    const { sseFrame, newId, ApprovalRegistry } = await import("./client/agent-server.ts");
+    assert.equal(sseFrame({ type: "done", text: "hi" }), 'data: {"type":"done","text":"hi"}\n\n', "sseFrame formats one data: frame");
+    const a = newId("sess");
+    const b = newId("sess");
+    assert.ok(a.startsWith("sess_") && a !== b, "newId is prefixed and unique");
+
+    const registry = new ApprovalRegistry();
+    const { id, promise } = registry.wait();
+    assert.equal(registry.size, 1, "wait() tracks one pending approval");
+    assert.ok(registry.settle(id, "yes"), "settle() resolves a known pending approval");
+    assert.equal(await promise, "yes", "the waiting promise resolves with the decision");
+    assert.equal(registry.size, 0, "settle() clears the pending entry");
+    assert.equal(registry.settle("nope", "no"), false, "settle() on an unknown id returns false");
+  }
   assert.equal((await toolByName.get("web_fetch")!.run({ url: "http://127.0.0.1/x" })).isError, true, "web_fetch blocks loopback (SSRF guard)");
 
   // --- destructive classifier: real dangers flagged; everyday redirects are not (2>/dev/null bug) ---
