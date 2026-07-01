@@ -23,8 +23,8 @@ export interface PromptResult {
 /** One event from an interactive session's prompt stream. */
 export type SessionEvent =
   | { type: "text"; delta: string }
-  | { type: "tool_call"; name: string; detail: string }
-  | { type: "tool_result"; name: string; output: string; isError: boolean }
+  | { type: "tool_call"; callId: string; name: string; detail: string }
+  | { type: "tool_result"; callId: string; name: string; output: string; isError: boolean }
   | { type: "approval_request"; id: string; name: string; summary: string }
   | { type: "done"; text: string; usage: string }
   | { type: "error"; message: string };
@@ -36,10 +36,17 @@ export interface AdaSession {
   readonly file: string;
   /** True if this session's history was seeded from an existing transcript. */
   readonly resumed: boolean;
-  /** Send a prompt; `onEvent` fires for every event as the turn streams. Resolves once it's done. */
-  prompt(text: string, onEvent: (e: SessionEvent) => void): Promise<void>;
+  /** Send a prompt; `onEvent` fires for every event as the turn streams. Resolves once it's done.
+   *  `images` are data: or https: URLs attached to the message. 409s if a turn is already running. */
+  prompt(text: string, onEvent: (e: SessionEvent) => void, opts?: { images?: string[] }): Promise<void>;
   /** Answer a pending `approval_request` event by its id. */
   approve(id: string, decision: "yes" | "all" | "no"): Promise<void>;
+  /** Cancel the currently-running turn (the "stop generating" button). Safe when idle. */
+  abort(): Promise<void>;
+  /** Queue a mid-turn user message — the agent folds it in between steps (the "steer" box). */
+  steer(text: string): Promise<void>;
+  /** Switch the session's permission mode: ask (gate every edit), plan (read-only), auto (run freely). */
+  setMode(mode: "ask" | "plan" | "auto"): Promise<void>;
   /** Free the session's resources server-side. (Does not delete the on-disk transcript.) */
   close(): Promise<void>;
 }
@@ -110,11 +117,11 @@ export function createClient(baseUrl = "http://localhost:8788"): AdaClient {
         id: sessionId,
         file,
         resumed,
-        async prompt(text, onEvent) {
+        async prompt(text, onEvent, opts) {
           const r = await fetch(`${url}/v1/sessions/${sessionId}/prompt`, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ text }),
+            body: JSON.stringify({ text, images: opts?.images }),
           });
           await streamSse(r, onEvent);
         },
@@ -125,6 +132,26 @@ export function createClient(baseUrl = "http://localhost:8788"): AdaClient {
             body: JSON.stringify({ id, decision }),
           });
           if (!r.ok) throw new Error(`ada ${r.status}: could not settle approval ${id}`);
+        },
+        async abort() {
+          const r = await fetch(`${url}/v1/sessions/${sessionId}/abort`, { method: "POST" });
+          if (!r.ok) throw new Error(`ada ${r.status}: abort failed`);
+        },
+        async steer(text) {
+          const r = await fetch(`${url}/v1/sessions/${sessionId}/steer`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ text }),
+          });
+          if (!r.ok) throw new Error(`ada ${r.status}: steer failed (is a turn running?)`);
+        },
+        async setMode(mode) {
+          const r = await fetch(`${url}/v1/sessions/${sessionId}`, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ mode }),
+          });
+          if (!r.ok) throw new Error(`ada ${r.status}: could not set mode`);
         },
         async close() {
           await fetch(`${url}/v1/sessions/${sessionId}`, { method: "DELETE" });

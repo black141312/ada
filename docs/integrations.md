@@ -24,8 +24,14 @@ language, over plain HTTP + Server-Sent Events:
 ```
 GET  /v1/sessions                        → { sessions: [{ file, title, mtime, parent? }, …] }
 POST /v1/sessions {"resume"?: "latest"|"<file>"} → { sessionId, model, file, resumed }
-POST /v1/sessions/:id/prompt {"text":…}  → SSE stream of events (see below), until "done"
+POST /v1/sessions/:id/prompt {"text":…, "images"?: [dataURL|https…]}
+                                         → SSE stream of events (see below), until "done"
+                                           (409 if a turn is already running on this session)
 POST /v1/sessions/:id/approve {"id":…, "decision":"yes"|"all"|"no"}
+POST /v1/sessions/:id/abort              → cancel the running turn ("stop generating"); also
+                                           denies any approval it was parked on
+POST /v1/sessions/:id/steer {"text":…}   → queue a mid-turn user message (409 when idle)
+PATCH /v1/sessions/:id {"mode":"ask"|"plan"|"auto"} → switch the permission mode live
 DELETE /v1/sessions/:id                  → free the session (does not delete the transcript)
 ```
 

@@ -1,0 +1,48 @@
+# Monthly: re-snapshot the curated model catalog from models.dev and open a PR if anything changed
+# (new models, price changes, context bumps). Keeps `ada catalog` / offline pricing honest without
+# anyone remembering to run `npm run catalog:refresh`.
+#
+# NOTE: PR creation by GITHUB_TOKEN requires the repo setting
+#   Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests"
+# to be enabled. Until it is, this workflow fails at the PR step (harmless — rerun after enabling).
+
+name: Catalog refresh
+on:
+  schedule:
+    - cron: "17 6 1 * *" # 06:17 UTC on the 1st of each month
+  workflow_dispatch: {} # allow manual runs from the Actions tab
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/refresh-catalog.mjs
+      - name: Open a PR if the catalog changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet src/client/catalog.json; then
+            echo "catalog unchanged — nothing to do"
+            exit 0
+          fi
+          BRANCH="chore/catalog-refresh-$(date +%Y-%m)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git add src/client/catalog.json
+          git commit -m "chore(catalog): monthly models.dev refresh"
+          # -f: a rerun (e.g. after enabling the PR-creation setting) must overwrite the branch a
+          # previously-failed run already pushed, not die on non-fast-forward.
+          git push -fu origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" \
+            --title "chore: monthly model-catalog refresh" \
+            --body "Automated re-snapshot of the curated models.dev catalog (prices, context limits, new models). Review the diff and merge." \
+            || gh pr view "$BRANCH" --json url -q .url  # already open from a previous run — fine

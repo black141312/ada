@@ -19,6 +19,9 @@ reproduce and the impact. You'll get an acknowledgement and a fix or mitigation 
 - Login tokens and local config live under `.ada/` / `~/.ada/`, which is git-ignored — never commit it.
 - `web_fetch` has an SSRF guard (blocks localhost/private/metadata addresses); MCP/connector tools run
   with the same approval gating.
+- **`ada serve` (the agent HTTP API) has no authentication of its own** — anyone who can reach the
+  port can drive the agent (and, in a session set to `auto`, edit files). It listens on localhost by
+  default; don't expose it beyond localhost without putting a reverse proxy with auth in front.
 
 ## Supported versions
 

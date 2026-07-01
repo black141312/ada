@@ -64,16 +64,28 @@ export function rankSkills(query: string, items: RankItem[], n = 5): { name: str
 
 /**
  * The single clearly-dominant skill for a query, or null when the match is weak/ambiguous.
- * Three gates, all required: a score floor, dominance over the runner-up, and — crucially — an
- * EXACT whole-token overlap with the skill NAME. That last gate is the precision guard against
- * lexical false positives: "make a powerpoint" prefix-matches "low-power" and even dominates, but
- * "powerpoint" never equals the name token "power", so it's correctly rejected.
+ * Four gates, all required:
+ *  1. a score floor;
+ *  2. dominance over the runner-up;
+ *  3. an EXACT whole-token overlap with the skill NAME — the guard against prefix false positives
+ *     ("make a powerpoint" prefix-matches "low-power" and even dominates, but "powerpoint" never
+ *     equals the name token "power", so it's rejected);
+ *  4. query COVERAGE — strictly more than a third of the query's content tokens must EXACTLY match
+ *     the skill's tokens. A conversational sentence that merely *contains* one skill-y keyword
+ *     ("remember this: the secret word is X" → secret-scan, observed live) is about something else;
+ *     a short task-like command ("describe the project" → project-overview) matches nearly all its
+ *     tokens. Exact equality here on purpose — matches()'s 4-char prefixing is right for recall in
+ *     rankSkills but inflates coverage ("remember" prefix-matches "remediate"), re-opening the leak.
  */
 export function confidentSkill(query: string, items: RankItem[]): string | null {
   const ranked = rankSkills(query, items, 2);
   const top = ranked[0];
   if (!top || top.score < 4) return null;
-  if (ranked[1] && top.score < ranked[1].score * 1.3) return null; // reject ties/near-ties; the name-exact gate below is the real precision guard
-  const q = new Set(tokenize(query));
-  return tokenize(top.name).some((t) => q.has(t)) ? top.name : null;
+  if (ranked[1] && top.score < ranked[1].score * 1.3) return null; // reject ties/near-ties
+  const q = [...new Set(tokenize(query))];
+  if (!tokenize(top.name).some((t) => q.includes(t))) return null;
+  const item = items.find((it) => it.name === top.name);
+  const doc = new Set(tokenize(`${top.name} ${item?.description ?? ""} ${item?.category ?? ""}`));
+  const covered = q.filter((qt) => doc.has(qt)).length;
+  return covered / q.length > 1 / 3 ? top.name : null;
 }

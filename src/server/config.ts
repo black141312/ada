@@ -23,9 +23,9 @@ export const PROVIDERS: Record<ProviderName, ProviderDef> = {
     baseURL: process.env.DASHSCOPE_BASE_URL ?? "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     keyEnv: "DASHSCOPE_API_KEY",
   },
-  // GitHub Copilot — OpenAI-compatible chat endpoint. COPILOT_API_KEY must be a Copilot *bearer*
-  // token (exchanged from a GitHub OAuth token at /copilot_internal/v2/token — that exchange is not
-  // implemented here; it needs a Copilot subscription). Required headers are added in the adapter.
+  // GitHub Copilot — OpenAI-compatible chat endpoint. Set COPILOT_API_KEY (a Copilot bearer you
+  // already have) OR COPILOT_GITHUB_TOKEN (a GitHub token with Copilot access — the adapter runs
+  // the /copilot_internal/v2/token exchange and caches/refreshes the bearer; see copilot-token.ts).
   copilot: { baseURL: process.env.COPILOT_BASE_URL ?? "https://api.githubcopilot.com", keyEnv: "COPILOT_API_KEY" },
   // Cloudflare Workers AI / AI Gateway — OpenAI-compatible. Workers AI: set CLOUDFLARE_ACCOUNT_ID +
   // CLOUDFLARE_API_TOKEN (default URL). AI Gateway: point CLOUDFLARE_BASE_URL at the gateway URL.
@@ -57,6 +57,8 @@ export function providerKey(p: ProviderName): string | undefined {
 
 /** A provider is usable if it's keyless, its key env var is set, or a credential is stored. */
 export function isConfigured(p: ProviderName): boolean {
+  // Copilot has a second way in: a GitHub token the adapter exchanges for a bearer (copilot-token.ts).
+  if (p === "copilot" && process.env.COPILOT_GITHUB_TOKEN) return true;
   return PROVIDERS[p].keyEnv === "" || !!process.env[PROVIDERS[p].keyEnv] || !!getCredential(p);
 }
 

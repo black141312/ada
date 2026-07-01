@@ -19,8 +19,8 @@ type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
  *  When `onEvent` is set on SendCtrl, `send()` emits these instead of writing to stdout. */
 export type AgentEvent =
   | { type: "text"; delta: string }
-  | { type: "tool_call"; name: string; detail: string }
-  | { type: "tool_result"; name: string; output: string; isError: boolean }
+  | { type: "tool_call"; callId: string; name: string; detail: string }
+  | { type: "tool_result"; callId: string; name: string; output: string; isError: boolean }
   | { type: "done"; text: string; usage: string };
 type SendCtrl = { signal?: AbortSignal; steer?: string[]; quiet?: boolean; images?: string[]; onReplyStart?: () => void; onEvent?: (e: AgentEvent) => void };
 type ToolCall = { id: string; name: string; args: string };
@@ -654,6 +654,7 @@ export class Agent {
               calls[tc.index] = entry;
             }
             if (tc.id) entry.id = tc.id;
+            else if (!entry.id) entry.id = `call_${tc.index}`; // some backends omit streamed ids — consumers key events on callId
             if (tc.function?.name) entry.name += tc.function.name;
             if (tc.function?.arguments) entry.args += tc.function.arguments;
           }
@@ -699,14 +700,14 @@ export class Agent {
    *  append one tool message per call. */
   private async execTools(toolCalls: ToolCall[], ctrl: SendCtrl | undefined, say: (s: string) => void): Promise<void> {
     const signal = ctrl?.signal;
-    const printCall = (name: string, args: Record<string, unknown>): void => {
+    const printCall = (callId: string, name: string, args: Record<string, unknown>): void => {
       const d = describeCall(name, args);
       const detail = d.detail ? ` ${d.detail.length > 100 ? `${d.detail.slice(0, 99)}…` : d.detail}` : "";
-      ctrl?.onEvent?.({ type: "tool_call", name, detail: d.detail });
+      ctrl?.onEvent?.({ type: "tool_call", callId, name, detail: d.detail });
       say(`\n\x1b[2m• ${name}${detail}\x1b[0m\n`);
     };
-    const printResult = (name: string, r: ToolResult): void => {
-      ctrl?.onEvent?.({ type: "tool_result", name, output: r.output, isError: !!r.isError });
+    const printResult = (callId: string, name: string, r: ToolResult): void => {
+      ctrl?.onEvent?.({ type: "tool_result", callId, name, output: r.output, isError: !!r.isError });
       if (r.display) say(`${r.display}\n`);
       else if (r.isError) say(`\x1b[31m  ${r.output.split("\n")[0]}\x1b[0m\n`);
     };
@@ -734,15 +735,15 @@ export class Agent {
         continue;
       }
       if (!tool) {
-        printCall(c.name, args);
+        printCall(c.id, c.name, args);
         results[i] = { output: `Unknown tool: ${c.name}`, isError: true };
         continue;
       }
       const perm = permissionFor(c.name, summarize(args)); // configured allow/ask/deny rule, if any
       if (perm === "deny") {
-        printCall(c.name, args);
+        printCall(c.id, c.name, args);
         results[i] = { output: "Denied by permission policy.", isError: true };
-        printResult(c.name, results[i]!);
+        printResult(c.id, c.name, results[i]!);
         continue;
       }
       if (!tool.needsApproval && perm !== "ask") {
@@ -750,10 +751,10 @@ export class Agent {
         continue;
       }
       // gated tool (or a rule forces "ask") → sequential (so prompts and same-file writes don't race)
-      printCall(c.name, args);
+      printCall(c.id, c.name, args);
       if (this.planMode && tool.needsApproval) {
         results[i] = { output: "Plan mode: not executing — finish the plan; the user approves with /run." };
-        printResult(c.name, results[i]!);
+        printResult(c.id, c.name, results[i]!);
         continue;
       }
       const forceConfirm = c.name === "bash" && isDestructive(String(args.command ?? ""));
@@ -771,15 +772,15 @@ export class Agent {
           results[i] = await runTool(tool, c.name, args);
         }
       }
-      printResult(c.name, results[i]!);
+      printResult(c.id, c.name, results[i]!);
     }
     await Promise.all(
       parallel.map(async (i) => {
         const c = toolCalls[i]!;
         const args = argsOf(c.args);
-        printCall(c.name, args);
+        printCall(c.id, c.name, args);
         results[i] = await runTool(toolByName.get(c.name)!, c.name, args);
-        printResult(c.name, results[i]!);
+        printResult(c.id, c.name, results[i]!);
       }),
     );
     for (let i = 0; i < toolCalls.length; i++) {
