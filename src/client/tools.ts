@@ -534,6 +534,31 @@ export const tools: Tool[] = [
     },
   },
   {
+    name: "codebase_search",
+    description:
+      "Semantic (meaning-based) search over the codebase — finds code by what it DOES, not by exact strings. Use when grep's literal matching won't work (\"where do we handle auth?\", \"how are sessions persisted?\"). First call indexes the repo (needs an Ollama embedding model, e.g. nomic-embed-text); later calls are incremental.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "What you're looking for, in plain words." },
+        k: { type: "number", description: "How many results (default 6)." },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+    needsApproval: false,
+    async run(args) {
+      try {
+        const { searchCodebase } = await import("./embed-index.ts"); // lazy — only pay for it when used
+        const hits = await searchCodebase(String(args.query), Math.min(Number(args.k) || 6, 20));
+        if (!hits.length) return { output: "No indexed content matched. Is the repo empty, or all files skipped?" };
+        return { output: hits.map((h) => `${h.file}:${h.start}-${h.end}  (score ${h.score.toFixed(3)})\n${h.snippet}`).join("\n\n---\n\n") };
+      } catch (e) {
+        return { output: String(e instanceof Error ? e.message : e), isError: true };
+      }
+    },
+  },
+  {
     name: "web_fetch",
     description: "Fetch an http(s) URL and return its content as readable text (HTML is stripped to text). Use to read docs, articles, changelogs, or JSON APIs.",
     parameters: {

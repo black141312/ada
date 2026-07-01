@@ -4,6 +4,20 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.6.0] — 2026-07-02
+
+### Added
+- **`codebase_search` — @codebase semantic search.** A read-only tool that finds code by what it
+  *does*, not by exact strings ("where do we handle auth?"). Chunks the working tree (80-line
+  windows, char-capped for minified files), embeds through the backend's new `/v1/embeddings`
+  (forwarded to Ollama — `ollama pull nomic-embed-text`, or set `ADA_EMBED_MODEL`), caches vectors
+  in `.ada/index.json` keyed by content hash (incremental — only changed files re-embed; the cache
+  key includes the embedding scheme so a model/prefix change rebuilds), and ranks by cosine.
+  nomic models get the asymmetric `search_query:`/`search_document:` prefixes, which measurably
+  improved code-vs-prose ranking in live tests. Backend `/v1/embeddings` endpoint by @black141312.
+
+[0.6.0]: https://github.com/black141312/ada/releases/tag/v0.6.0
+
 ## [0.5.0] — 2026-07-02
 
 The "do it all" gap batch — everything flagged as missing after 0.4.0.
