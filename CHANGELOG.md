@@ -4,6 +4,19 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.6.1] — 2026-07-02
+
+### Fixed
+- **Windows: "Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)" noise on exit.** Two causes,
+  both fixed: the backend health probe's undici (fetch) keep-alive socket lingered into process
+  teardown — the probe now uses plain `node:http` with `agent: false` (socket closes with the
+  response; verified deterministic: 3× asserting before, 0× after, on both the probe-only and the
+  autostart-spawn paths); and node-pty's native module was loaded at import time by every command —
+  it now loads lazily on the first `bash` call, so `--version`, `catalog`, `--list-models`, etc.
+  never touch it.
+
+[0.6.1]: https://github.com/black141312/ada/releases/tag/v0.6.1
+
 ## [0.6.0] — 2026-07-02
 
 ### Added

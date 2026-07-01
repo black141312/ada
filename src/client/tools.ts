@@ -99,14 +99,21 @@ export function formatFile(abs: string): boolean {
 }
 
 // node-pty gives the bash tool a real terminal. It's a required dependency; if the native build is
-// ever broken on a platform, fall back to spawnSync so bash still works.
-const pty: typeof PtyType | null = (() => {
-  try {
-    return createRequire(import.meta.url)("node-pty") as typeof PtyType;
-  } catch {
-    return null;
+// ever broken on a platform, fall back to spawnSync so bash still works. Loaded LAZILY on the first
+// bash call: merely loading the native module on Windows sets up async handles whose teardown races
+// process.exit and prints "Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)" — commands that
+// never spawn a PTY (--version, catalog, --list-models, …) shouldn't pay that.
+let ptyMod: typeof PtyType | null | undefined;
+function getPty(): typeof PtyType | null {
+  if (ptyMod === undefined) {
+    try {
+      ptyMod = createRequire(import.meta.url)("node-pty") as typeof PtyType;
+    } catch {
+      ptyMod = null;
+    }
   }
-})();
+  return ptyMod;
+}
 
 // Built via new RegExp (string escapes) so no literal ESC/BEL bytes live in the source.
 const ANSI = new RegExp("[\\u001B\\u009B][\\[\\]()#;?]*(?:(?:[a-zA-Z\\d]*(?:;[a-zA-Z\\d]*)*)?\\u0007|(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PR-TZcf-ntqry=><~])", "g");
@@ -120,7 +127,7 @@ function runPty(command: string, timeoutMs = 120_000): Promise<{ output: string;
     const win = process.platform === "win32";
     const shell = win ? process.env.COMSPEC ?? "cmd.exe" : process.env.SHELL ?? "/bin/bash";
     const shellArgs = win ? ["/c", command] : ["-lc", command];
-    const p = pty!.spawn(shell, shellArgs, { name: "xterm-256color", cols: 120, rows: 30, cwd: process.cwd(), env: process.env as Record<string, string> });
+    const p = getPty()!.spawn(shell, shellArgs, { name: "xterm-256color", cols: 120, rows: 30, cwd: process.cwd(), env: process.env as Record<string, string> });
     let out = "";
     const cap = 10 * 1024 * 1024;
     p.onData((d) => {
@@ -360,7 +367,7 @@ export const tools: Tool[] = [
     needsApproval: true,
     async run(args) {
       const command = String(args.command);
-      if (pty) {
+      if (getPty()) {
         const { output, code } = await runPty(command);
         return { output: `exit ${code ?? "null"}\n${spillIfHuge(stripAnsi(output).trim() || "(no output)")}`, isError: code !== 0 };
       }

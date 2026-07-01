@@ -30,13 +30,22 @@ export function healthUrl(backendUrl: string): string {
   }
 }
 
-async function probe(url: string, timeoutMs = 800): Promise<boolean> {
-  try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-    return res.ok;
-  } catch {
-    return false;
-  }
+// Plain node:http with agent:false, NOT fetch: undici's keep-alive socket from a probe lingers into
+// process teardown and deterministically prints "Assertion failed: !(handle->flags &
+// UV_HANDLE_CLOSING)" on Windows at exit. agent:false closes the socket with the response.
+function probe(url: string, timeoutMs = 800): Promise<boolean> {
+  return new Promise((resolve) => {
+    import("node:http")
+      .then((http) => {
+        const req = http.get(url, { agent: false, timeout: timeoutMs }, (res) => {
+          res.resume(); // drain so the socket can close
+          resolve((res.statusCode ?? 500) < 400);
+        });
+        req.on("timeout", () => req.destroy());
+        req.on("error", () => resolve(false));
+      })
+      .catch(() => resolve(false));
+  });
 }
 
 /** Resolved path to bin/ada-server.mjs (sibling of bin/ada.mjs, packaged in the npm tarball). */
