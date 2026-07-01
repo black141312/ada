@@ -15,7 +15,14 @@ import { routeConfident, routeSkills } from "./skills.ts";
 import { Session } from "./session.ts";
 
 type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
-type SendCtrl = { signal?: AbortSignal; steer?: string[]; quiet?: boolean; images?: string[]; onReplyStart?: () => void };
+/** Structured turn events — for a caller (e.g. an IDE service) that wants more than plain text.
+ *  When `onEvent` is set on SendCtrl, `send()` emits these instead of writing to stdout. */
+export type AgentEvent =
+  | { type: "text"; delta: string }
+  | { type: "tool_call"; name: string; detail: string }
+  | { type: "tool_result"; name: string; output: string; isError: boolean }
+  | { type: "done"; text: string; usage: string };
+type SendCtrl = { signal?: AbortSignal; steer?: string[]; quiet?: boolean; images?: string[]; onReplyStart?: () => void; onEvent?: (e: AgentEvent) => void };
 type ToolCall = { id: string; name: string; args: string };
 type StepResult = { content: string; toolCalls: ToolCall[] };
 type ToolDef = OpenAI.Chat.Completions.ChatCompletionTool;
@@ -493,6 +500,10 @@ export class Agent {
   async send(input: string, ctrl?: SendCtrl): Promise<string> {
     let replyStarted = false;
     const say = (s: string): void => {
+      if (ctrl?.onEvent) {
+        if (s.trim()) ctrl.onEvent({ type: "text", delta: s });
+        return;
+      }
       if (ctrl?.quiet) return;
       if (!replyStarted && s.trim()) {
         replyStarted = true;
@@ -539,6 +550,7 @@ export class Agent {
 
     const engine = this.makeEngine(ctrl, say, interrupted, drainSteer);
     await (ORCHESTRATORS[this.strategy] ?? reAct).run(engine);
+    ctrl?.onEvent?.({ type: "done", text: this.lastAssistant, usage: this.usageReport() });
     return this.lastAssistant;
   }
 
@@ -690,9 +702,11 @@ export class Agent {
     const printCall = (name: string, args: Record<string, unknown>): void => {
       const d = describeCall(name, args);
       const detail = d.detail ? ` ${d.detail.length > 100 ? `${d.detail.slice(0, 99)}…` : d.detail}` : "";
+      ctrl?.onEvent?.({ type: "tool_call", name, detail: d.detail });
       say(`\n\x1b[2m• ${name}${detail}\x1b[0m\n`);
     };
-    const printResult = (r: ToolResult): void => {
+    const printResult = (name: string, r: ToolResult): void => {
+      ctrl?.onEvent?.({ type: "tool_result", name, output: r.output, isError: !!r.isError });
       if (r.display) say(`${r.display}\n`);
       else if (r.isError) say(`\x1b[31m  ${r.output.split("\n")[0]}\x1b[0m\n`);
     };
@@ -728,7 +742,7 @@ export class Agent {
       if (perm === "deny") {
         printCall(c.name, args);
         results[i] = { output: "Denied by permission policy.", isError: true };
-        printResult(results[i]!);
+        printResult(c.name, results[i]!);
         continue;
       }
       if (!tool.needsApproval && perm !== "ask") {
@@ -739,7 +753,7 @@ export class Agent {
       printCall(c.name, args);
       if (this.planMode && tool.needsApproval) {
         results[i] = { output: "Plan mode: not executing — finish the plan; the user approves with /run." };
-        printResult(results[i]!);
+        printResult(c.name, results[i]!);
         continue;
       }
       const forceConfirm = c.name === "bash" && isDestructive(String(args.command ?? ""));
@@ -757,7 +771,7 @@ export class Agent {
           results[i] = await runTool(tool, c.name, args);
         }
       }
-      printResult(results[i]!);
+      printResult(c.name, results[i]!);
     }
     await Promise.all(
       parallel.map(async (i) => {
@@ -765,7 +779,7 @@ export class Agent {
         const args = argsOf(c.args);
         printCall(c.name, args);
         results[i] = await runTool(toolByName.get(c.name)!, c.name, args);
-        printResult(results[i]!);
+        printResult(c.name, results[i]!);
       }),
     );
     for (let i = 0; i < toolCalls.length; i++) {

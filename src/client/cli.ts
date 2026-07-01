@@ -7,7 +7,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { stdin, stdout } from "node:process";
 import OpenAI from "openai";
-import { Agent, type ApprovalDecision, type OnApprove } from "./agent.ts";
+import { Agent, type AgentEvent, type ApprovalDecision, type OnApprove } from "./agent.ts";
+import { ApprovalRegistry, newId, sseFrame } from "./agent-server.ts";
 import { expandPrompt, loadPrompts } from "./prompts.ts";
 import { Session, list, type SessionMeta } from "./session.ts";
 import { deleteCredential, getCredential, listCredentials } from "../server/credentials.ts";
@@ -727,13 +728,45 @@ async function main(): Promise<void> {
       }
     }
     const port = Number(process.env.ADA_HTTP_PORT) || 8788;
+
+    // Interactive sessions — for driving ada like an IDE agent panel (live text/tool-call events,
+    // and edits pause for YOUR approval UI instead of auto-running). See docs/integrations.md.
+    interface AgentSession {
+      agent: Agent;
+      registry: ApprovalRegistry;
+      emit: ((frame: string) => void) | null; // set only while a /prompt request's SSE stream is open
+    }
+    const sessions = new Map<string, AgentSession>();
+    const makeSession = (m: string): { id: string; rec: AgentSession } => {
+      const rec: AgentSession = { agent: undefined as unknown as Agent, registry: new ApprovalRegistry(), emit: null };
+      rec.agent = new Agent({
+        client,
+        model: m,
+        session: Session.create(),
+        project: trusted,
+        compactAt: settings.compactAt,
+        autoApprove: false,
+        onApprove: async (toolName, summary): Promise<ApprovalDecision> => {
+          if (!rec.emit) return "no"; // no open stream to ask through — fail closed, don't silently run
+          const { id, promise } = rec.registry.wait();
+          rec.emit(sseFrame({ type: "approval_request", id, name: toolName, summary }));
+          return promise;
+        },
+      });
+      const id = newId("sess");
+      sessions.set(id, rec);
+      return { id, rec };
+    };
+
     const { createServer } = await import("node:http");
     createServer((req, res) => {
-      if (req.method === "GET" && (req.url === "/health" || req.url === "/")) {
-        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, model }));
+      const url = new URL(req.url ?? "/", "http://localhost");
+      if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/")) {
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, model, sessions: sessions.size }));
         return;
       }
-      if (req.method === "POST" && req.url === "/v1/prompt") {
+      // One-shot, no memory between calls — good for a "generate this" action, not a chat panel.
+      if (req.method === "POST" && url.pathname === "/v1/prompt") {
         let body = "";
         req.on("data", (c) => (body += c));
         req.on("end", async () => {
@@ -748,8 +781,88 @@ async function main(): Promise<void> {
         });
         return;
       }
+      // Interactive: persistent session, streamed events, approval round-trip.
+      if (req.method === "POST" && url.pathname === "/v1/sessions") {
+        let body = "";
+        req.on("data", (c) => (body += c));
+        req.on("end", () => {
+          let m = model;
+          try {
+            m = (JSON.parse(body || "{}") as { model?: string }).model || model;
+          } catch {
+            /* ignore, use default model */
+          }
+          const { id } = makeSession(m);
+          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: id, model: m }));
+        });
+        return;
+      }
+      const promptMatch = req.method === "POST" && url.pathname.match(/^\/v1\/sessions\/([^/]+)\/prompt$/);
+      if (promptMatch) {
+        const rec = sessions.get(promptMatch[1]!);
+        if (!rec) {
+          res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: "unknown session" }));
+          return;
+        }
+        let body = "";
+        req.on("data", (c) => (body += c));
+        req.on("end", async () => {
+          let text = "";
+          try {
+            text = String((JSON.parse(body || "{}") as { text?: string }).text ?? "");
+          } catch {
+            /* empty prompt */
+          }
+          res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+          rec.emit = (frame) => res.write(frame);
+          try {
+            await rec.agent.send(text, { onEvent: (e: AgentEvent) => res.write(sseFrame(e)) });
+          } catch (e) {
+            res.write(sseFrame({ type: "error", message: e instanceof Error ? e.message : String(e) }));
+          } finally {
+            rec.emit = null;
+            res.end();
+          }
+        });
+        return;
+      }
+      const approveMatch = req.method === "POST" && url.pathname.match(/^\/v1\/sessions\/([^/]+)\/approve$/);
+      if (approveMatch) {
+        const rec = sessions.get(approveMatch[1]!);
+        if (!rec) {
+          res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: "unknown session" }));
+          return;
+        }
+        let body = "";
+        req.on("data", (c) => (body += c));
+        req.on("end", () => {
+          let ok = false;
+          try {
+            const { id, decision } = JSON.parse(body || "{}") as { id?: string; decision?: ApprovalDecision };
+            if (id && decision) ok = rec.registry.settle(id, decision);
+          } catch {
+            /* ok stays false */
+          }
+          res.writeHead(ok ? 200 : 404, { "content-type": "application/json" }).end(JSON.stringify({ ok }));
+        });
+        return;
+      }
+      const delMatch = req.method === "DELETE" && url.pathname.match(/^\/v1\/sessions\/([^/]+)$/);
+      if (delMatch) {
+        const existed = sessions.delete(delMatch[1]!);
+        res.writeHead(existed ? 200 : 404, { "content-type": "application/json" }).end(JSON.stringify({ ok: existed }));
+        return;
+      }
       res.writeHead(404).end();
-    }).listen(port, () => console.log(`ada HTTP API on http://localhost:${port}  ·  POST /v1/prompt {"text":"…"}  ·  model ${model || "(none — set one)"}`));
+    }).listen(port, () =>
+      console.log(
+        `ada HTTP API on http://localhost:${port}  ·  model ${model || "(none — set one)"}\n` +
+          `  one-shot:    POST /v1/prompt {"text":"…"}\n` +
+          `  interactive: POST /v1/sessions → {sessionId}\n` +
+          `               POST /v1/sessions/:id/prompt {"text":"…"}  (SSE: text/tool_call/tool_result/approval_request/done)\n` +
+          `               POST /v1/sessions/:id/approve {"id":"…","decision":"yes"|"all"|"no"}`,
+      ),
+    );
     await new Promise(() => {}); // keep the process alive for the server
     return;
   }

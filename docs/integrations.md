@@ -9,20 +9,65 @@ build, an IdP) are described with what they'd take — they can't be "live" with
 ```bash
 ada serve            # → http://localhost:8788  (ADA_HTTP_PORT to change)
 ```
-- `GET /health` → `{ ok, model }`
-- `POST /v1/prompt` `{ "text": "...", "model"?: "..." }` → `{ text, usage }` (runs a fresh agent turn)
+- `GET /health` → `{ ok, model, sessions }`
+- `POST /v1/prompt` `{ "text": "...", "model"?: "..." }` → `{ text, usage }` — **one-shot**: a fresh
+  agent + fresh session per call, no memory between calls. Good for a "generate this" button, not a
+  chat panel.
+
+### Building a Cursor-style agent panel (an IDE integration)
+
+For a real agent panel — persistent conversation, live streamed output, visible tool calls, and
+edits that pause for **your own** approval UI instead of auto-running — use the **interactive
+session** endpoints instead. This is the intended integration point for a custom IDE/editor, in any
+language, over plain HTTP + Server-Sent Events:
+
+```
+POST /v1/sessions                        → { sessionId, model }
+POST /v1/sessions/:id/prompt {"text":…}  → SSE stream of events (see below), until "done"
+POST /v1/sessions/:id/approve {"id":…, "decision":"yes"|"all"|"no"}
+DELETE /v1/sessions/:id                  → free the session
+```
+
+The session holds one persistent `Agent` — history, model, and skill/tool state carry across every
+`/prompt` call. Each `/prompt` call streams one event per SSE frame (`data: {...}\n\n`):
+
+| `type` | Fields | Meaning |
+|---|---|---|
+| `text` | `delta` | A chunk of the assistant's reply |
+| `tool_call` | `name`, `detail` | A tool is about to run |
+| `tool_result` | `name`, `output`, `isError` | It finished |
+| `approval_request` | `id`, `name`, `summary` | **Blocks** until you POST `.../approve` with this `id` — this is where your IDE shows its own "allow this edit?" UI |
+| `done` | `text`, `usage` | Turn complete |
+| `error` | `message` | The turn failed (e.g. upstream unreachable) |
+
+Sessions default to `autoApprove: false` (unlike the one-shot `/v1/prompt`, which auto-approves
+everything) — every gated tool call (file writes, destructive shell, …) fires `approval_request` and
+waits for your response. If no `/prompt` stream is currently open when an approval is needed, it's
+declined (fails closed, never runs silently).
 
 ## Typed SDK — `src/sdk`
 
 ```ts
 import { createClient } from "ada-agent/sdk"; // in-repo: "./src/sdk/index.ts"
 const ada = createClient("http://localhost:8788");
-console.log(await ada.health());
+
+// one-shot
 const { text } = await ada.prompt("list the files in this project");
+
+// interactive — the IDE integration point
+const session = await ada.session({ model: "claude-opus-4-8" });
+await session.prompt("refactor foo.ts to use async/await", (e) => {
+  if (e.type === "text") process.stdout.write(e.delta);
+  if (e.type === "tool_call") console.log(`→ ${e.name} ${e.detail}`);
+  if (e.type === "approval_request") session.approve(e.id, myOwnConfirmUi(e) ? "yes" : "no");
+  if (e.type === "done") console.log("\n" + e.usage);
+});
+await session.close();
 ```
 
-It's a ~30-line `fetch` wrapper over the HTTP API above — if you'd rather not pull in the source,
-just POST to `/v1/prompt` directly.
+It's a `fetch`-based wrapper (manual SSE parsing, no dependency) over the HTTP API above — if you'd
+rather not pull in the source, or your IDE isn't Node/TypeScript, talk to the same endpoints directly
+from any HTTP client that can read a chunked response (Java, Python, Rust, a browser, …).
 
 ## ACP bridge — `ada acp`
 
