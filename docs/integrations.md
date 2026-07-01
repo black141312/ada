@@ -22,10 +22,11 @@ session** endpoints instead. This is the intended integration point for a custom
 language, over plain HTTP + Server-Sent Events:
 
 ```
-POST /v1/sessions                        → { sessionId, model }
+GET  /v1/sessions                        → { sessions: [{ file, title, mtime, parent? }, …] }
+POST /v1/sessions {"resume"?: "latest"|"<file>"} → { sessionId, model, file, resumed }
 POST /v1/sessions/:id/prompt {"text":…}  → SSE stream of events (see below), until "done"
 POST /v1/sessions/:id/approve {"id":…, "decision":"yes"|"all"|"no"}
-DELETE /v1/sessions/:id                  → free the session
+DELETE /v1/sessions/:id                  → free the session (does not delete the transcript)
 ```
 
 The session holds one persistent `Agent` — history, model, and skill/tool state carry across every
@@ -44,6 +45,14 @@ Sessions default to `autoApprove: false` (unlike the one-shot `/v1/prompt`, whic
 everything) — every gated tool call (file writes, destructive shell, …) fires `approval_request` and
 waits for your response. If no `/prompt` stream is currently open when an approval is needed, it's
 declined (fails closed, never runs silently).
+
+**Resuming after a restart.** Sessions live in memory, so a `sessionId` doesn't survive `ada serve`
+restarting — but every session's conversation is also persisted to an on-disk transcript
+(`.ada/sessions/*.jsonl`), same as the CLI's own sessions. `GET /v1/sessions` lists them (newest
+first); pass `resume: "latest"` or a specific `file` from that list to `POST /v1/sessions` to spin up
+a **new** in-memory session seeded with that history — the conversation picks up right where it left
+off. Verified live: kill `ada serve` mid-conversation, restart it, resume, and the model still recalls
+what was said before the restart.
 
 ## Typed SDK — `src/sdk`
 
