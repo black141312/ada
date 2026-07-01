@@ -5,37 +5,38 @@ through `tsx`, **no build step**. The whole thing is meant to stay readable in a
 
 ## Branches
 
-- **`dev`** is the default integration branch — **branch from it and open your PR against it.**
-- **`main`** holds tagged releases only. Maintainers merge `dev` → `main` and tag (`vX.Y.Z`) to cut
-  a release; please don't PR directly to `main`.
-- CI (`typecheck` + `selfcheck`) runs on every push and PR to both `dev` and `main`.
+Simple GitHub flow — `main` is the only long-lived branch:
+
+- **`main`** is always releasable. Branch from it, open your PR against it.
+- Feature/fix work happens on a short-lived branch (`my-change`), PR'd back to `main`.
+- CI (`typecheck` + `selfcheck`) runs on every push and PR to `main`.
+
+```bash
+git switch main && git pull
+git switch -c my-change      # work, commit
+# open a PR with base = main
+```
 
 ### Cutting a release (maintainers)
 
-1. Bump `package.json` `version` and add a `CHANGELOG.md` entry on `dev`.
-2. PR `dev → main` and merge.
-3. From `main`, run the release script — it tags `v<version>`, pushes, and watches the publish:
+1. On your branch (or directly on `main` for a trivial bump), update `package.json` `version` and add
+   a `CHANGELOG.md` entry. Merge to `main`.
+2. From `main`, run the release script — it tags `v<version>`, pushes, and watches the publish:
    ```bash
    git switch main && git pull
    npm run release            # or: npm run release -- --no-watch
    ```
    It refuses unless you're on a clean `main` and the tag is new, so it can't tag the wrong commit.
-4. The **Release** workflow takes over: verifies the tag matches `package.json`, runs the gates,
+3. The **Release** workflow takes over: verifies the tag matches `package.json`, runs the gates,
    `npm publish`es `ada-agent`, and creates the GitHub release. Requires the repo secret `NPM_TOKEN`
-   (a granular automation token with publish rights for `ada-agent`).
-
-```bash
-git switch dev && git pull
-git switch -c my-change      # work, commit
-# open a PR with base = dev
-```
+   (a **classic Automation** token — not Granular/Publish, which prompt for an OTP that CI can't
+   supply).
 
 ## Setup
 
 ```bash
 git clone https://github.com/black141312/ada.git
 cd ada
-git switch dev      # contribute from dev, not main
 npm install
 npm link            # puts `ada` / `ada-server` on PATH (or just `npm start`)
 ```
