@@ -39,6 +39,14 @@ export class ApprovalRegistry {
     return true;
   }
 
+  /** Deny every pending approval — an aborted turn must not stay parked on an unanswered prompt. */
+  abortAll(): number {
+    const n = this.pending.size;
+    for (const resolve of this.pending.values()) resolve("no");
+    this.pending.clear();
+    return n;
+  }
+
   get size(): number {
     return this.pending.size;
   }

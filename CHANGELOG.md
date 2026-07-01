@@ -4,6 +4,65 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.5.0] — 2026-07-02
+
+The "do it all" gap batch — everything flagged as missing after 0.4.0.
+
+### Added
+- **`ada --version` / `-v`** — prints the version and exits. (Previously it fell through to
+  interactive mode and even auto-started the backend.)
+- **Session API completions** for IDE panels:
+  - `POST /v1/sessions/:id/abort` — the "stop generating" button; also denies any approval the turn
+    was parked on so it can't stay stuck.
+  - **Busy guard** — a second `prompt` on a session with a turn running gets `409` instead of
+    silently interleaving two turns into one conversation.
+  - `PATCH /v1/sessions/:id {"mode":"ask"|"plan"|"auto"}` — switch the permission mode live.
+  - `POST /v1/sessions/:id/steer` — queue a mid-turn user message (parity with the CLI's
+    type-while-running steering).
+  - `images` on `prompt` — attach data:/https: image URLs to a message.
+  - SDK: `session.abort()`, `.steer()`, `.setMode()`, `prompt(…, { images })`.
+- **Copilot token exchange** — set `COPILOT_GITHUB_TOKEN` and the backend exchanges it at
+  `/copilot_internal/v2/token`, caching + refreshing the bearer (still needs a Copilot subscription
+  to exercise; `COPILOT_API_KEY` continues to work as a direct bearer). Editor-identification
+  headers now report the real ada version.
+- **ACP bridge streaming** — `ada acp` now emits `session/update` notifications
+  (`agent_message_chunk`, `tool_call`/`tool_call_update`) while a turn runs, matching the shape ACP
+  editors render live. Still experimental until exercised against a real ACP client.
+- **Windows CI job** — typecheck + selfcheck now also run on `windows-latest`, exercising the
+  node-pty native build on the platform many users actually run.
+- **Monthly catalog refresh** — a scheduled workflow re-snapshots the models.dev catalog and opens a
+  PR when prices/models changed. (Needs the "Allow GitHub Actions to create and approve pull
+  requests" repo setting.)
+
+### Fixed
+- **Skill auto-apply false positives** — a long conversational sentence merely *containing* a
+  skill-y keyword ("remember this: the secret word is…" → `secret-scan`, observed live) no longer
+  auto-applies. New coverage gate: at least a third of the query's content tokens must match the
+  skill; short task-like commands ("describe the project") still fire.
+
+### Security
+- SECURITY.md now states plainly that `ada serve` has no auth of its own — keep it on localhost or
+  front it with an authenticating proxy.
+
+### Hardening (from a pre-merge adversarial review of this batch; all verified live)
+- A client that dies **mid-request-body** (e.g. a dropped image upload) no longer bricks the session
+  with a permanent 409 — the claim is released on `req` close.
+- A client that **drops the SSE stream mid-turn** (IDE reload/crash) no longer leaves the turn
+  running headless (or, in ask mode, parked forever on an approval nobody can see) — the turn is
+  aborted on `res` close.
+- The skill-router coverage gate counts **exact** token matches with a **strict** threshold — the
+  prefix-matching + inclusive-bound combination re-admitted short phrasings of the very leak the
+  gate was built to stop.
+- Copilot: `COPILOT_GITHUB_TOKEN` alone now actually configures the provider (the exchange was
+  unreachable), stored credentials again send an auth header, and an upstream 401 invalidates the
+  cached bearer.
+- Resuming a transcript that a live session is still writing is refused (409 + the live sessionId)
+  instead of interleaving two conversations into one file.
+- `tool_call`/`tool_result` events carry a stable `callId` (generated when a backend omits streamed
+  ids); ACP gained `session/cancel`; SDK `abort()` surfaces HTTP errors instead of pretending success.
+
+[0.5.0]: https://github.com/black141312/ada/releases/tag/v0.5.0
+
 ## [0.4.0] — 2026-07-01
 
 ### Added

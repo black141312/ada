@@ -18,3 +18,18 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run selfcheck
+
+  # Windows leg — exercises the node-pty native build + path handling on the platform many users
+  # (and the maintainer) actually run. Deliberately a separate job, NOT a matrix: branch protection
+  # requires the check named "check", and a matrix would rename it to "check (ubuntu-latest)".
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run selfcheck

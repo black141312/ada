@@ -502,6 +502,11 @@ const NO_BACKEND = new Set(["mcp", "skill", "worktree", "wt", "catalog", "share"
 
 async function main(): Promise<void> {
   const sub = process.argv[2];
+  if (sub === "--version" || sub === "-v" || sub === "version") {
+    // Before anything else — must not auto-start a backend just to print a version.
+    console.log(`ada ${adaVersion()}`);
+    return;
+  }
   if (sub === "login" || sub === "logout") {
     await authCommand(sub, process.argv[3]);
     return;
@@ -643,9 +648,10 @@ async function main(): Promise<void> {
     return;
   }
   if (sub === "acp") {
-    // Minimal Agent Client Protocol bridge over stdio (JSON-RPC 2.0, newline-delimited). Scaffold:
-    // handles initialize + prompt so an ACP-aware editor can drive ada. Extend method names/framing
-    // to match your client's ACP version.
+    // Agent Client Protocol bridge over stdio (JSON-RPC 2.0, newline-delimited). Handles
+    // initialize / session/new / session/prompt, and streams session/update notifications
+    // (agent_message_chunk + tool_call/tool_call_update) while a turn runs — the shape ACP editors
+    // like Zed render live. Still experimental until exercised against a real ACP client.
     const trusted = isTrusted(process.cwd());
     const settings = loadSettings(trusted);
     await loadExtensions(trusted);
@@ -662,6 +668,9 @@ async function main(): Promise<void> {
     }
     const agent = new Agent({ client, model, session: Session.create(), onApprove: async (): Promise<ApprovalDecision> => "yes", autoApprove: true, project: trusted, compactAt: settings.compactAt });
     const send = (msg: object): void => void stdout.write(`${JSON.stringify(msg)}\n`);
+    const ACP_SESSION = newId("acp");
+    const update = (update: object): void => send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: ACP_SESSION, update } });
+    let acpCtrl: AbortController | null = null; // the in-flight prompt's abort handle (session/cancel)
     let buf = "";
     stdin.on("data", async (d) => {
       buf += d.toString("utf8");
@@ -677,16 +686,29 @@ async function main(): Promise<void> {
           continue;
         }
         if (msg.method === "initialize") send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: {} } } });
-        else if (msg.method === "session/new" || msg.method === "newSession") send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "ada" } });
-        else if (msg.method === "session/prompt" || msg.method === "prompt") {
+        else if (msg.method === "session/new" || msg.method === "newSession") send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: ACP_SESSION } });
+        else if (msg.method === "session/cancel" || msg.method === "cancel") {
+          acpCtrl?.abort();
+          if (msg.id != null) send({ jsonrpc: "2.0", id: msg.id, result: {} });
+        } else if (msg.method === "session/prompt" || msg.method === "prompt") {
           const p = msg.params ?? {};
           const blocks = (p.prompt ?? p.text) as unknown;
           const text = Array.isArray(blocks) ? blocks.map((b) => (b as { text?: string }).text ?? "").join("") : String(blocks ?? "");
+          acpCtrl = new AbortController();
           try {
-            const out = await agent.send(text, { quiet: true });
-            send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn", content: [{ type: "text", text: out }] } });
+            await agent.send(text, {
+              signal: acpCtrl.signal,
+              onEvent: (e: AgentEvent) => {
+                if (e.type === "text") update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: e.delta } });
+                else if (e.type === "tool_call") update({ sessionUpdate: "tool_call", toolCallId: e.callId, title: `${e.name} ${e.detail}`.trim(), status: "in_progress" });
+                else if (e.type === "tool_result") update({ sessionUpdate: "tool_call_update", toolCallId: e.callId, status: e.isError ? "failed" : "completed" });
+              },
+            });
+            send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: acpCtrl.signal.aborted ? "cancelled" : "end_turn" } });
           } catch (e) {
             send({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: e instanceof Error ? e.message : String(e) } });
+          } finally {
+            acpCtrl = null;
           }
         } else if (msg.id != null) send({ jsonrpc: "2.0", id: msg.id, result: {} });
       }
@@ -736,6 +758,9 @@ async function main(): Promise<void> {
       registry: ApprovalRegistry;
       emit: ((frame: string) => void) | null; // set only while a /prompt request's SSE stream is open
       file: string; // the on-disk transcript — survives an `ada serve` restart; resume with it
+      ctrl: AbortController | null; // set while a turn runs — doubles as the busy flag
+      steer: string[]; // queued mid-turn user messages, drained by the agent between steps
+      mode: "ask" | "plan" | "auto";
     }
     const sessions = new Map<string, AgentSession>();
     // `resumeFile` reattaches to an existing on-disk transcript (e.g. after `ada serve` restarted) —
@@ -743,7 +768,7 @@ async function main(): Promise<void> {
     const makeSession = (m: string, resumeFile?: string): { id: string; rec: AgentSession } => {
       const session = resumeFile ? Session.open(resumeFile) : Session.create();
       const history = resumeFile ? (session.load() as unknown as Msg[]) : undefined;
-      const rec: AgentSession = { agent: undefined as unknown as Agent, registry: new ApprovalRegistry(), emit: null, file: session.file };
+      const rec: AgentSession = { agent: undefined as unknown as Agent, registry: new ApprovalRegistry(), emit: null, file: session.file, ctrl: null, steer: [], mode: "ask" };
       rec.agent = new Agent({
         client,
         model: m,
@@ -810,6 +835,16 @@ async function main(): Promise<void> {
           } catch {
             /* ignore, use default model + no resume */
           }
+          if (resume) {
+            // A live in-memory session may still be appending to that transcript (e.g. the IDE lost
+            // its SSE stream and *assumed* a restart) — two Agents on one JSONL interleave twin
+            // conversations. Point the caller at the live session instead of forking the file.
+            const live = [...sessions.entries()].find(([, r]) => r.file === resume);
+            if (live) {
+              res.writeHead(409, { "content-type": "application/json" }).end(JSON.stringify({ error: "that transcript belongs to a live session — reuse it (or DELETE it first)", sessionId: live[0], busy: !!live[1].ctrl }));
+              return;
+            }
+          }
           const { id, rec } = makeSession(m, resume);
           res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: id, model: m, file: rec.file, resumed: !!resume }));
         });
@@ -822,25 +857,118 @@ async function main(): Promise<void> {
           res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: "unknown session" }));
           return;
         }
+        if (rec.ctrl) {
+          // One turn at a time per session — two interleaved prompts would corrupt one conversation.
+          res.writeHead(409, { "content-type": "application/json" }).end(JSON.stringify({ error: "a turn is already running on this session — abort it or wait for done" }));
+          return;
+        }
+        rec.ctrl = new AbortController(); // claim the session before any await, so a racing second prompt sees busy
+        // If the client dies MID-BODY (e.g. a dropped multi-MB image upload), 'end' never fires and
+        // the claim above would brick the session with a permanent 409 — release it on 'close'.
+        req.on("close", () => {
+          if (!req.complete) {
+            rec.ctrl = null;
+            rec.steer.length = 0;
+          }
+        });
         let body = "";
         req.on("data", (c) => (body += c));
         req.on("end", async () => {
           let text = "";
+          let images: string[] | undefined;
           try {
-            text = String((JSON.parse(body || "{}") as { text?: string }).text ?? "");
+            const j = JSON.parse(body || "{}") as { text?: string; images?: string[] };
+            text = String(j.text ?? "");
+            if (Array.isArray(j.images) && j.images.length) images = j.images.map(String);
           } catch {
             /* empty prompt */
           }
           res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+          // If the client drops the SSE stream mid-turn (IDE reload/crash), abort the turn — else it
+          // runs headless, and in ask mode parks forever on an approval no one can see or answer.
+          res.on("close", () => {
+            if (!res.writableEnded) {
+              rec.ctrl?.abort();
+              rec.registry.abortAll();
+            }
+          });
           rec.emit = (frame) => res.write(frame);
           try {
-            await rec.agent.send(text, { onEvent: (e: AgentEvent) => res.write(sseFrame(e)) });
+            await rec.agent.send(text, { signal: rec.ctrl!.signal, steer: rec.steer, images, onEvent: (e: AgentEvent) => res.write(sseFrame(e)) });
           } catch (e) {
             res.write(sseFrame({ type: "error", message: e instanceof Error ? e.message : String(e) }));
           } finally {
             rec.emit = null;
+            rec.ctrl = null;
+            rec.steer.length = 0;
             res.end();
           }
+        });
+        return;
+      }
+      const abortMatch = req.method === "POST" && url.pathname.match(/^\/v1\/sessions\/([^/]+)\/abort$/);
+      if (abortMatch) {
+        const rec = sessions.get(abortMatch[1]!);
+        if (!rec) {
+          res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: "unknown session" }));
+          return;
+        }
+        const wasRunning = !!rec.ctrl;
+        rec.ctrl?.abort();
+        rec.registry.abortAll(); // a turn parked on an unanswered approval must not stay stuck
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, wasRunning }));
+        return;
+      }
+      const steerMatch = req.method === "POST" && url.pathname.match(/^\/v1\/sessions\/([^/]+)\/steer$/);
+      if (steerMatch) {
+        const rec = sessions.get(steerMatch[1]!);
+        if (!rec) {
+          res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: "unknown session" }));
+          return;
+        }
+        let body = "";
+        req.on("data", (c) => (body += c));
+        req.on("end", () => {
+          let text = "";
+          try {
+            text = String((JSON.parse(body || "{}") as { text?: string }).text ?? "");
+          } catch {
+            /* stays empty */
+          }
+          if (!text || !rec.ctrl) {
+            // steering only makes sense mid-turn; when idle, just send the next prompt instead
+            res.writeHead(409, { "content-type": "application/json" }).end(JSON.stringify({ ok: false, error: rec.ctrl ? "empty text" : "no turn running — send a prompt instead" }));
+            return;
+          }
+          rec.steer.push(text);
+          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true }));
+        });
+        return;
+      }
+      const modeMatch = req.method === "PATCH" && url.pathname.match(/^\/v1\/sessions\/([^/]+)$/);
+      if (modeMatch) {
+        const rec = sessions.get(modeMatch[1]!);
+        if (!rec) {
+          res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: "unknown session" }));
+          return;
+        }
+        let body = "";
+        req.on("data", (c) => (body += c));
+        req.on("end", () => {
+          let mode: string | undefined;
+          try {
+            mode = (JSON.parse(body || "{}") as { mode?: string }).mode;
+          } catch {
+            /* stays undefined */
+          }
+          if (mode !== "ask" && mode !== "plan" && mode !== "auto") {
+            res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: 'mode must be "ask" | "plan" | "auto"' }));
+            return;
+          }
+          rec.mode = mode;
+          rec.agent.setPlanMode(mode === "plan");
+          rec.agent.setAutoApprove(mode === "auto");
+          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, mode }));
         });
         return;
       }
@@ -867,6 +995,9 @@ async function main(): Promise<void> {
       }
       const delMatch = req.method === "DELETE" && url.pathname.match(/^\/v1\/sessions\/([^/]+)$/);
       if (delMatch) {
+        const rec = sessions.get(delMatch[1]!);
+        rec?.ctrl?.abort(); // don't orphan a running turn
+        rec?.registry.abortAll();
         const existed = sessions.delete(delMatch[1]!);
         res.writeHead(existed ? 200 : 404, { "content-type": "application/json" }).end(JSON.stringify({ ok: existed }));
         return;
@@ -876,9 +1007,10 @@ async function main(): Promise<void> {
       console.log(
         `ada HTTP API on http://localhost:${port}  ·  model ${model || "(none — set one)"}\n` +
           `  one-shot:    POST /v1/prompt {"text":"…"}\n` +
-          `  interactive: POST /v1/sessions → {sessionId}\n` +
-          `               POST /v1/sessions/:id/prompt {"text":"…"}  (SSE: text/tool_call/tool_result/approval_request/done)\n` +
-          `               POST /v1/sessions/:id/approve {"id":"…","decision":"yes"|"all"|"no"}`,
+          `  interactive: POST /v1/sessions → {sessionId}   (GET lists resumable transcripts)\n` +
+          `               POST /v1/sessions/:id/prompt {"text":"…","images"?:[…]}  (SSE: text/tool_call/tool_result/approval_request/done)\n` +
+          `               POST /v1/sessions/:id/approve {"id":"…","decision":"yes"|"all"|"no"}\n` +
+          `               POST /v1/sessions/:id/abort · /steer {"text":"…"} · PATCH /v1/sessions/:id {"mode":"ask"|"plan"|"auto"}`,
       ),
     );
     await new Promise(() => {}); // keep the process alive for the server

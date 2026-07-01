@@ -293,6 +293,16 @@ async function main(): Promise<void> {
     assert.equal(route("anything-else"), "openrouter", "unmatched → openrouter");
   }
 
+  // --- `ada --version` prints the version and exits WITHOUT auto-starting a backend ---
+  {
+    const { spawnSync } = await import("node:child_process");
+    const { fileURLToPath } = await import("node:url");
+    const bin = fileURLToPath(new URL("../bin/ada.mjs", import.meta.url));
+    const r = spawnSync(process.execPath, [bin, "--version"], { encoding: "utf8", timeout: 30_000 });
+    assert.match(r.stdout, /^ada \d+\.\d+\.\d+/, `--version prints the version (got: ${JSON.stringify(r.stdout)} / ${JSON.stringify(r.stderr?.slice(0, 120))})`);
+    assert.ok(!/starting ada-server/.test(r.stderr ?? ""), "--version must not auto-start the backend");
+  }
+
   // --- autostart helpers: URL classification + /health derivation ---
   {
     const { isLocalBackend, healthUrl } = await import("./client/autostart.ts");
@@ -327,6 +337,14 @@ async function main(): Promise<void> {
     assert.equal(await promise, "yes", "the waiting promise resolves with the decision");
     assert.equal(registry.size, 0, "settle() clears the pending entry");
     assert.equal(registry.settle("nope", "no"), false, "settle() on an unknown id returns false");
+
+    // abortAll: an aborted turn must not stay parked on unanswered approvals
+    const a1 = registry.wait();
+    const a2 = registry.wait();
+    assert.equal(registry.abortAll(), 2, "abortAll reports how many were pending");
+    assert.equal(await a1.promise, "no", "aborted approvals resolve to 'no'");
+    assert.equal(await a2.promise, "no", "all of them");
+    assert.equal(registry.size, 0, "abortAll clears the registry");
   }
   assert.equal((await toolByName.get("web_fetch")!.run({ url: "http://127.0.0.1/x" })).isError, true, "web_fetch blocks loopback (SSRF guard)");
 
@@ -381,6 +399,18 @@ async function main(): Promise<void> {
   assert.equal(confidentSkill("draw an architecture diagram of this project", allSkills), "architecture-diagram", "confident: → architecture-diagram");
   assert.equal(confidentSkill("make a powerpoint about Q3 results", allSkills), null, "precision guard: 'powerpoint' must NOT auto-apply 'low-power'");
   assert.equal(confidentSkill("what is 2 + 2", allSkills), null, "ambiguous query → no auto-apply");
+  // Coverage gate — a long sentence merely CONTAINING a skill-y keyword must not auto-apply
+  // (observed live: this exact prompt pulled in secret-scan and derailed a small model).
+  assert.equal(
+    confidentSkill("Remember this fact for later: the secret word is PINEAPPLE97. Just confirm you will remember it, do not do anything else.", allSkills),
+    null,
+    "coverage gate: incidental 'secret' must NOT auto-apply secret-scan",
+  );
+  assert.equal(confidentSkill("I was talking to my friend about docker yesterday and she mentioned kubernetes", allSkills), null, "coverage gate: conversational mention of docker");
+  // Short rephrasings of the same incident — prefix-matching must not inflate coverage
+  // ("remember" prefix-matches "remediate"), and 1/3 exactly must not pass the strict gate.
+  assert.equal(confidentSkill("remember this: the secret word is X", allSkills), null, "coverage gate: short secret-word phrasing");
+  assert.equal(confidentSkill("remember the secret word", allSkills), null, "coverage gate: shortest secret-word phrasing");
   // LOADED was set by registerSkillTool(allSkills) above, so routeConfident/skillBody resolve a body.
   const applied = routeConfident("describe the project");
   assert.ok(applied?.name === "project-overview" && /purpose/i.test(applied.body), "routeConfident returns the skill body to inject");
