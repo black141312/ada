@@ -4,6 +4,29 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.7.0] — 2026-07-02
+
+### Added — enterprise control plane (Stage 1)
+`ada-server` now doubles as an org control plane. **Enterprise mode activates only when a seat
+exists or `ADA_ADMIN_KEY` is set** — with neither, nothing changes. See
+[docs/enterprise.md](docs/enterprise.md).
+
+- **Seats** — per-user client keys (`POST/GET/DELETE /v1/users`, admin-gated; keys shown once,
+  listed only as prefixes; disable keeps the audit trail). `ADA_ADMIN_KEY` bootstraps the first
+  admin. `/v1/whoami` now reports `{user, role}`.
+- **Org policy** (`GET/PUT /v1/policy`) — a model allowlist enforced **server-side** (403 + audit),
+  and tool permission rules **pushed to clients**, merged restrictive-wins with local config (org
+  deny beats local allow; org can tighten, never loosen). Applied in every client path:
+  interactive, `-p` headless, `serve`, `acp`.
+- **Usage metering** (`GET /v1/usage?days=N`) — per-user/per-model token counts captured
+  server-side by teeing each chat response and recording the upstream's reported usage (works for
+  streamed and non-streamed, all adapters, one code path).
+- **Audit log** (`GET /v1/audit`) — seat lifecycle, policy updates, policy denials.
+- File-backed under `~/.ada/server` (`ADA_DATA_DIR` to move) — a database is the upgrade path.
+
+Live-verified end-to-end: bootstrap → seat create → 401/403 gating → model-allowlist denial
+(audited) → allowed chat metered per user → org `web_* deny` blocking a tool inside a headless run.
+
 ## [0.6.1] — 2026-07-02
 
 ### Fixed

@@ -42,14 +42,25 @@ export const openAICompatAdapter: Adapter = {
     // endpoint wants the bare id. (Cloudflare's "@cf/…" ids aren't "cloudflare/…", so they pass through.)
     const prefix = `${provider}/`;
     const outBody = typeof body.model === "string" && body.model.startsWith(prefix) ? { ...body, model: body.model.slice(prefix.length) } : body;
+    // If the client goes away, abort the upstream too — else the full completion is generated,
+    // billed, and (for enterprise) metered against a request nobody is reading.
+    const ac = new AbortController();
+    res.on("close", () => {
+      if (!res.writableEnded) ac.abort();
+    });
     let upstream: Awaited<ReturnType<typeof fetch>>;
     try {
       upstream = await fetch(`${def.baseURL}/chat/completions`, {
         method: "POST",
         headers: { "content-type": "application/json", ...(await authHeaders(provider)) },
         body: JSON.stringify(outBody),
+        signal: ac.signal,
       });
     } catch (e) {
+      if (ac.signal.aborted) {
+        res.end();
+        return;
+      }
       res.writeHead(502, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
@@ -71,10 +82,18 @@ export const openAICompatAdapter: Adapter = {
     if (body.stream) {
       res.writeHead(200, SSE_HEADERS);
       const reader = upstream.body.getReader();
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) res.write(Buffer.from(value));
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (res.destroyed) {
+            await reader.cancel(); // client gone → stop pulling tokens from upstream
+            break;
+          }
+          if (value) res.write(Buffer.from(value));
+        }
+      } catch {
+        /* aborted mid-stream (client closed) — nothing more to do */
       }
       res.end();
     } else {
