@@ -12,8 +12,8 @@ import { Agent, type AgentEvent, type ApprovalDecision, type OnApprove } from ".
 import { ApprovalRegistry, newId, sseFrame } from "./agent-server.ts";
 import { expandPrompt, loadPrompts } from "./prompts.ts";
 import { Session, list, type SessionMeta } from "./session.ts";
-import { deleteCredential, getCredential, listCredentials } from "../server/credentials.ts";
-import { deviceLogin, oauthConfig } from "../server/oauth.ts";
+import { deleteCredential, getCredential, listCredentials, setCredential } from "../server/credentials.ts";
+import { deviceGrant, deviceLogin, oauthConfig } from "../server/oauth.ts";
 import { addTrust, isTrusted, loadSettings, setActiveAgentPermissions, setOrgPermissions, type PermRule, type Settings } from "./settings.ts";
 import { getCommands, loadExtensions } from "./extensions.ts";
 import { registerTool, setAsker } from "./tools.ts";
@@ -36,8 +36,12 @@ type RL = ReturnType<typeof createInterface>;
 
 const BACKEND = process.env.ADA_BACKEND_URL ?? "http://localhost:8787/v1";
 
-/** A stored GitHub/Google login token, sent as the bearer so the backend can identify us. */
+/** A stored login credential, sent as the bearer so the backend can identify us. An OIDC SSO seat
+ *  key (ada_sk_…) wins — it's a durable, server-minted, disableable bearer (see oidcLogin). A seat
+ *  key is only honored by the backend that minted it, so a stray one sent elsewhere just 401s. */
 function identityToken(): string | undefined {
+  const oidc = getCredential("oidc");
+  if (oidc?.type === "oauth" && oidc.key) return oidc.key;
   for (const p of ["github", "google"]) {
     const c = getCredential(p);
     if (c?.type === "oauth" && c.access) return c.access;
@@ -353,8 +357,52 @@ function makeClient(): OpenAI {
   return new OpenAI({ baseURL: BACKEND, apiKey: clientKey(), maxRetries: 0 });
 }
 
-/** Run the device flow for `provider`; returns true on success (token stored). */
+interface AuthMethods {
+  methods: string[];
+  oidc?: { issuer: string; clientId: string; deviceAuthEndpoint: string; tokenEndpoint: string; scope: string; exchangePath: string };
+  oidcError?: string;
+}
+
+/** Ask the backend which login methods it offers (so the client needs no OIDC env of its own). */
+async function fetchAuthMethods(): Promise<AuthMethods | null> {
+  try {
+    const r = await fetch(`${BACKEND}/auth/methods`, { signal: AbortSignal.timeout(4000) });
+    if (!r.ok) return null;
+    return (await r.json()) as AuthMethods;
+  } catch {
+    return null;
+  }
+}
+
+/** OIDC SSO login (model B): device-flow against the org IdP using the backend-advertised config,
+ *  then exchange the id_token for a durable seat key stored under the "oidc" credential. */
+async function oidcLogin(): Promise<boolean> {
+  const m = await fetchAuthMethods();
+  if (!m?.oidc) {
+    console.log(m?.oidcError ? `SSO unavailable: ${m.oidcError}` : "this backend does not offer OIDC SSO.");
+    return false;
+  }
+  const { clientId, deviceAuthEndpoint, tokenEndpoint, scope, exchangePath } = m.oidc;
+  try {
+    const tok = await deviceGrant("SSO", { clientId, deviceUrl: deviceAuthEndpoint, tokenUrl: tokenEndpoint, scope }, (s) => console.log(s));
+    const idToken = tok.id_token as string | undefined;
+    if (!idToken) throw new Error("IdP returned no id_token — ensure the 'openid' scope is granted");
+    const r = await fetch(`${BACKEND}${exchangePath}`, { method: "POST", headers: { authorization: `Bearer ${idToken}` } });
+    if (!r.ok) throw new Error(`exchange failed: HTTP ${r.status} ${await r.text().catch(() => "")}`);
+    const { seat_key, user, role } = (await r.json()) as { seat_key?: string; user?: string; role?: string };
+    if (!seat_key) throw new Error("backend returned no seat_key");
+    await setCredential("oidc", { type: "oauth", key: seat_key });
+    console.log(`Logged in via SSO as ${user} (${role}).`);
+    return true;
+  } catch (e) {
+    console.error(`SSO login failed: ${e instanceof Error ? e.message : e}`);
+    return false;
+  }
+}
+
+/** Run the device flow for `provider`; returns true on success (credential stored). */
 async function loginFlow(provider: string): Promise<boolean> {
+  if (provider === "oidc" || provider === "sso") return oidcLogin();
   const cfg = oauthConfig(provider);
   if (!cfg) {
     console.log(`No OAuth config for ${provider}. Set ADA_OAUTH_${provider.toUpperCase()}_{CLIENT_ID,DEVICE_URL,TOKEN_URL}.`);
@@ -411,12 +459,16 @@ async function ensureAuth(rl: RL, client: OpenAI): Promise<OpenAI> {
     return client; // backend unreachable — the model fetch will report it
   }
   if (status !== 401) return client; // 200 = already authorized, or backend is open (dev)
-  const provider = ["github", "google"].find((p) => oauthConfig(p));
+  // Prefer the org IdP if the backend advertises OIDC SSO; else fall back to a locally-configured
+  // GitHub/Google OAuth app.
+  const methods = await fetchAuthMethods();
+  const provider = methods?.methods.includes("oidc") ? "oidc" : ["github", "google"].find((p) => oauthConfig(p));
   if (!provider) {
-    console.log("\x1b[33mthis backend requires login, but no OAuth provider is configured (set ADA_OAUTH_*).\x1b[0m");
+    console.log("\x1b[33mthis backend requires login, but no login method is available (backend offers no SSO and no ADA_OAUTH_* is set).\x1b[0m");
     return client;
   }
-  const ans = (await rl.question(`\x1b[33mnot logged in — sign in with ${provider}? [Y/n] \x1b[0m`)).trim().toLowerCase();
+  const label = provider === "oidc" ? `your org (${methods?.oidc?.issuer ?? "SSO"})` : provider;
+  const ans = (await rl.question(`\x1b[33mnot logged in — sign in with ${label}? [Y/n] \x1b[0m`)).trim().toLowerCase();
   if (ans === "n" || ans === "no") return client;
   return (await loginFlow(provider)) ? makeClient() : client;
 }

@@ -55,8 +55,10 @@ async function postForm(url: string, body: Record<string, string>): Promise<Reco
   return (await res.json()) as Record<string, unknown>;
 }
 
-/** Run the device flow: print the user code, poll for the token, store it on success. */
-export async function deviceLogin(provider: string, cfg: OAuthConfig, print: (s: string) => void): Promise<void> {
+/** Run the device flow: print the user code, poll, and RETURN the raw token response (access_token,
+ *  id_token, refresh_token, …) without storing anything. Callers decide what to persist — GitHub/Google
+ *  store the access token (deviceLogin below); OIDC SSO exchanges the id_token for a seat key. */
+export async function deviceGrant(provider: string, cfg: OAuthConfig, print: (s: string) => void): Promise<Record<string, unknown>> {
   const secret: Record<string, string> = cfg.clientSecret ? { client_secret: cfg.clientSecret } : {};
   const dev = await postForm(cfg.deviceUrl, { client_id: cfg.clientId, scope: cfg.scope ?? "", ...secret });
   const deviceCode = dev.device_code as string;
@@ -74,20 +76,23 @@ export async function deviceLogin(provider: string, cfg: OAuthConfig, print: (s:
       grant_type: "urn:ietf:params:oauth:grant-type:device_code",
       ...secret,
     });
-    if (tok.access_token) {
-      await setCredential(provider, {
-        type: "oauth",
-        access: tok.access_token as string,
-        refresh: tok.refresh_token as string | undefined,
-        expires: tok.expires_in ? Date.now() + Number(tok.expires_in) * 1000 : undefined,
-      });
-      print(`Logged in to ${provider}.`);
-      return;
-    }
+    if (tok.access_token || tok.id_token) return tok;
     const err = tok.error as string | undefined;
     if (err && err !== "authorization_pending" && err !== "slow_down") {
       throw new Error((tok.error_description as string) ?? err);
     }
   }
   throw new Error("device login timed out");
+}
+
+/** Device flow for identity providers (GitHub/Google): grant, then store the access token. */
+export async function deviceLogin(provider: string, cfg: OAuthConfig, print: (s: string) => void): Promise<void> {
+  const tok = await deviceGrant(provider, cfg, print);
+  await setCredential(provider, {
+    type: "oauth",
+    access: tok.access_token as string,
+    refresh: tok.refresh_token as string | undefined,
+    expires: tok.expires_in ? Date.now() + Number(tok.expires_in) * 1000 : undefined,
+  });
+  print(`Logged in to ${provider}.`);
 }

@@ -252,6 +252,12 @@ model allowlist + tool rules pushed to every client), per-user usage metering, a
 activated only when you create seats, file-backed, self-hosted in your own network. See
 **[docs/enterprise.md](docs/enterprise.md)** for the 2-minute bootstrap.
 
+**SSO (OIDC)** — federate login to your IdP (Okta, Entra single-tenant, Auth0, Keycloak, Google
+Workspace): `ADA_OIDC_ISSUER=… ada-server`, then developers run `ada login oidc`. The backend
+JIT-provisions a seat for the verified identity and offboarding is immediate. Stdlib-only RS256/JWKS
+verification, no new dependency; fail-closed by construction. See
+**[docs/enterprise-stage2-oidc.md](docs/enterprise-stage2-oidc.md)**.
+
 ## Benchmarks
 
 ada can run **SWE-bench Verified** — it generates patches for real GitHub issues (one isolated repo
