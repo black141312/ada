@@ -1,0 +1,21 @@
+# Local dev / simple self-host of the ada routing backend.
+#
+#   cp .env.example .env   # add your provider key(s); optionally ADA_ADMIN_KEY / ADA_OIDC_*
+#   docker compose up --build
+#   # then point a client at it:  ADA_BACKEND_URL=http://localhost:8787/v1 ada
+#
+# Data (seats/policy/usage/audit) persists in the named volume `ada-data`. See docs/deploy.md.
+services:
+  ada-server:
+    build: .
+    image: ada-server
+    ports:
+      - "8787:8787"
+    env_file:
+      - .env
+    volumes:
+      - ada-data:/data
+    restart: unless-stopped
+
+volumes:
+  ada-data:

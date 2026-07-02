@@ -1,0 +1,20 @@
+# Keep the build context small and the image server-only. The Dockerfile copies just bin/ + src/ +
+# tsconfig + package files, so most of this is belt-and-suspenders for context size / stray secrets.
+node_modules
+.git
+.github
+out
+out-*
+*.log
+build-pipeline.log
+.ada
+.cos0
+.env
+.env.*
+skills
+bench
+docs
+test
+scratchpad
+*.tsbuildinfo
+npm-debug.log*

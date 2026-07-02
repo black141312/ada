@@ -1,6 +1,6 @@
 {
   "name": "ada-agent",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "A from-zero terminal coding agent with a Cursor-style routing backend, ~285 skills, MCP connectors, and ask/plan/auto modes",
   "type": "module",
   "license": "MIT",
@@ -56,9 +56,11 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.106.0",
-    "node-pty": "^1.1.0",
     "openai": "^6.45.0",
     "tsx": "^4.22.4"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.1.0"
   },
   "devDependencies": {
     "@types/node": "^26.0.1",
