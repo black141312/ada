@@ -41,6 +41,57 @@ DELETE /v1/users/<keyPrefix>   # disable a seat (≥12 chars of its key; kept fo
 Full keys are never listed after creation — only a 14-char prefix. `ADA_ADMIN_KEY` is the
 break-glass admin; create an admin *seat* for day-to-day and keep the env key in a vault.
 
+## SSO (OIDC) — federate login to your IdP
+
+Instead of handing out static seat keys, connect your OIDC IdP (Okta, Entra **single-tenant**, Auth0,
+Keycloak, Google Workspace). Developers sign in through the browser via the device flow, and the
+backend **JIT-provisions a seat** for the verified identity. Seats are keyed to a stable, non-secret
+`iss#sub`, so offboarding has a target.
+
+```bash
+# On the backend (all values are non-secret except any confidential-client secret):
+export ADA_OIDC_ISSUER=https://your-tenant.okta.com          # single-tenant issuer URL (https)
+export ADA_OIDC_CLIENT_ID=<device-flow app client id>
+export ADA_OIDC_ALLOWED_GROUPS=ada-users                     # OR ADA_OIDC_ALLOWED_DOMAINS=yourco.com
+export ADA_OIDC_ADMIN_GROUP=ada-admins                       # optional: this group → role "admin"
+ada-server                                                   # banner: [OIDC SSO (0 seats — awaiting first login)]
+```
+
+**Setting `ADA_OIDC_ISSUER` locks the backend immediately** (before any seat exists) — a request
+that doesn't authenticate gets `401`, never dev-open. Two fail-closed guards refuse to start on unsafe
+config: no `ALLOWED_GROUPS`/`ALLOWED_DOMAINS` (would provision every IdP user), or a **multi-tenant**
+issuer (`.../common` or `.../organizations`, where `sub` isn't unique). When OIDC is on, the
+GitHub/Google login path is disabled — the IdP is the single identity authority.
+
+The developer needs **no OIDC config** — the client learns it from the backend:
+
+```bash
+export ADA_BACKEND_URL=https://ada.yourcompany.com/v1
+ada login oidc     # opens the IdP in a browser; on success stores a seat key. Then just `ada`.
+```
+
+Under the hood the ID token is a **one-time provisioning artifact**: `ada login oidc` exchanges it at
+`POST /v1/auth/oidc/exchange` for a durable `ada_sk_` seat key, and every later request (including
+`-p`, `serve`, `acp`) carries that seat key — so long headless runs never expire mid-job, and
+revocation is a seat-disable, not a token-lifetime wait.
+
+**Offboarding (immediate):** disable the seat by its `iss#sub`. The next request 401s and re-login is
+refused (a disabled seat is never resurrected).
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADA_ADMIN_KEY" \
+     -d '{"externalId":"https://your-tenant.okta.com#00u1a2b3c4"}' \
+     http://localhost:8787/v1/users/disable-by-external
+```
+
+`GET /v1/auth/methods` (unauthenticated) advertises the enabled methods. ID-token verification is
+stdlib-only (RS256 + JWKS, `alg` allowlisted, `iss`/`aud`/`azp`/`exp`/`nbf` checked) — no new
+dependency. Full env reference and the security model: [enterprise-stage2-oidc.md](enterprise-stage2-oidc.md).
+
+Automated joiner/mover/leaver (**SCIM**) and audit **export to a SIEM** are the sequenced next stages;
+today login events (`sso_login`, `sso_login_denied`, `seat_created`, `seat_disabled`) are appended to
+the audit log but not yet streamed out.
+
 ## Org policy
 
 ```bash

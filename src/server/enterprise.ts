@@ -35,6 +35,8 @@ export interface Seat {
   role: "admin" | "dev";
   created: string;
   disabled?: boolean;
+  externalId?: string; // OIDC SSO: issuer-scoped stable id (`iss#sub`) — non-secret, the deprovision target
+  iss?: string; // OIDC issuer the seat was provisioned from (so an issuer change is detectable)
 }
 export interface PolicyRule {
   tool?: string;
@@ -135,6 +137,66 @@ export function createSeat(name: string, role: "admin" | "dev" = "dev", dir = da
   saveSeats(seats, dir);
   appendAudit({ ts: Date.now(), user: "-", event: "seat_created", detail: `${name} (${role})` }, dir);
   return key;
+}
+
+/** Find a seat by its OIDC externalId (`iss#sub`). Scans the (small) seat map by VALUE — externalId
+ *  is compared, never used as a lookup key, so it's inherently prototype-safe. Inherits CorruptStore
+ *  from loadSeats (callers fail closed). */
+export function seatByExternalId(externalId: string, dir = dataDir()): { key: string; seat: Seat } | null {
+  const seats = loadSeats(dir);
+  for (const key of Object.keys(seats)) {
+    const seat = seats[key]!;
+    if (seat.externalId === externalId) return { key, seat };
+  }
+  return null;
+}
+
+/** JIT-provision (or reuse) a seat for a verified OIDC identity. Returns the seat's `ada_sk_` key, or
+ *  null if the seat exists but is DISABLED (a deprovisioned user must not be resurrected by re-login).
+ *  - existing enabled seat → reuse its key (NO rotation); if it was admin and the login no longer
+ *    carries the admin group, downgrade admin→dev (privilege revocation). Never auto-ESCALATE here.
+ *  - new identity → mint one key, stamp externalId+iss, one `seat_created` audit row. */
+export function upsertSeatForSSO(externalId: string, iss: string, name: string, role: "admin" | "dev", dir = dataDir()): string | null {
+  const seats = loadSeats(dir);
+  let foundKey: string | null = null;
+  for (const key of Object.keys(seats)) {
+    if (seats[key]!.externalId === externalId) {
+      foundKey = key;
+      break;
+    }
+  }
+  if (foundKey) {
+    const seat = seats[foundKey]!;
+    if (seat.disabled) return null; // deprovisioned — do NOT resurrect
+    if (seat.role === "admin" && role === "dev") {
+      seat.role = "dev";
+      saveSeats(seats, dir);
+      appendAudit({ ts: Date.now(), user: name, event: "role_changed", detail: `${name} admin→dev (SSO group removed)` }, dir);
+    }
+    return foundKey;
+  }
+  const key = `ada_sk_${randomBytes(24).toString("hex")}`;
+  seats[key] = { name, role, created: new Date().toISOString(), externalId, iss };
+  saveSeats(seats, dir);
+  appendAudit({ ts: Date.now(), user: name, event: "seat_created", detail: `${name} (${role}) via OIDC ${externalId}` }, dir);
+  return key;
+}
+
+/** Immediate offboarding: disable the seat for an OIDC externalId. The admin endpoint (and, later,
+ *  SCIM DELETE) call this — the next identifySeat for that key returns null (401). */
+export function disableSeatByExternalId(externalId: string, dir = dataDir()): string | null {
+  const seats = loadSeats(dir);
+  for (const key of Object.keys(seats)) {
+    const seat = seats[key]!;
+    if (seat.externalId === externalId) {
+      if (seat.disabled) return seat.name; // idempotent
+      seat.disabled = true;
+      saveSeats(seats, dir);
+      appendAudit({ ts: Date.now(), user: seat.name, event: "seat_disabled", detail: `${seat.name} (SSO ${externalId})` }, dir);
+      return seat.name;
+    }
+  }
+  return null;
 }
 
 /** Disable (not delete — the audit trail keeps the history) the seat whose key starts with prefix. */

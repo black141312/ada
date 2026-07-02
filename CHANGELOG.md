@@ -4,6 +4,45 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.8.0] — 2026-07-02
+
+### Added — OIDC SSO + JIT seat provisioning (enterprise Stage 2)
+Federate developer login to your OIDC IdP (Okta, Entra **single-tenant**, Auth0, Keycloak, Google
+Workspace). Setting `ADA_OIDC_ISSUER` locks the backend and turns on SSO. See
+[docs/enterprise-stage2-oidc.md](docs/enterprise-stage2-oidc.md).
+
+- **Device-flow SSO** — `ada login oidc` runs the browser device flow against the IdP; the client
+  self-configures from the backend's new unauthenticated `GET /v1/auth/methods` (no OIDC env on the
+  client). The ID token is exchanged once at `POST /v1/auth/oidc/exchange` for a durable `ada_sk_`
+  **seat key** (model B), which carries every later request — so `-p`/`serve`/`acp` never expire
+  mid-run, and revocation is a seat-disable rather than a token-lifetime wait.
+- **JIT provisioning** — a verified identity is provisioned a seat keyed to a stable, non-secret,
+  issuer-scoped `externalId` (`iss#sub`). Reused seats aren't rotated; an admin login that drops the
+  admin group downgrades the seat (never auto-escalates).
+- **Immediate offboarding** — admin `POST /v1/users/disable-by-external { externalId }`; a disabled
+  seat 401s on the next request and re-login is refused (no resurrection).
+- **Stdlib-only verification** — RS256 + JWKS via `node:crypto`, **zero new dependencies**.
+
+### Security (fail-closed by construction)
+- `ADA_OIDC_ISSUER` adds to `locked()` so a fresh SSO deployment with **zero seats** never falls to
+  dev-open. The server **refuses to start** without a positive allow-surface
+  (`ADA_OIDC_ALLOWED_GROUPS`/`ADA_OIDC_ALLOWED_DOMAINS`) or with a **multi-tenant** issuer.
+- `alg` allowlisted to RS256 (rejects `none`/`HS*`); `iss`/`aud`/`azp`/`exp`/`nbf` checked; JWKS
+  fetch rate-capped; `jwks_uri` https-only and blocked from loopback/private hosts (classified via
+  `net.isIP`, so bracketed IPv6 literals can't slip through). Domain provisioning requires a
+  **verified** email. The `id_token` is accepted at exactly one endpoint and never reaches the
+  per-request identity path. GitHub/Google login **and** legacy `ADA_CLIENT_KEYS` are refused while
+  OIDC is on (single identity authority).
+
+Adversarially reviewed before release (5 finders → per-finding refutation → adjudication): 2 blockers
+(legacy-shared-key SSO bypass, unverified-email provisioning), 1 major (bracketed-IPv6 SSRF-guard
+bypass), and 2 minors — all fixed and regression-tested in selfcheck.
+
+Design chosen and hardened via a multi-agent panel + 3-lens adversarial red-team (5 blockers, all
+resolved before build). Live-verified: OIDC-locked backend 401s a tokenless request; fail-closed
+startup on missing allow-surface and multi-tenant issuer; real-Google discovery + JWKS guard; exchange
+rejects a bogus token.
+
 ## [0.7.0] — 2026-07-02
 
 ### Added — enterprise control plane (Stage 1)

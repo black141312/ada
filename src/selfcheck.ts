@@ -349,6 +349,86 @@ async function main(): Promise<void> {
     }
   }
 
+  // --- OIDC SSO (Stage 2): JIT seat invariants + hermetic RS256 id-token verification ---
+  {
+    const dir = join(tmpdir(), `ada-oidc-${Date.now()}`);
+    const ent = await import("./server/enterprise.ts");
+    const oidc = await import("./server/oidc.ts");
+    const { generateKeyPairSync, sign } = await import("node:crypto");
+    const savedEnv = { ...process.env };
+    const iss = "https://idp.example.com";
+    process.env.ADA_DATA_DIR = dir;
+    process.env.ADA_OIDC_ISSUER = iss;
+    process.env.ADA_OIDC_CLIENT_ID = "ada-client";
+    process.env.ADA_OIDC_ALLOWED_GROUPS = "engineering";
+    process.env.ADA_OIDC_ADMIN_GROUP = "admins";
+    try {
+      // JIT seat provisioning invariants (the load-bearing new behavior).
+      const ext = `${iss}#sub-123`;
+      const k1 = ent.upsertSeatForSSO(ext, iss, "sso-user", "dev", dir);
+      assert.ok(k1 && k1.startsWith("ada_sk_") && k1.length > 40, "OIDC JIT mints a valid seat key");
+      assert.equal(ent.upsertSeatForSSO(ext, iss, "sso-user", "dev", dir), k1, "same iss#sub reuses one seat (no key rotation)");
+      assert.equal(ent.upsertSeatForSSO(ext, iss, "sso-user", "admin", dir), k1, "existing seat is NOT auto-escalated to admin on login");
+      assert.deepEqual(ent.identifySeat(k1!, dir), { user: "sso-user", role: "dev" }, "SSO seat key authenticates like any seat");
+      assert.equal(ent.disableSeatByExternalId(ext, dir), "sso-user", "disable-by-externalId offboards");
+      assert.equal(ent.upsertSeatForSSO(ext, iss, "sso-user", "dev", dir), null, "disabled externalId denies re-login (fail-closed deprovision, no resurrect)");
+      assert.equal(ent.identifySeat(k1!, dir), null, "disabled SSO seat no longer authenticates");
+      assert.equal(ent.seatByExternalId("__proto__", dir), null, "externalId scan is prototype-safe");
+      // admin→dev downgrade when the admin group drops off a later login.
+      const ext2 = `${iss}#boss`;
+      const kb = ent.upsertSeatForSSO(ext2, iss, "boss", "admin", dir);
+      assert.equal(ent.identifySeat(kb!, dir)!.role, "admin", "admin seat provisioned");
+      assert.equal(ent.upsertSeatForSSO(ext2, iss, "boss", "dev", dir), kb, "downgrade reuses the same key");
+      assert.equal(ent.identifySeat(kb!, dir)!.role, "dev", "admin→dev downgrade on group removal");
+
+      // group/domain gate.
+      assert.ok(oidc.isProvisionAllowed({ iss, sub: "s", name: "n", groups: ["engineering"] }), "allowed group provisions");
+      assert.ok(!oidc.isProvisionAllowed({ iss, sub: "s", name: "n", groups: ["other"], email: "x@evil.com" }), "non-allowed group/domain refused");
+      assert.equal(oidc.mapIdentityToSeatFields({ iss, sub: "z", name: "z", groups: ["admins"] }).role, "admin", "admin group → admin role");
+
+      // Hermetic RS256 verification: sign a token locally, verify via an injected JWKS key.
+      const { publicKey, privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+      const pubJwk = { ...(publicKey.export({ format: "jwk" }) as Record<string, unknown>), kid: "test", kty: "RSA" };
+      const getKey = (kid: string) => (kid === "test" ? pubJwk : null);
+      const now = 1_800_000_000_000;
+      const sec = Math.floor(now / 1000);
+      const b64u = (o: unknown): string => Buffer.from(typeof o === "string" ? o : JSON.stringify(o)).toString("base64url");
+      const mkToken = (payload: Record<string, unknown>, alg = "RS256"): string => {
+        const head = b64u({ alg, kid: "test", typ: "JWT" });
+        const body = b64u(payload);
+        if (alg === "none") return `${head}.${body}.`;
+        return `${head}.${body}.${sign("RSA-SHA256", Buffer.from(`${head}.${body}`), privateKey).toString("base64url")}`;
+      };
+      const good = { iss, aud: "ada-client", sub: "sub-123", exp: sec + 3600, iat: sec, groups: ["engineering"], email: "dev@corp.com" };
+      const id = await oidc.verifyOidcToken(mkToken(good), { getKey, now });
+      assert.ok(id && id.sub === "sub-123" && id.iss === iss, "valid RS256 id_token verifies");
+      const validTok = mkToken(good);
+      assert.equal(await oidc.verifyOidcToken(`${validTok.slice(0, -4)}AAAA`, { getKey, now }), null, "tampered signature → null");
+      assert.equal(await oidc.verifyOidcToken(mkToken({ ...good, aud: "someone-else" }), { getKey, now }), null, "wrong audience → null");
+      assert.equal(await oidc.verifyOidcToken(mkToken(good, "none"), { getKey, now }), null, "alg=none → null (no key confusion)");
+      assert.equal(await oidc.verifyOidcToken(mkToken({ ...good, exp: sec - 7200 }), { getKey, now }), null, "expired token → null");
+      // email is trusted only when the IdP marks it verified (domain-provisioning fail-open fix).
+      const idU = await oidc.verifyOidcToken(mkToken({ ...good, email: "x@corp.com", email_verified: false }), { getKey, now });
+      assert.ok(idU && idU.email === undefined, "unverified email dropped from identity");
+      const idV = await oidc.verifyOidcToken(mkToken({ ...good, email: "x@corp.com", email_verified: true }), { getKey, now });
+      assert.equal(idV!.email, "x@corp.com", "verified email kept");
+
+      // SSRF guard classifies against a parsed IP (net.isIP), not a string prefix.
+      for (const bad of ["https://[::1]/keys", "https://[fe80::1]/keys", "https://[fc00::1]/keys", "https://[::ffff:127.0.0.1]/keys", "https://127.0.0.1/keys", "https://10.1.2.3/keys", "http://idp.okta.com/keys"]) {
+        assert.throws(() => oidc.assertSafeJwksUri(bad), `jwks_uri rejected: ${bad}`);
+      }
+      for (const ok of ["https://fcm.googleapis.com/keys", "https://fd-idp.corp.com/keys", "https://your-tenant.okta.com/oauth2/v1/keys"]) {
+        assert.doesNotThrow(() => oidc.assertSafeJwksUri(ok), `jwks_uri allowed: ${ok}`);
+      }
+    } finally {
+      for (const k of ["ADA_DATA_DIR", "ADA_OIDC_ISSUER", "ADA_OIDC_CLIENT_ID", "ADA_OIDC_ALLOWED_GROUPS", "ADA_OIDC_ADMIN_GROUP"]) {
+        if (savedEnv[k] === undefined) delete process.env[k];
+        else process.env[k] = savedEnv[k];
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
   // --- org policy merge: restrictive wins, org can tighten but never loosen ---
   {
     const { permissionFor, setActiveAgentPermissions, setOrgPermissions } = await import("./client/settings.ts");
