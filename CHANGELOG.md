@@ -4,6 +4,22 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.9.0] — 2026-07-02
+
+### Added — deployable backend (container)
+- **`Dockerfile` + `docker-compose.yml` + `.env.example`** — run `ada-server` anywhere:
+  `docker compose up --build` → `http://localhost:8787`. Server-only image (`node:22-slim`, no native
+  build), data persisted at a `/data` volume. Point clients with `ADA_BACKEND_URL` / `ada.backendUrl`.
+- **[docs/deploy.md](docs/deploy.md)** — env, persistence, and Cloudflare hosting: use Workers AI
+  models (`@cf/*`) or an AI Gateway with **zero code change**; container-first on Fly/Render/Railway
+  now, with the edge-native Workers + D1/KV port outlined as the next phase.
+- CI gains a build-only `docker` job so the image is verified on every push/PR.
+
+### Changed
+- **`node-pty` is now an optional dependency.** It's a client-only PTY nicety with an existing
+  `spawnSync` fallback, so making it optional lets the server image build without a C toolchain **and**
+  stops `npm i -g ada-agent` from failing on machines with no compiler (the CLI falls back cleanly).
+
 ## [0.8.0] — 2026-07-02
 
 ### Added — OIDC SSO + JIT seat provisioning (enterprise Stage 2)

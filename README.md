@@ -258,6 +258,10 @@ JIT-provisions a seat for the verified identity and offboarding is immediate. St
 verification, no new dependency; fail-closed by construction. See
 **[docs/enterprise-stage2-oidc.md](docs/enterprise-stage2-oidc.md)**.
 
+**Deploy** — a `Dockerfile` + `docker-compose.yml` run the backend anywhere (`docker compose up`);
+point clients at it with `ADA_BACKEND_URL` / `ada.backendUrl`. Use Cloudflare Workers AI models
+(`@cf/*`) or an AI Gateway with zero code change. See **[docs/deploy.md](docs/deploy.md)**.
+
 ## Benchmarks
 
 ada can run **SWE-bench Verified** — it generates patches for real GitHub issues (one isolated repo
