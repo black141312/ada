@@ -1,0 +1,22 @@
+# Cloudflare Worker deploy config for the ada backend (edge port — see docs/deploy.md → "Phase 2").
+# The container (Dockerfile) is the other, node-native way to run the backend; use ONE of them.
+#
+#   npx wrangler d1 create ada                  # → paste the database_id below
+#   npx wrangler d1 execute ada --file src/worker/schema.sql --remote
+#   npx wrangler secret put ADA_ADMIN_KEY       # bootstrap admin (any long random string)
+#   npx wrangler secret put CLOUDFLARE_API_TOKEN
+#   npx wrangler secret put CLOUDFLARE_ACCOUNT_ID   # for Workers AI @cf/* models
+#   npx wrangler deploy
+name = "ada-server"
+main = "src/worker/index.ts"
+compatibility_date = "2024-11-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ada"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+# Provider keys + ADA_ADMIN_KEY are set as SECRETS (`wrangler secret put …`), never here.
+# Non-secret vars only, e.g. an AI Gateway base URL:
+# [vars]
+# CLOUDFLARE_BASE_URL = "https://gateway.ai.cloudflare.com/v1/<acct>/<gateway>/workers-ai/v1"

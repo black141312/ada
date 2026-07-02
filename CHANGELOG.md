@@ -4,6 +4,28 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.10.0] — 2026-07-02
+
+### Added — Cloudflare Worker backend (edge-native port)
+An edge-native port of the routing backend in `src/worker/` (deploy config `wrangler.toml`, schema
+`src/worker/schema.sql`) — a self-contained Workers `fetch` handler: auth (D1 seats + admin key), the
+org model-allowlist, and provider passthrough with server-side metering. **Cloudflare Workers AI
+(`@cf/*`) is the first-class provider.** Use *either* this Worker *or* the container, not both. See
+[docs/deploy.md](docs/deploy.md).
+
+- Endpoints match the Node backend: `/v1/models`, `/v1/chat/completions`, `/v1/embeddings`, and the
+  admin `/v1/users` · `/v1/policy` · `/v1/usage` · `/v1/audit`. Stores are strongly-consistent **D1**.
+- Metering via a `TransformStream` tee + `ctx.waitUntil`; auth is prototype-safe by construction
+  (parameterized `WHERE key = ?`). Verified against a local D1 (miniflare): seat CRUD, allowlist
+  denial (403), admin gating (403), prototype-key rejection (401), usage aggregation. `wrangler
+  deploy --dry-run` bundles clean (~18 KiB).
+- **Deferred** (the Worker returns a clear error meanwhile): native Anthropic — reach Claude via
+  OpenRouter or a Cloudflare AI Gateway; and OIDC SSO — needs a Web Crypto port of `oidc.ts`
+  (`node:crypto`/`node:net` aren't on Workers).
+
+### Changed
+- CI typechecks the Worker (`npm run typecheck:worker`); `@cloudflare/workers-types` added as a devDep.
+
 ## [0.9.0] — 2026-07-02
 
 ### Added — deployable backend (container)

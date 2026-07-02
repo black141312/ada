@@ -62,17 +62,30 @@ unified logging, caching, rate-limiting), point `CLOUDFLARE_BASE_URL` at your ga
   is stateless-leaning — durable seat/usage/audit state wants **R2/D1**, not a container disk. For a
   Cloudflare-native, stateful deploy, prefer the port below.
 
-### Phase 2 — Workers-native port (planned)
+### Cloudflare Worker (edge-native) — `src/worker/`
 
-The container is deliberately step one. The edge-native version swaps:
+An edge-native port of the backend ships in `src/worker/` (config: `wrangler.toml`, schema:
+`src/worker/schema.sql`). It's a self-contained Workers `fetch` handler: auth (D1 seats + admin key),
+the org model-allowlist, and provider passthrough with server-side metering — **Cloudflare Workers AI
+(`@cf/*`) is the first-class provider**. Use *either* this Worker *or* the container, not both.
 
-- the Node HTTP server → a Workers `fetch` handler,
-- the file-backed stores (already isolated behind `dataDir()` in `enterprise.ts`) → **D1** (seats /
-  policy / usage / audit) or **KV**,
-- streaming metering (currently a `res.write` tee) → **AI Gateway** request logs,
-- and uses **Workers AI** directly for `@cf/*`.
+```bash
+npx wrangler d1 create ada                                   # → paste the id into wrangler.toml
+npx wrangler d1 execute ada --file src/worker/schema.sql --remote
+npx wrangler secret put ADA_ADMIN_KEY                        # bootstrap admin
+npx wrangler secret put CLOUDFLARE_ACCOUNT_ID                # for @cf/* Workers AI models
+npx wrangler secret put CLOUDFLARE_API_TOKEN
+npx wrangler deploy
+# then create seats: curl -X POST -H "Authorization: Bearer $ADA_ADMIN_KEY" -d '{"name":"alice"}' https://<worker>/v1/users
+```
 
-Tracked as a follow-up; the container unblocks distribution first.
+Endpoints match the Node backend (`/v1/models`, `/v1/chat/completions`, `/v1/embeddings`, and the
+admin `/v1/users` · `/v1/policy` · `/v1/usage` · `/v1/audit`). Stores are strongly-consistent **D1**.
+
+**Deferred to a follow-up** (the Worker returns a clear error meanwhile): **native Anthropic** — reach
+Claude via OpenRouter (`anthropic/claude-…`) or point `CLOUDFLARE_BASE_URL` at an AI Gateway; and
+**OIDC SSO**, which needs a Web Crypto port of `oidc.ts` (`node:crypto`/`node:net` aren't on Workers).
+Metering is a `TransformStream` tee today; an **AI Gateway** in front gives it to you for free.
 
 ## Hardening
 
