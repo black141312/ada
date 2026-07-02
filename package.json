@@ -1,6 +1,6 @@
 {
   "name": "ada-agent",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "A from-zero terminal coding agent with a Cursor-style routing backend, ~285 skills, MCP connectors, and ask/plan/auto modes",
   "type": "module",
   "license": "MIT",
@@ -49,6 +49,7 @@
     "start": "tsx src/client/cli.ts",
     "server": "tsx src/server/index.ts",
     "typecheck": "tsc --noEmit",
+    "typecheck:worker": "tsc -p src/worker/tsconfig.json --noEmit",
     "selfcheck": "tsx src/selfcheck.ts",
     "bench:swebench": "node bench/swebench.mjs",
     "catalog:refresh": "node scripts/refresh-catalog.mjs",
@@ -63,6 +64,7 @@
     "node-pty": "^1.1.0"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260702.1",
     "@types/node": "^26.0.1",
     "typescript": "^6.0.3"
   }

@@ -17,6 +17,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
+      - run: npm run typecheck:worker
       - run: npm run selfcheck
 
   # Windows leg — exercises the node-pty native build + path handling on the platform many users

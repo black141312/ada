@@ -5,3 +5,6 @@ node_modules/
 
 # ada session transcripts / local data
 .cos0/
+
+.dev.vars
+.wrangler/
