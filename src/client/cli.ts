@@ -3,7 +3,8 @@
 import { createInterface } from "node:readline/promises";
 import { spawnSync } from "node:child_process";
 import { basename, dirname, join, resolve } from "node:path";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { stdin, stdout } from "node:process";
 import OpenAI from "openai";
@@ -13,7 +14,7 @@ import { expandPrompt, loadPrompts } from "./prompts.ts";
 import { Session, list, type SessionMeta } from "./session.ts";
 import { deleteCredential, getCredential, listCredentials } from "../server/credentials.ts";
 import { deviceLogin, oauthConfig } from "../server/oauth.ts";
-import { addTrust, isTrusted, loadSettings, setActiveAgentPermissions, type Settings } from "./settings.ts";
+import { addTrust, isTrusted, loadSettings, setActiveAgentPermissions, setOrgPermissions, type PermRule, type Settings } from "./settings.ts";
 import { getCommands, loadExtensions } from "./extensions.ts";
 import { registerTool, setAsker } from "./tools.ts";
 import { addRemoteSkill, loadSkills, registerSkillTool } from "./skills.ts";
@@ -368,6 +369,38 @@ async function loginFlow(provider: string): Promise<boolean> {
   }
 }
 
+/** Fetch org policy from an enterprise backend and apply its tool rules locally (restrictive-wins
+ *  merge in settings.permissionFor; the backend enforces the model allowlist regardless). Caches the
+ *  last-good policy under ~/.ada so a transient fetch failure falls back to known rules instead of
+ *  silently dropping them. No-op against a non-enterprise backend. */
+async function applyOrgPolicy(): Promise<void> {
+  const cacheFile = join(homedir(), ".ada", "org-policy.json");
+  const enterprise = clientKey().startsWith("ada_sk_"); // a seat key ⇒ this is an enterprise backend
+  try {
+    const r = await fetch(`${BACKEND}/policy`, { headers: { authorization: `Bearer ${clientKey()}` }, signal: AbortSignal.timeout(3000) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const policy = (await r.json()) as { permissions?: PermRule[] };
+    setOrgPermissions(policy.permissions ?? null);
+    try {
+      mkdirSync(join(homedir(), ".ada"), { recursive: true });
+      writeFileSync(cacheFile, JSON.stringify(policy));
+    } catch {
+      /* cache best-effort */
+    }
+    if (policy.permissions?.length) console.error(`\x1b[2m↳ org policy applied (${policy.permissions.length} rule${policy.permissions.length === 1 ? "" : "s"})\x1b[0m`);
+  } catch (e) {
+    if (!enterprise) return; // non-enterprise backend — local rules only, silently
+    // Enterprise backend unreachable — fall back to the last policy we saw, and say so loudly.
+    try {
+      const cached = JSON.parse(readFileSync(cacheFile, "utf8")) as { permissions?: PermRule[] };
+      setOrgPermissions(cached.permissions ?? null);
+      console.error(`\x1b[33m[warn] could not fetch org policy (${e instanceof Error ? e.message : e}) — using cached rules.\x1b[0m`);
+    } catch {
+      console.error(`\x1b[33m[warn] could not fetch org policy (${e instanceof Error ? e.message : e}) and no cache — org tool rules NOT applied this session.\x1b[0m`);
+    }
+  }
+}
+
 /** Startup login check: probe the backend; if it says 401, offer to sign in and rebuild the client. */
 async function ensureAuth(rl: RL, client: OpenAI): Promise<OpenAI> {
   let status: number;
@@ -658,6 +691,7 @@ async function main(): Promise<void> {
     registerSkillTool(loadSkills(trusted));
     await loadMcpServers(trusted);
     const client = makeClient();
+    await applyOrgPolicy(); // enterprise org rules apply to acp sessions too
     let model = process.env.ADA_MODEL || settings.model || "";
     if (!model) {
       try {
@@ -741,6 +775,7 @@ async function main(): Promise<void> {
     registerSkillTool(loadSkills(trusted));
     await loadMcpServers(trusted);
     const client = makeClient();
+    await applyOrgPolicy(); // enterprise org rules apply to serve sessions too
     let model = (process.argv[3] && !process.argv[3].startsWith("--") ? process.argv[3] : "") || process.env.ADA_MODEL || settings.model || "";
     if (!model) {
       try {
@@ -1082,6 +1117,7 @@ async function main(): Promise<void> {
   if (flags.print !== undefined) {
     const trusted = isTrusted(process.cwd());
     const settings = loadSettings(trusted);
+    await applyOrgPolicy(); // org tool rules bind headless runs too (CI is the classic bypass path)
     let pm = flags.model ?? process.env.ADA_MODEL ?? settings.model ?? scoped[0] ?? "";
     if (!pm) {
       try {
@@ -1125,6 +1161,7 @@ async function main(): Promise<void> {
   const mcp = await loadMcpServers(includeProject);
 
   client = await ensureAuth(rl, client); // always check login at startup; prompt if the backend says 401
+  await applyOrgPolicy(); // enterprise backends push org tool rules; no-op otherwise
 
   let session: Session;
   let history: Msg[] = [];

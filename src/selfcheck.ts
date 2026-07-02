@@ -293,6 +293,79 @@ async function main(): Promise<void> {
     assert.equal(route("anything-else"), "openrouter", "unmatched → openrouter");
   }
 
+  // --- enterprise control plane: seats, policy, metering, audit (temp data dir, no HTTP) ---
+  {
+    const dir = join(tmpdir(), `ada-ent-${Date.now()}`);
+    const ent = await import("./server/enterprise.ts");
+    process.env.ADA_DATA_DIR = dir;
+    try {
+      assert.equal(ent.enterpriseMode(dir), false, "no seats + no admin key → enterprise mode off");
+      const key = ent.createSeat("alice", "admin", dir);
+      assert.ok(key.startsWith("ada_sk_") && key.length > 40, "seat keys are long and prefixed");
+      assert.equal(ent.enterpriseMode(dir), true, "a seat activates enterprise mode");
+      assert.deepEqual(ent.identifySeat(key, dir), { user: "alice", role: "admin" }, "seat key resolves to its identity");
+      assert.equal(ent.identifySeat("ada_sk_wrong", dir), null, "unknown key → null");
+      // The auth-bypass the review caught: Object.prototype keys must NOT authenticate.
+      for (const evil of ["toString", "constructor", "__proto__", "valueOf", "hasOwnProperty"]) {
+        assert.equal(ent.identifySeat(evil, dir), null, `prototype key "${evil}" must not authenticate`);
+      }
+      assert.equal(ent.listSeats(dir)[0]!.keyPrefix.length, 14, "listing exposes only a key prefix");
+      assert.equal(ent.disableSeat(key.slice(0, 8), dir), null, "too-short prefix refused");
+      assert.equal(ent.disableSeat(key.slice(0, 14), dir), "alice", "disable by unique prefix");
+      assert.equal(ent.identifySeat(key, dir), null, "disabled seat no longer authenticates");
+
+      assert.ok(ent.modelAllowed("claude-opus-4-8", {}), "empty policy allows everything");
+      const pol = { models: ["@cf/*", "claude-*"] };
+      assert.ok(ent.modelAllowed("@cf/moonshotai/kimi-k2.7-code", pol), "wildcard allowlist matches");
+      assert.ok(!ent.modelAllowed("gpt-5", pol), "non-listed model denied");
+
+      ent.appendUsage({ ts: Date.now(), user: "alice", model: "m1", provider: "p", promptTokens: 100, completionTokens: 20 }, dir);
+      ent.appendUsage({ ts: Date.now(), user: "alice", model: "m1", provider: "p", promptTokens: 50, completionTokens: 10 }, dir);
+      ent.appendUsage({ ts: Date.now() - 90 * 86_400_000, user: "old", model: "m1", provider: "p", promptTokens: 999, completionTokens: 999 }, dir);
+      const sum = ent.usageSummary(30, dir);
+      assert.equal(sum.byUser.alice!.requests, 2, "usage aggregates per user");
+      assert.equal(sum.totals.promptTokens, 150, "old rows fall outside the window");
+
+      assert.ok(ent.auditTail(10, dir).some((e) => e.event === "seat_created"), "audit log records seat creation");
+
+      const sse = 'data: {"choices":[]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"completion_tokens_details":{"reasoning_tokens":2}}}\n\ndata: [DONE]\n\n';
+      assert.deepEqual(ent.extractLastUsage(sse), { promptTokens: 11, completionTokens: 7 }, "usage extracted from SSE tail (nested details ok)");
+      assert.equal(ent.extractLastUsage("no usage here"), null, "no usage → null");
+      // A trailing "usage": null must not hide the real one earlier in the stream.
+      assert.deepEqual(ent.extractLastUsage('{"usage":{"prompt_tokens":5,"completion_tokens":3}}\n{"usage":null}'), { promptTokens: 5, completionTokens: 3 }, "trailing usage:null skipped, real one found");
+
+      // policy validation rejects malformed shapes, accepts good ones
+      assert.ok("error" in ent.validatePolicy({ models: [1, 2] }), "non-string models rejected");
+      assert.ok("error" in ent.validatePolicy({ permissions: [{ tool: "x" }] }), "permission without action rejected");
+      assert.ok("policy" in ent.validatePolicy({ models: ["@cf/*"], permissions: [{ tool: "bash", action: "deny" }] }), "valid policy accepted");
+
+      // corrupt users.json → CorruptStore (fail-closed), NOT an empty map that unlocks the backend
+      writeFileSync(join(dir, "users.json"), "{ this is not json");
+      assert.throws(() => ent.loadSeats(dir), (e: unknown) => e instanceof ent.CorruptStore, "corrupt users.json throws CorruptStore");
+      assert.equal(ent.enterpriseMode(dir), true, "corrupt store → still enterprise (locked), never open");
+    } finally {
+      delete process.env.ADA_DATA_DIR;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  // --- org policy merge: restrictive wins, org can tighten but never loosen ---
+  {
+    const { permissionFor, setActiveAgentPermissions, setOrgPermissions } = await import("./client/settings.ts");
+    setActiveAgentPermissions([{ tool: "bash", action: "allow" }]);
+    setOrgPermissions([{ tool: "bash", action: "deny" }]);
+    assert.equal(permissionFor("bash", "x"), "deny", "org deny beats local allow");
+    setOrgPermissions([{ tool: "bash", action: "ask" }]);
+    assert.equal(permissionFor("bash", "x"), "ask", "org ask upgrades local allow");
+    setActiveAgentPermissions([{ tool: "bash", action: "deny" }]);
+    setOrgPermissions([{ tool: "bash", action: "allow" }]);
+    assert.equal(permissionFor("bash", "x"), "deny", "org allow cannot loosen a local deny");
+    setActiveAgentPermissions([]);
+    assert.equal(permissionFor("bash", "x"), null, "org allow cannot loosen the default gating");
+    setOrgPermissions(null);
+    setActiveAgentPermissions(null);
+  }
+
   // --- @codebase semantic search: pure parts (no network / no embedding model needed) ---
   {
     const { chunkText, cosine, walkFiles } = await import("./client/embed-index.ts");

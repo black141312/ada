@@ -245,6 +245,13 @@ See **[docs/architecture.md](docs/architecture.md)** for the design (adapters, r
 flow, file layout), **[docs/orchestration.md](docs/orchestration.md)** for the agent strategies, and
 **[docs/integrations.md](docs/integrations.md)** for the HTTP API / SDK / ACP.
 
+## Enterprise
+
+`ada-server` doubles as an org **control plane**: per-user seat keys, an org policy (server-enforced
+model allowlist + tool rules pushed to every client), per-user usage metering, and an audit log —
+activated only when you create seats, file-backed, self-hosted in your own network. See
+**[docs/enterprise.md](docs/enterprise.md)** for the 2-minute bootstrap.
+
 ## Benchmarks
 
 ada can run **SWE-bench Verified** — it generates patches for real GitHub issues (one isolated repo

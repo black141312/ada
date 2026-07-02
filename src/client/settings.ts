@@ -66,9 +66,15 @@ export function setActiveAgentPermissions(rules: PermRule[] | null): void {
   activeAgentPerms = rules;
 }
 
-/** Evaluate the configured permission rules for a tool call. null = no matching rule (use defaults). */
-export function permissionFor(toolName: string, summary: string): PermAction | null {
-  const rules = activeAgentPerms ?? loadSettings(isTrusted(process.cwd())).permissions ?? [];
+// Org policy pushed by an enterprise backend (fetched from /v1/policy at startup). Merged
+// restrictive-wins: an org "deny" beats any local "allow"; an org "ask" upgrades a local "allow".
+// A local "deny" always stands — the org can tighten a user's setup, never loosen it.
+let orgPerms: PermRule[] | null = null;
+export function setOrgPermissions(rules: PermRule[] | null): void {
+  orgPerms = rules?.length ? rules : null;
+}
+
+function evalRules(rules: PermRule[], toolName: string, summary: string): PermAction | null {
   let result: PermAction | null = null;
   for (const r of rules) {
     const toolOk = !r.tool || r.tool === toolName || globMatch(r.tool, toolName);
@@ -76,6 +82,18 @@ export function permissionFor(toolName: string, summary: string): PermAction | n
     if (toolOk && patOk) result = r.action; // last match wins
   }
   return result;
+}
+
+const STRICTNESS: Record<PermAction, number> = { allow: 0, ask: 1, deny: 2 };
+
+/** Evaluate the configured permission rules for a tool call. null = no matching rule (use defaults). */
+export function permissionFor(toolName: string, summary: string): PermAction | null {
+  const local = evalRules(activeAgentPerms ?? loadSettings(isTrusted(process.cwd())).permissions ?? [], toolName, summary);
+  if (!orgPerms) return local;
+  const org = evalRules(orgPerms, toolName, summary);
+  if (org === null) return local;
+  if (local === null) return org === "allow" ? null : org; // org can't LOOSEN the default gating, only tighten
+  return STRICTNESS[org] > STRICTNESS[local] ? org : local;
 }
 
 export function addTrust(dir: string): void {

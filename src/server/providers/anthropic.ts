@@ -114,6 +114,8 @@ export const anthropicAdapter: Adapter = {
 
     let stop = "stop";
     let toolIndex = -1;
+    let inTokens = 0; // Anthropic reports input on message_start, cumulative output on message_delta
+    let outTokens = 0;
 
     try {
       const client = await getClient();
@@ -148,7 +150,9 @@ export const anthropicAdapter: Adapter = {
       );
 
       for await (const event of stream) {
-        if (event.type === "content_block_start") {
+        if (event.type === "message_start") {
+          inTokens = (event.message as { usage?: { input_tokens?: number } }).usage?.input_tokens ?? 0;
+        } else if (event.type === "content_block_start") {
           const cb = event.content_block as { type: string; id?: string; name?: string };
           if (cb.type === "tool_use") {
             toolIndex++;
@@ -161,10 +165,15 @@ export const anthropicAdapter: Adapter = {
         } else if (event.type === "message_delta") {
           const reason = (event.delta as { stop_reason?: string | null }).stop_reason;
           if (reason) stop = mapStop(reason);
+          const ot = (event as { usage?: { output_tokens?: number } }).usage?.output_tokens;
+          if (typeof ot === "number") outTokens = ot; // cumulative — take the latest
         }
       }
 
       chunk({}, stop);
+      // Emit an OpenAI-shaped usage chunk so the backend's metering (and the client's own token
+      // counters) work for Claude too — Anthropic doesn't send one in this wire format.
+      writeChunk(res, { id, object: "chat.completion.chunk", created, model, choices: [], usage: { prompt_tokens: inTokens, completion_tokens: outTokens, total_tokens: inTokens + outTokens } });
       endStream(res);
     } catch (err) {
       chunk({ content: `\n[backend: anthropic error: ${err instanceof Error ? err.message : String(err)}]` }, "stop");
