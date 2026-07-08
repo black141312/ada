@@ -20,7 +20,7 @@ type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 export type AgentEvent =
   | { type: "text"; delta: string }
   | { type: "tool_call"; callId: string; name: string; detail: string }
-  | { type: "tool_result"; callId: string; name: string; output: string; isError: boolean }
+  | { type: "tool_result"; callId: string; name: string; output: string; isError: boolean; display?: string }
   | { type: "done"; text: string; usage: string };
 type SendCtrl = { signal?: AbortSignal; steer?: string[]; quiet?: boolean; images?: string[]; onReplyStart?: () => void; onEvent?: (e: AgentEvent) => void };
 type ToolCall = { id: string; name: string; args: string };
@@ -707,7 +707,7 @@ export class Agent {
       say(`\n\x1b[2m• ${name}${detail}\x1b[0m\n`);
     };
     const printResult = (callId: string, name: string, r: ToolResult): void => {
-      ctrl?.onEvent?.({ type: "tool_result", callId, name, output: r.output, isError: !!r.isError });
+      ctrl?.onEvent?.({ type: "tool_result", callId, name, output: r.output, isError: !!r.isError, display: r.display });
       if (r.display) say(`${r.display}\n`);
       else if (r.isError) say(`\x1b[31m  ${r.output.split("\n")[0]}\x1b[0m\n`);
     };
