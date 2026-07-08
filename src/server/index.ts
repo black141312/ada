@@ -7,6 +7,10 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { PORT, PROVIDERS, clientKeys, configuredProviders, isConfigured } from "./config.ts";
 import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, createSeat, disableSeat, disableSeatByExternalId, enterpriseMode, extractLastUsage, identifySeat, listSeats, loadPolicy, modelAllowed, savePolicy, upsertSeatForSSO, usageSummary, validatePolicy } from "./enterprise.ts";
 import { allowedUsers, isAllowed, verifyIdentity } from "./identity.ts";
+import { auth, verifyBetterAuth } from "./auth.ts";
+import { toNodeHandler } from "better-auth/node";
+
+const betterAuthHandler = toNodeHandler(auth);
 import { assertOidcConfig, discover, isProvisionAllowed, mapIdentityToSeatFields, oidcConfig, oidcEnabled, verifyOidcToken } from "./oidc.ts";
 import { adapterFor } from "./providers/registry.ts";
 import { route } from "./router.ts";
@@ -54,6 +58,8 @@ async function identify(req: IncomingMessage): Promise<Identity | "corrupt" | nu
       const id = await verifyIdentity(token); // GitHub / Google login
       if (id && isAllowed(id.user)) return { user: id.user, role: "dev" };
     }
+    // Better Auth session token or API key (accounts served at /api/auth/*)
+    if (await verifyBetterAuth(token)) return { user: "account", role: "dev" };
   }
   return locked() ? null : { user: "dev", role: "dev" }; // dev mode: open
 }
@@ -250,6 +256,8 @@ const server = createServer(async (req, res) => {
     // Pre-auth login routes (a locked backend must still let a new user authenticate).
     if (req.method === "GET" && url.pathname === "/v1/auth/methods") return await handleAuthMethods(res);
     if (req.method === "POST" && url.pathname === "/v1/auth/oidc/exchange") return await handleOidcExchange(req, res);
+    // Better Auth: accounts, sessions, social login, API keys, device flow.
+    if (url.pathname.startsWith("/api/auth")) return betterAuthHandler(req, res);
 
     const who = await identify(req);
     if (who === "corrupt") return json(res, 503, { error: { message: "auth store unreadable — refusing all requests (fail-closed). Fix ~/.ada/server/users.json." } });

@@ -4,6 +4,12 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.10.1] — 2026-07-02
+
+### Added
+- `tool_result` agent events now carry the tool's `display` (its colored diff), so a client driving
+  the session API (the IDE panel over `ada serve`) can render real diffs instead of plain text.
+
 ## [0.10.0] — 2026-07-02
 
 ### Added — Cloudflare Worker backend (edge-native port)
