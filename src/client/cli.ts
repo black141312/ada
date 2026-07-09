@@ -18,6 +18,7 @@ import { addTrust, isTrusted, loadSettings, setActiveAgentPermissions, setOrgPer
 import { getCommands, loadExtensions } from "./extensions.ts";
 import { registerTool, setAsker } from "./tools.ts";
 import { addRemoteSkill, loadSkills, registerSkillTool } from "./skills.ts";
+import { memoryCommand, registerMemoryTools } from "./memory.ts";
 import { addConnector, listConnectors, loadMcpServers, removeConnector } from "./mcp.ts";
 import { addExtension, selfUpdate } from "./pkg.ts";
 import { runTui } from "./tui-mode.ts";
@@ -583,7 +584,7 @@ async function printBanner(): Promise<void> {
 }
 
 /** Subcommands that don't touch the backend — no point spawning a server for these. */
-const NO_BACKEND = new Set(["mcp", "skill", "worktree", "wt", "catalog", "share"]);
+const NO_BACKEND = new Set(["mcp", "skill", "worktree", "wt", "catalog", "share", "memory"]);
 
 async function main(): Promise<void> {
   const sub = process.argv[2];
@@ -621,6 +622,10 @@ async function main(): Promise<void> {
   }
   if (sub === "update") {
     selfUpdate();
+    return;
+  }
+  if (sub === "memory") {
+    memoryCommand(process.argv.slice(3), isTrusted(process.cwd()));
     return;
   }
   if (sub === "mcp") {
@@ -740,7 +745,7 @@ async function main(): Promise<void> {
     const trusted = isTrusted(process.cwd());
     const settings = loadSettings(trusted);
     await loadExtensions(trusted);
-    registerSkillTool(loadSkills(trusted));
+    registerSkillTool(loadSkills(trusted)); registerMemoryTools(trusted);
     await loadMcpServers(trusted);
     const client = makeClient();
     await applyOrgPolicy(); // enterprise org rules apply to acp sessions too
@@ -824,7 +829,7 @@ async function main(): Promise<void> {
     const trusted = isTrusted(process.cwd());
     const settings = loadSettings(trusted);
     await loadExtensions(trusted);
-    registerSkillTool(loadSkills(trusted));
+    registerSkillTool(loadSkills(trusted)); registerMemoryTools(trusted);
     await loadMcpServers(trusted);
     const client = makeClient();
     await applyOrgPolicy(); // enterprise org rules apply to serve sessions too
@@ -1131,7 +1136,7 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     await loadExtensions(trusted);
-    registerSkillTool(loadSkills(trusted));
+    registerSkillTool(loadSkills(trusted)); registerMemoryTools(trusted);
     await loadMcpServers(trusted);
     const agent = new Agent({
       client,
@@ -1209,7 +1214,7 @@ async function main(): Promise<void> {
   const kbInterrupt = settings.keybindings?.interrupt;
   const exts = await loadExtensions(includeProject);
   const skills = loadSkills(includeProject);
-  registerSkillTool(skills);
+  registerSkillTool(skills); registerMemoryTools(includeProject);
   const mcp = await loadMcpServers(includeProject);
 
   client = await ensureAuth(rl, client); // always check login at startup; prompt if the backend says 401
@@ -1444,6 +1449,10 @@ async function main(): Promise<void> {
     }
     if (line === "/todos") {
       console.log(renderTodos());
+      continue;
+    }
+    if (line === "/memory" || line.startsWith("/memory ")) {
+      memoryCommand(line.slice(7).trim().split(/\s+/).filter(Boolean), includeProject);
       continue;
     }
     if (line === "/ask" || line === "/auto" || line === "/plan" || line === "/mode") {
