@@ -4,6 +4,16 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.12.0] — 2026-07-09
+
+### Added — /connect
+`/connect` opens an arrow-select menu to connect ada to a provider (OpenRouter, OpenAI, Anthropic,
+Cloudflare Workers AI, Groq, Google, Mistral, DeepSeek, xAI, Together, DashScope) — saving its API
+key to the credential store so the local backend routes to it — or a custom backend / Cloudflare
+Worker URL, saved to `~/.ada/settings.json`. Both **persist across sessions**: the client reads
+`ADA_BACKEND_URL`, then the saved `backendUrl`, then localhost. Shortcuts: `/connect <provider>` or
+`/connect <url>`.
+
 ## [0.11.0] — 2026-07-09
 
 ### Added — auto-memory
