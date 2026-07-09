@@ -4,6 +4,19 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.11.0] — 2026-07-09
+
+### Added — auto-memory
+ada now remembers durable facts (preferences, conventions, decisions, gotchas) and auto-recalls the
+relevant few at the start of each turn. Markdown-bullet store under `.ada/memory` (project,
+trust-gated) + `~/.ada/memory` (global) — git-diffable, hand-editable. Recall reuses the lexical
+`rankSkills` ranker (deterministic, offline), floored + capped (≤7 facts), and rides the per-turn
+transient system-note seam so it is recomputed each turn and never persisted — context stays flat as
+the store grows. Capture via a `remember_fact` tool with a hard secret-safety gate (refuse on write
+AND at load), supersede-not-duplicate on same-subject value changes, and a `/memory` command surface
+(list/add/forget/edit/pin/search/why/consolidate) + headless `ada memory`. Zero new dependencies.
+Adversarially reviewed (fixed a secret-gate bypass + 5 more findings; selfcheck covers all).
+
 ## [0.10.1] — 2026-07-02
 
 ### Added
