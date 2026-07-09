@@ -13,6 +13,8 @@ export interface PermRule {
 }
 
 export interface Settings {
+  backendUrl?: string; // which ada-server the client talks to (a hosted server / Cloudflare Worker); env ADA_BACKEND_URL overrides
+  backendKey?: string; // bearer/seat key for that backend
   model?: string;
   reasoning?: "low" | "medium" | "high";
   autoApprove?: boolean;
@@ -94,6 +96,11 @@ export function permissionFor(toolName: string, summary: string): PermAction | n
   if (org === null) return local;
   if (local === null) return org === "allow" ? null : org; // org can't LOOSEN the default gating, only tighten
   return STRICTNESS[org] > STRICTNESS[local] ? org : local;
+}
+
+/** Merge a patch into GLOBAL settings and persist (used by /connect). */
+export function setGlobal(patch: Partial<Settings>): void {
+  writeGlobal({ ...readJson(GLOBAL), ...patch });
 }
 
 export function addTrust(dir: string): void {

@@ -1,6 +1,6 @@
 {
   "name": "ada-agent",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "A from-zero terminal coding agent with a Cursor-style routing backend, ~285 skills, MCP connectors, and ask/plan/auto modes",
   "type": "module",
   "license": "MIT",

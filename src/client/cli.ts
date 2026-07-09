@@ -14,7 +14,7 @@ import { expandPrompt, loadPrompts } from "./prompts.ts";
 import { Session, list, type SessionMeta } from "./session.ts";
 import { deleteCredential, getCredential, listCredentials, setCredential } from "../server/credentials.ts";
 import { deviceGrant, deviceLogin, oauthConfig } from "../server/oauth.ts";
-import { addTrust, isTrusted, loadSettings, setActiveAgentPermissions, setOrgPermissions, type PermRule, type Settings } from "./settings.ts";
+import { addTrust, isTrusted, loadSettings, setActiveAgentPermissions, setGlobal, setOrgPermissions, type PermRule, type Settings } from "./settings.ts";
 import { getCommands, loadExtensions } from "./extensions.ts";
 import { registerTool, setAsker } from "./tools.ts";
 import { addRemoteSkill, loadSkills, registerSkillTool } from "./skills.ts";
@@ -35,7 +35,8 @@ import { track } from "./telemetry.ts";
 type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 type RL = ReturnType<typeof createInterface>;
 
-const BACKEND = process.env.ADA_BACKEND_URL ?? "http://localhost:8787/v1";
+// Which backend the client talks to: env wins, then a saved /connect setting, then local default.
+const BACKEND = process.env.ADA_BACKEND_URL ?? loadSettings(false).backendUrl ?? "http://localhost:8787/v1";
 
 /** A stored login credential, sent as the bearer so the backend can identify us. An OIDC SSO seat
  *  key (ada_sk_…) wins — it's a durable, server-minted, disableable bearer (see oidcLogin). A seat
@@ -51,7 +52,7 @@ function identityToken(): string | undefined {
 }
 
 function clientKey(): string {
-  return process.env.ADA_CLIENT_KEY ?? identityToken() ?? "dev";
+  return process.env.ADA_CLIENT_KEY ?? identityToken() ?? loadSettings(false).backendKey ?? "dev";
 }
 
 interface Flags {
@@ -486,6 +487,41 @@ async function authCommand(sub: string, provider?: string): Promise<void> {
     return;
   }
   if (!(await loginFlow(provider))) process.exit(1);
+}
+
+// Providers the local backend can route to (each just needs an API key stored in the credential store).
+const CONNECTABLE = ["openrouter", "openai", "anthropic", "cloudflare", "groq", "google", "mistral", "deepseek", "xai", "together", "dashscope"];
+
+/** /connect — pick a provider (saves its API key; the local backend routes to it) or a backend
+ *  endpoint (saves the URL/key so new sessions point there). Interactive menu, or /connect <name|url>. */
+async function connectCommand(rl: RL, arg?: string): Promise<void> {
+  if (arg) {
+    if (/^https?:\/\//.test(arg)) return connectBackend(rl, arg);
+    if (CONNECTABLE.includes(arg)) return connectProvider(rl, arg);
+    console.log(`unknown target "${arg}". Run /connect for the menu, or pass a provider name or a backend URL.`);
+    return;
+  }
+  const items = [...CONNECTABLE.map((p) => `${p}${getCredential(p)?.key ? "  \x1b[2m✓ connected\x1b[0m" : ""}`), "custom backend / Cloudflare Worker URL…"];
+  const i = await select(rl, "Connect ada to:", items);
+  if (i == null) return;
+  return i < CONNECTABLE.length ? connectProvider(rl, CONNECTABLE[i]!) : connectBackend(rl);
+}
+
+async function connectProvider(rl: RL, p: string): Promise<void> {
+  const key = (await rl.question(`API key for ${p} (blank to cancel): `)).trim();
+  if (!key) return console.log("cancelled");
+  await setCredential(p, { type: "api_key", key });
+  console.log(`\x1b[32m✓ connected to ${p}\x1b[0m — key saved (~/.ada/credentials.json). The local backend uses it now and in new sessions.`);
+  const remote = loadSettings(false).backendUrl;
+  if (remote) console.log(`\x1b[33mnote: you're pointed at a remote backend (${remote}) — provider keys live on THAT server, not here.\x1b[0m`);
+}
+
+async function connectBackend(rl: RL, preset?: string): Promise<void> {
+  const url = (preset ?? (await rl.question("backend URL (e.g. https://ada.you.workers.dev/v1): "))).trim();
+  if (!url) return console.log("cancelled");
+  const key = (await rl.question("seat/bearer key for it (blank = dev): ")).trim();
+  setGlobal({ backendUrl: url, ...(key ? { backendKey: key } : {}) });
+  console.log(`\x1b[32m✓ ada backend set to ${url}\x1b[0m — saved. New sessions will use it (restart ada to apply).`);
 }
 
 /** Gate project-level files (.ada/prompts, AGENTS.md, project settings) behind explicit trust. */
@@ -1453,6 +1489,10 @@ async function main(): Promise<void> {
     }
     if (line === "/memory" || line.startsWith("/memory ")) {
       memoryCommand(line.slice(7).trim().split(/\s+/).filter(Boolean), includeProject);
+      continue;
+    }
+    if (line === "/connect" || line.startsWith("/connect ")) {
+      await connectCommand(rl, line.slice(8).trim() || undefined);
       continue;
     }
     if (line === "/ask" || line === "/auto" || line === "/plan" || line === "/mode") {
