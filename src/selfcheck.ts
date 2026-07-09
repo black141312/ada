@@ -429,6 +429,67 @@ async function main(): Promise<void> {
     }
   }
 
+  // --- auto-memory: recall relevance, supersede, secret gate, scoping, pinned, reference ---
+  {
+    const dir = join(tmpdir(), `ada-mem-${Date.now()}`);
+    process.env.ADA_MEMORY_DIR = dir;
+    const mem = await import("./client/memory.ts");
+    try {
+      assert.ok(mem.rememberFact({ text: "We deploy from the release branch", scope: "project", type: "decision" }).ok, "remember a project fact");
+      assert.ok(mem.rememberFact({ text: "I prefer terse output", scope: "user", type: "preference" }).ok, "remember a user fact");
+      assert.equal(mem.loadMemories(true).length, 2, "both scopes load when project is trusted");
+      assert.equal(mem.loadMemories(false).length, 1, "only the user fact loads when project is untrusted");
+
+      // dedup: a near-identical fact adds no line
+      const before = mem.loadMemories(true).length;
+      mem.rememberFact({ text: "we deploy from the release branch", scope: "project" });
+      assert.equal(mem.loadMemories(true).length, before, "dedup: near-identical fact is a NOOP");
+
+      // supersede a same-subject value change; coexist across different subjects
+      mem.rememberFact({ text: "test runner is jest", scope: "project", type: "convention" });
+      mem.rememberFact({ text: "test runner is vitest", scope: "project", type: "convention" });
+      const runners = mem.loadMemories(true).filter((m) => m.text.includes("test runner"));
+      assert.equal(runners.length, 1, "supersede: only the newest same-subject fact is live");
+      assert.ok(runners[0]!.text.includes("vitest"), "supersede: the newest value wins");
+      mem.rememberFact({ text: "uses pnpm for the web app", scope: "project" });
+      mem.rememberFact({ text: "uses cargo for the rust crate", scope: "project" });
+      assert.equal(mem.loadMemories(true).filter((m) => m.text.startsWith("uses")).length, 2, "different subjects coexist");
+      mem.rememberFact({ text: "never delete the prod database", scope: "project", type: "gotcha" });
+      mem.rememberFact({ text: "never delete stale feature branches", scope: "project", type: "convention" });
+      assert.equal(mem.loadMemories(true).filter((m) => m.text.startsWith("never delete")).length, 2, "shared-bigram-but-distinct facts coexist (no over-supersede)");
+
+      // secret gate — refuse on write, allow a plain hex sha
+      for (const secret of ["my key is sk-abcdefghijklmnop1234", "AKIAABCDEFGHIJKLMNOP", "token=ghp_0123456789abcdefghijklmnop", "password=hunter2horse99", "ada_sk_" + "a".repeat(48)]) {
+        assert.ok(!mem.rememberFact({ text: secret }).ok, `secret refused: ${secret.slice(0, 14)}…`);
+      }
+      assert.ok(mem.redactScan("the base commit is a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2").ok, "a plain hex sha is not flagged");
+      assert.ok(!mem.redactScan("deploy token ZXCVBNM1234567890ASDFGHJKLQWERTY").ok, "two-class high-entropy key refused (was the gate bypass)");
+      assert.ok(mem.redactScan("the auth handler is verifyBetterAuthSession").ok, "a long camelCase identifier is not flagged as a secret");
+      assert.ok(!mem.rememberFact({ text: "the template marker is <!-- here -->" }).ok, "a comment marker in fact text is refused");
+
+      // recall: relevant surfaces, off-topic injects nothing
+      const hit = mem.recallBlock("what branch do we deploy from", true);
+      assert.ok(hit && hit.includes("release branch"), "recall surfaces the relevant fact");
+      const off = mem.recallBlock("quantum chromodynamics lunch menu roster", true);
+      assert.ok(!(off ?? "").includes("release branch") && !(off ?? "").includes("test runner"), "off-topic recall surfaces no ranked project facts (floor)");
+
+      // pinned is always recalled regardless of query
+      const g = mem.rememberFact({ text: "prod migrations need ops on-call sign-off", scope: "project", type: "gotcha" });
+      assert.ok(g.ok);
+      mem.memoryCommand(["pin", (g as { memory: { id: string } }).memory.id], true);
+      const pinnedBlock = mem.recallBlock("some entirely unrelated question about widgets", true);
+      assert.ok(pinnedBlock && pinnedBlock.includes("ops on-call sign-off"), "pinned fact is recalled for any query");
+
+      // reference: the body is never in the recall block (only the title)
+      mem.rememberFact({ text: "release runbook", scope: "project", type: "reference", body: "STEP-BODY-SECRET-MARKER: do the release" });
+      const refBlock = mem.recallBlock("release runbook steps", true);
+      assert.ok(!(refBlock ?? "").includes("STEP-BODY-SECRET-MARKER"), "reference body is not auto-injected");
+    } finally {
+      delete process.env.ADA_MEMORY_DIR;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
   // --- org policy merge: restrictive wins, org can tighten but never loosen ---
   {
     const { permissionFor, setActiveAgentPermissions, setOrgPermissions } = await import("./client/settings.ts");

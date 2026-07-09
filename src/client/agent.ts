@@ -12,6 +12,7 @@ import { configuredServers } from "./mcp.ts";
 import { priceOf } from "./models-dev.ts";
 import { permissionFor } from "./settings.ts";
 import { routeConfident, routeSkills } from "./skills.ts";
+import { recallBlock } from "./memory.ts";
 import { Session } from "./session.ts";
 
 type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
@@ -52,6 +53,7 @@ function systemPrompt(includeProject: boolean): string {
       `Platform: ${process.platform}`,
       "Tools: read_file, write_file, edit_file, bash, ls, grep, glob, codebase_search, web_fetch, web_search, lsp_diagnostics. Use grep/glob/ls to explore the codebase — or codebase_search when you're looking for code by MEANING rather than an exact string; read a file before editing it; prefer edit_file for changes to existing files; web_fetch to read a URL, web_search to find one; lsp_diagnostics to check a file for errors after editing; apply_patch for multi-file changes; ask_user only when genuinely blocked.",
       "Specialized skills are available: call list_skills to browse them (by category or filter), then use_skill to load one before a specialized task.",
+      "When the user states a durable preference, project convention, decision, correction, or constraint worth recalling in later sessions ('always use X', 'we deploy via Y', 'my name is Z', 'never touch W'), call remember_fact. Do NOT remember transient task state, anything already in AGENTS.md/CLAUDE.md, or secrets/keys/tokens (those are refused). Relevant memories are auto-recalled at the start of a turn.",
       "Be concise. Don't narrate routine actions or pad with preamble. When you have enough information to act, act. Ask only when genuinely blocked or before destructive, irreversible actions.",
     ].join("\n") + (includeProject ? projectContext() : "")
   );
@@ -423,6 +425,8 @@ export class Agent {
   private lastAssistant = "";
   private strategy = "react"; // orchestration architecture (see ORCHESTRATORS)
   private pendingNote: string | null = null; // transient skill-routing hint for the next model turn
+  private pendingMemory: string | null = null; // transient auto-recalled memories for the next model turn
+  private project: boolean; // cwd is trusted → load project skills/memory
 
   constructor(opts: {
     client: OpenAI;
@@ -443,7 +447,8 @@ export class Agent {
     this.autoApprove = !!opts.autoApprove;
     this.compactAt = opts.compactAt || COMPACT_AT;
     this.apiTools = buildApiTools(); // snapshot the registry (incl. extension/skill/MCP tools) at construction
-    this.messages = [{ role: "system", content: systemPrompt(opts.project ?? true) }, ...(opts.history ?? [])];
+    this.project = opts.project ?? true;
+    this.messages = [{ role: "system", content: systemPrompt(this.project) }, ...(opts.history ?? [])];
   }
 
   setModel(m: string): void {
@@ -535,6 +540,8 @@ export class Agent {
 
     if (estimateTokens(this.messages) > this.compactAt) await this.autoCompact("size threshold");
     if (!ctrl?.quiet) {
+      // Auto-recall: the few memories relevant to this input, injected transiently for this turn only.
+      this.pendingMemory = recallBlock(input, !!this.project);
       // Orchestrate skills: when one clearly fits, apply it (inject its procedure into context so
       // even a weak model follows it, persisted across the tool loop). Otherwise, a soft hint.
       const fit = routeConfident(input);
@@ -592,8 +599,10 @@ export class Agent {
       return null;
     }
     const suggest = this.pendingNote;
+    const memory = this.pendingMemory;
     this.pendingNote = null; // consume once — the routing hint applies to this turn only
-    const note = [opts?.note ?? (this.planMode ? PLAN_NOTE : null), suggest].filter(Boolean).join("\n\n") || null;
+    this.pendingMemory = null; // recall is per-turn + transient — never pushed to messages/session
+    const note = [opts?.note ?? (this.planMode ? PLAN_NOTE : null), memory, suggest].filter(Boolean).join("\n\n") || null;
     let overflowRetried = false;
     for (;;) {
       const create = () =>
