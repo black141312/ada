@@ -87,7 +87,10 @@ export async function ensureBackend(backendUrl: string, opts?: { quiet?: boolean
     /* surfaced via the probe loop's timeout */
   });
 
-  const deadline = Date.now() + (opts?.waitMs ?? 5000);
+  // 9s (not 5s): a cold first start now loads Better Auth's native better-sqlite3, which on a
+  // fresh install can take a few seconds. Returns the instant /health responds, so a warm start
+  // (≈1s) pays nothing extra — this only buys headroom for the cold case.
+  const deadline = Date.now() + (opts?.waitMs ?? 9000);
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 150));
     if (await probe(probeUrl, 400)) {

@@ -4,6 +4,42 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.12.1] — 2026-07-11
+
+### Security
+- **Better Auth is now opt-in (`BETTER_AUTH_ENABLED`).** Previously a Better Auth session token was
+  honored on *every* request, so on a backend locked by seats / admin key / `ADA_CLIENT_KEYS` /
+  allowlist / OIDC, anyone could self-register via the always-mounted `/api/auth/sign-up` and obtain
+  dev access — bypassing the configured auth. Better Auth tokens are now honored only when
+  `BETTER_AUTH_ENABLED` is set, and the resolved account is checked against the allowlist. Better
+  Auth remains **experimental / off by default**.
+
+### Fixed
+- **`ada` no longer hangs at startup when a model provider is unreachable.** Identity verification
+  (GitHub/Google) and the `/whoami` probe now have timeouts, and a dev-open backend short-circuits to
+  `dev` before any network/DB auth call — so an offline machine (or an un-migrated Better Auth DB) can
+  no longer wedge the CLI.
+- The model picker no longer dead-ends when nothing is reachable — it offers `/connect` instead.
+
+### Added — provider visibility
+- `GET /v1/providers` reports every service the backend can route to and how each is configured
+  (env / stored key / keyless), plus a live Ollama reachability probe.
+- The startup header shows `model → provider` and a `services:` line (`openrouter ✓ · ollama ✗ …`);
+  the status line shows `model@provider`. A `↳ served by <model>` note surfaces when an upstream
+  resolves an alias id (e.g. OpenRouter's `~family`) to a different model than requested. These
+  provider tags appear only for a local backend (the client's routing table can't speak for a remote).
+
+### Added — model picker
+- A curated **popular-models** shortlist (newest per family: Opus, Fable, Grok, Qwen, Kimi, DeepSeek,
+  Gemini, GPT) leads the picker, plus "enter a model id" and "browse all". The chosen model now
+  **persists** (`~/.ada/settings.json`), so subsequent launches boot straight to chat. `/model` (no
+  arg) opens the picker; `/model <id>` warns on an unknown id with the closest match.
+
+### Changed — UI
+- Startup commands/mode render in a bordered block with aligned accent labels; the skills line is
+  gone. The thinking indicator shows a live elapsed timer. Tool calls render Claude-Code-style
+  (`⏺ Read(path)` + an indented `⎿ result`).
+
 ## [0.12.0] — 2026-07-09
 
 ### Added — /connect

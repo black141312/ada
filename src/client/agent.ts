@@ -426,6 +426,7 @@ export class Agent {
   private strategy = "react"; // orchestration architecture (see ORCHESTRATORS)
   private pendingNote: string | null = null; // transient skill-routing hint for the next model turn
   private pendingMemory: string | null = null; // transient auto-recalled memories for the next model turn
+  private servedModel: string | null = null; // upstream-reported model of the last turn (see served())
   private project: boolean; // cwd is trusted → load project skills/memory
 
   constructor(opts: {
@@ -453,6 +454,12 @@ export class Agent {
 
   setModel(m: string): void {
     this.model = m;
+  }
+
+  /** The model id the upstream actually reported serving the last turn (from the response's `model`
+   *  field) — the ground truth when the requested id was an alias/family id (e.g. OpenRouter's `~…`). */
+  served(): string | null {
+    return this.servedModel;
   }
 
   setStrategy(s: string): void {
@@ -503,6 +510,7 @@ export class Agent {
   }
 
   async send(input: string, ctrl?: SendCtrl): Promise<string> {
+    this.servedModel = null; // per-turn ground truth — never carry a stale value across turns/models
     let replyStarted = false;
     const say = (s: string): void => {
       if (ctrl?.onEvent) {
@@ -643,6 +651,7 @@ export class Agent {
       let sniffed = false;
       try {
         for await (const chunk of stream) {
+          if (chunk.model) this.servedModel = chunk.model; // what the upstream says it's actually serving
           if (chunk.usage) {
             this.promptTokens += chunk.usage.prompt_tokens ?? 0;
             this.completionTokens += chunk.usage.completion_tokens ?? 0;
@@ -711,14 +720,18 @@ export class Agent {
     const signal = ctrl?.signal;
     const printCall = (callId: string, name: string, args: Record<string, unknown>): void => {
       const d = describeCall(name, args);
-      const detail = d.detail ? ` ${d.detail.length > 100 ? `${d.detail.slice(0, 99)}…` : d.detail}` : "";
+      const detail = d.detail.length > 100 ? `${d.detail.slice(0, 99)}…` : d.detail;
+      const label = d.label.charAt(0).toUpperCase() + d.label.slice(1); // Claude-Code-style: ⏺ Read(path)
       ctrl?.onEvent?.({ type: "tool_call", callId, name, detail: d.detail });
-      say(`\n\x1b[2m• ${name}${detail}\x1b[0m\n`);
+      say(`\n\x1b[32m⏺\x1b[0m \x1b[1m${label}\x1b[0m\x1b[2m(${detail})\x1b[0m\n`);
     };
     const printResult = (callId: string, name: string, r: ToolResult): void => {
       ctrl?.onEvent?.({ type: "tool_result", callId, name, output: r.output, isError: !!r.isError, display: r.display });
-      if (r.display) say(`${r.display}\n`);
-      else if (r.isError) say(`\x1b[31m  ${r.output.split("\n")[0]}\x1b[0m\n`);
+      if (r.display) return void say(`${r.display}\n`); // rich display (e.g. edit diff) is its own result block
+      const first = (r.output || "").split("\n").find((l) => l.trim()) ?? "";
+      const line = first.length > 80 ? `${first.slice(0, 79)}…` : first; // one-line summary under the ⏺ call
+      if (r.isError) say(`\x1b[31m  ⎿ ${line}\x1b[0m\n`);
+      else if (line) say(`\x1b[2m  ⎿ ${line}\x1b[0m\n`);
     };
     const argsOf = (s: string): Record<string, unknown> => {
       try {

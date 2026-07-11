@@ -14,6 +14,7 @@ const TTL = 5 * 60_000;
 async function verifyGitHub(token: string): Promise<Identity | null> {
   const r = await fetch("https://api.github.com/user", {
     headers: { authorization: `Bearer ${token}`, "user-agent": "ada", accept: "application/vnd.github+json" },
+    signal: AbortSignal.timeout(4000), // never let identity verification hang a request
   });
   if (!r.ok) return null;
   const j = (await r.json()) as { login?: string };
@@ -21,7 +22,7 @@ async function verifyGitHub(token: string): Promise<Identity | null> {
 }
 
 async function verifyGoogle(token: string): Promise<Identity | null> {
-  const r = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", { headers: { authorization: `Bearer ${token}` } });
+  const r = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(4000) });
   if (!r.ok) return null;
   const j = (await r.json()) as { email?: string };
   return j.email ? { provider: "google", user: j.email } : null;
