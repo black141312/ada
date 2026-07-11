@@ -426,7 +426,6 @@ export class Agent {
   private strategy = "react"; // orchestration architecture (see ORCHESTRATORS)
   private pendingNote: string | null = null; // transient skill-routing hint for the next model turn
   private pendingMemory: string | null = null; // transient auto-recalled memories for the next model turn
-  private servedModel: string | null = null; // upstream-reported model of the last turn (see served())
   private project: boolean; // cwd is trusted → load project skills/memory
 
   constructor(opts: {
@@ -454,12 +453,6 @@ export class Agent {
 
   setModel(m: string): void {
     this.model = m;
-  }
-
-  /** The model id the upstream actually reported serving the last turn (from the response's `model`
-   *  field) — the ground truth when the requested id was an alias/family id (e.g. OpenRouter's `~…`). */
-  served(): string | null {
-    return this.servedModel;
   }
 
   setStrategy(s: string): void {
@@ -510,7 +503,6 @@ export class Agent {
   }
 
   async send(input: string, ctrl?: SendCtrl): Promise<string> {
-    this.servedModel = null; // per-turn ground truth — never carry a stale value across turns/models
     let replyStarted = false;
     const say = (s: string): void => {
       if (ctrl?.onEvent) {
@@ -651,7 +643,6 @@ export class Agent {
       let sniffed = false;
       try {
         for await (const chunk of stream) {
-          if (chunk.model) this.servedModel = chunk.model; // what the upstream says it's actually serving
           if (chunk.usage) {
             this.promptTokens += chunk.usage.prompt_tokens ?? 0;
             this.completionTokens += chunk.usage.completion_tokens ?? 0;

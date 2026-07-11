@@ -208,6 +208,32 @@ function boxedRows(rows: Array<{ label: string; body: string }>): string[] {
   return [`${DIM}╭${"─".repeat(inner + 2)}╮${R}`, ...mid, `${DIM}╰${"─".repeat(inner + 2)}╯${R}`];
 }
 
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const THINK_VERBS = ["Thinking", "Working", "Reasoning", "Crunching", "Pondering", "Churning", "Cooking", "Noodling", "Scheming"];
+
+/** A transient "thinking" line for the readline REPL: spinner + cycling verb + live elapsed timer +
+ *  interrupt hint, redrawn in place. Returns stop() which clears the line. No-op off a TTY. */
+function thinkingSpinner(): () => void {
+  if (!stdout.isTTY) return () => {};
+  const start = Date.now();
+  let i = 0;
+  let verb = THINK_VERBS[Math.floor(Math.random() * THINK_VERBS.length)]!;
+  const draw = (): void => {
+    const secs = Math.floor((Date.now() - start) / 1000);
+    stdout.write(`\r\x1b[2K\x1b[38;5;214m${SPINNER[i]}\x1b[0m \x1b[2m${verb}… (${secs}s · esc to interrupt)\x1b[0m`);
+  };
+  draw();
+  const t = setInterval(() => {
+    i = (i + 1) % SPINNER.length;
+    if (i === 0 && Math.random() < 0.5) verb = THINK_VERBS[Math.floor(Math.random() * THINK_VERBS.length)]!;
+    draw();
+  }, 90);
+  return () => {
+    clearInterval(t);
+    stdout.write("\r\x1b[2K");
+  };
+}
+
 function reportModelsError(e: unknown): void {
   const msg = e instanceof Error ? e.message : String(e);
   console.error(`Could not reach the ada backend at ${BACKEND}: ${msg}`);
@@ -411,34 +437,35 @@ type PermMode = "ask" | "plan" | "auto";
 type ApproveChoice = "yes" | "auto" | "plan" | "no";
 
 /**
- * Tool-approval prompt. A fixed single-key prompt (no scrolling redraw — that fought the streaming
- * transcript and glitched): it states in plain words what permission is being requested + the actual
- * target, then reads one key — [y]es · [a]uto (run the rest without asking) · [p]lan (switch to plan
- * mode, skip this) · [n]o/Esc. `summary` is "<permission phrase>\n<detail>" from the agent.
+ * Tool-approval prompt: a one-line "ada wants to <permission> — <target>" title over an arrow-select
+ * list — Yes · Yes, don't ask again (→ auto) · No. On a choice the list collapses to a single
+ * confirmation line so the transcript stays compact. `summary` is "<permission phrase>\n<detail>".
  */
 async function approvePrompt(rl: RL, name: string, summary: string): Promise<ApproveChoice> {
   const nl = summary.indexOf("\n");
   const risk = (nl >= 0 ? summary.slice(0, nl) : summary) || `run the ${name} tool`;
   const detail = nl >= 0 ? summary.slice(nl + 1).trim() : "";
   const danger = risk.startsWith("⚠");
+  const what = risk.replace(/^⚠ /, "");
+  const cols = (stdout.columns || 80) - 4;
+  const short = detail && detail.length > cols ? `${detail.slice(0, cols - 1)}…` : detail;
   if (!stdin.isTTY) {
-    const ans = (await rl.question(`\x1b[33m? ${risk}  [y]es / [a]uto / [p]lan / [N]o \x1b[0m`)).trim().toLowerCase();
-    return ans[0] === "y" ? "yes" : ans[0] === "a" ? "auto" : ans[0] === "p" ? "plan" : "no";
+    const ans = (await rl.question(`? ${risk}${detail ? ` (${short})` : ""}  [y]es / [a]uto / [N]o `)).trim().toLowerCase();
+    return ans[0] === "y" ? "yes" : ans[0] === "a" ? "auto" : "no";
   }
-  const cols = (stdout.columns || 80) - 2;
-  const head = `${danger ? "\x1b[31m" : "\x1b[33m"}ada wants to ${risk.replace(/^⚠ /, "")}\x1b[0m`;
-  const det = detail ? `  \x1b[2m${detail.length > cols ? `${detail.slice(0, cols - 1)}…` : detail}\x1b[0m\n` : "";
-  stdout.write(`\n${danger ? "\x1b[31m⚠\x1b[0m " : ""}${head}\n${det}\x1b[2m[\x1b[0my\x1b[2m]es  [\x1b[0ma\x1b[2m]uto  [\x1b[0mp\x1b[2m]lan  [\x1b[0mn\x1b[2m]o ›\x1b[0m `);
-  return await new Promise<ApproveChoice>((res) => {
-    readKeys(rl, (key, done) => {
-      const k = key.length === 1 ? key.toLowerCase() : key;
-      const val: ApproveChoice | null = k === "y" || key === "enter" ? "yes" : k === "a" ? "auto" : k === "p" ? "plan" : k === "n" || key === "esc" || key === "ctrl-c" ? "no" : null;
-      if (!val) return;
-      done();
-      stdout.write(`\r\x1b[2K${val === "no" ? "\x1b[31m✗\x1b[0m skipped" : `\x1b[32m✓\x1b[0m ${val === "auto" ? "auto (won't ask again)" : val === "plan" ? "→ plan mode" : "ran"}`}\n`);
-      res(val);
-    });
-  });
+  const title = `${danger ? "\x1b[31m⚠ " : "\x1b[33m"}ada wants to ${what}\x1b[0m${detail ? ` \x1b[2m— ${short}\x1b[0m` : ""}`;
+  const items = ["Yes", "Yes, and don't ask again this session", "No"];
+  const i = await select(rl, title, items); // arrow-select; Esc → null → No (safe default)
+  const val: ApproveChoice = i === 0 ? "yes" : i === 1 ? "auto" : "no";
+  // Collapse the menu. The title can WRAP (the permission phrase isn't width-capped), so rewind by its
+  // actual physical-row count, not a hardcoded 1 — else a wrapped title leaves a stray fragment.
+  // ponytail: assumes the 3 fixed items don't wrap (they fit at ≥40 cols); ok for real terminals.
+  const width = stdout.columns || 80;
+  const titleRows = Math.max(1, Math.ceil(title.replace(/\x1b\[[0-9;]*m/g, "").length / width));
+  stdout.write(`\x1b[${items.length + titleRows}A\x1b[0J`);
+  const mark = val === "no" ? "\x1b[31m✗\x1b[0m no" : val === "auto" ? "\x1b[32m✓\x1b[0m yes · won't ask again" : "\x1b[32m✓\x1b[0m yes";
+  stdout.write(`${mark} \x1b[2m${what}\x1b[0m\n`);
+  return val;
 }
 
 function printTree(currentFile: string): void {
@@ -1581,11 +1608,12 @@ async function main(): Promise<void> {
   console.log("\x1b[2mduring a turn: Esc/Ctrl+C = interrupt · type + Enter = steer\x1b[0m\n");
 
   const pendingImages: string[] = []; // images attached via /image or /paste, sent with the next message
-  let lastServedNote = ""; // last "↳ served by" we printed, so alias resolution is announced once
   for (;;) {
     if (stdin.isTTY) {
-      const modeTag = mode === "plan" ? " · \x1b[33mplan\x1b[0m\x1b[2m" : mode === "auto" ? " · \x1b[31mauto\x1b[0m\x1b[2m" : " · ask";
-      process.stdout.write(`\x1b[2m${model}${routeTag(model) ? `@${routeTag(model)}` : ""}${modeTag} · ~${agent.contextTokens()} tok\x1b[0m\n`);
+      // Minimal pre-prompt line: just the context size. Show plan/auto (a safety signal — tools run
+      // without asking in auto) but not the default "ask", and not model@provider (it's in the header).
+      const modeTag = mode === "plan" ? "\x1b[33mplan\x1b[0m\x1b[2m · " : mode === "auto" ? "\x1b[31mauto\x1b[0m\x1b[2m · " : "";
+      process.stdout.write(`\x1b[2m${modeTag}~${agent.contextTokens()} tok\x1b[0m\n`);
     }
     let line: string;
     try {
@@ -1823,24 +1851,23 @@ async function main(): Promise<void> {
     track("turn", { model });
     const imgs = pendingImages.length ? pendingImages.slice() : undefined;
     pendingImages.length = 0;
-    process.stdout.write("\n\x1b[38;5;214m◆\x1b[0m \x1b[1mada\x1b[0m\n");
+    process.stdout.write("\n");
+    const stopSpin = thinkingSpinner(); // show a live "thinking…" indicator until the first output
+    let replyOpened = false;
+    const openReply = (): void => {
+      if (replyOpened) return;
+      replyOpened = true;
+      stopSpin();
+      process.stdout.write("\x1b[38;5;214m◆\x1b[0m  "); // reply streams inline right after the bullet (no "ada" label)
+    };
     try {
-      await agent.send(toSend, { signal: abort.signal, steer, images: imgs });
-      // Ground truth: if the upstream reported serving a DIFFERENT model than requested (alias ids,
-      // e.g. OpenRouter's `~family`, resolve server-side), say so once — not every turn. Compare
-      // against the id the backend actually forwarded: it strips the `groq/…`/`together/…`/`copilot/…`
-      // routing prefix, so the upstream echoes the bare id (which is not a real substitution).
-      const served = agent.served();
-      const forwarded = model.startsWith(`${route(model)}/`) ? model.slice(route(model).length + 1) : model;
-      if (served && served !== model && served !== forwarded && served !== lastServedNote) {
-        lastServedNote = served;
-        console.log(`\x1b[2m↳ served by ${served}\x1b[0m`);
-      }
+      await agent.send(toSend, { signal: abort.signal, steer, images: imgs, onReplyStart: openReply });
       if (!abort.signal.aborted && Date.now() - turnStart > 8000) notify("ada", "task complete");
     } catch (e) {
       track("error", { message: e instanceof Error ? e.message : String(e) });
       console.error(`\n[error] ${e instanceof Error ? e.message : e}`);
     } finally {
+      stopSpin(); // clear the spinner if the turn ended before any output (e.g. interrupted)
       if (stdin.isTTY) rawOff(rl, onData);
       turn = null;
     }
