@@ -39,6 +39,7 @@ export class Tui {
   private word = WORDS[0]!;
   private thinkTimer: ReturnType<typeof setInterval> | null = null;
   private thinking = false;
+  private thinkStart = 0; // ms epoch when the current turn began thinking — for the live elapsed timer
 
   private lineResolve: ((s: string | null) => void) | null = null;
   private confirmResolve: ((s: "yes" | "all" | "no") => void) | null = null;
@@ -129,6 +130,7 @@ export class Tui {
 
   private startThinking(): void {
     this.thinking = true;
+    this.thinkStart = Date.now();
     this.word = WORDS[Math.floor(Math.random() * WORDS.length)]!;
     this.renderThinking();
     this.thinkTimer = setInterval(() => {
@@ -139,8 +141,9 @@ export class Tui {
   }
 
   private renderThinking(): void {
-    const tail = this.status ? `  ${DIM}${this.status} · esc to interrupt${RST}` : `  ${DIM}esc to interrupt${RST}`;
-    stdout.write(`\r\x1b[2K${GOLD}${SPIN[this.spin]}${RST} ${DIM}${this.word}…${RST}${tail}`);
+    const secs = Math.floor((Date.now() - this.thinkStart) / 1000); // live elapsed timer (design mockup)
+    const meta = this.status ? `${this.status} · ${secs}s · esc to interrupt` : `${secs}s · esc to interrupt`;
+    stdout.write(`\r\x1b[2K${GOLD}${SPIN[this.spin]}${RST} ${DIM}${this.word}…${RST}  ${DIM}(${meta})${RST}`);
   }
 
   private stopThinking(): void {

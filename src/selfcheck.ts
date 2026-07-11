@@ -23,7 +23,9 @@ import * as checkpoint from "./client/checkpoint.ts";
 import { renderTodos, setTodos } from "./client/todos.ts";
 import { deleteCredential, getCredential, setCredential } from "./server/credentials.ts";
 import { isAllowed } from "./server/identity.ts";
+import { popularModels } from "./client/models.ts";
 import { route } from "./server/router.ts";
+import { providerStatus } from "./server/config.ts";
 
 function tool(name: string) {
   const t = toolByName.get(name);
@@ -687,6 +689,40 @@ async function main(): Promise<void> {
   assert.ok(isAllowed("alice"));
   assert.ok(!isAllowed("carol"), "off-allowlist user rejected");
   delete process.env.ADA_ALLOWED_USERS;
+
+  // --- popular-model picker: newest per family, deduped, valid ids only ---
+  {
+    const live = [
+      "anthropic/claude-opus-4.1-20240229", "anthropic/claude-opus-4.8", "x-ai/grok-2-1212", "x-ai/grok-4",
+      "qwen/qwen-2.5-72b-instruct", "qwen/qwen3-235b", "moonshotai/kimi-k2", "deepseek/deepseek-chat",
+      "google/gemini-2.0-flash", "openai/gpt-4o", "meta-llama/llama-3.1-70b",
+    ];
+    const pop = popularModels(live);
+    const byLabel = Object.fromEntries(pop.map((p) => [p.label, p.id]));
+    assert.equal(byLabel["Claude Opus"], "anthropic/claude-opus-4.8", "newest Opus: 4.8 beats the date-stamped 4.1");
+    assert.equal(byLabel["Grok"], "x-ai/grok-4", "picks grok-4 over grok-2-1212");
+    assert.equal(byLabel["Qwen"], "qwen/qwen3-235b", "picks qwen3 over qwen-2.5 despite the naming mismatch");
+    assert.ok(pop.every((p) => live.includes(p.id)), "every featured id is a real live id");
+    assert.equal(new Set(pop.map((p) => p.id)).size, pop.length, "no duplicate ids");
+    assert.equal(popularModels(["ollama/llama3.2", "codellama"]).length, 0, "no popular families in a llama-only local list");
+    assert.equal(popularModels(["qwen2.5-coder:7b"]).length, 1, "a local qwen is still featured");
+    // prefer a concrete pinned id over an alias (~vendor/model, …-latest) — the tilde/latest forms
+    // resolve server-side and caused the original "kimi answers as Claude" confusion.
+    const withAlias = popularModels(["~anthropic/claude-opus-latest", "anthropic/claude-opus-4.8"]);
+    assert.equal(withAlias[0]!.id, "anthropic/claude-opus-4.8", "concrete id beats the ~…-latest alias");
+    assert.equal(popularModels(["~moonshotai/kimi-latest"])[0]!.id, "~moonshotai/kimi-latest", "alias still featured when it's the only match");
+  }
+
+  // --- provider status (the /v1/providers truth) ---
+  {
+    const st = providerStatus();
+    const by = Object.fromEntries(st.map((s) => [s.name, s]));
+    assert.equal(by.ollama!.source, "keyless", "ollama is keyless");
+    assert.ok(by.ollama!.configured, "keyless counts as configured");
+    for (const s of st) assert.equal(s.configured, s.source !== "none", "configured ⇔ has a source");
+    assert.equal(route("~moonshotai/kimi-latest"), "openrouter", "alias ids with / still route to openrouter");
+    assert.equal(route("claude-opus-4-8"), "anthropic");
+  }
 
   console.log("selfcheck OK");
   process.exit(0); // a spawned stub MCP subprocess can hold stdin open — exit cleanly

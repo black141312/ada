@@ -4,13 +4,40 @@
 
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { PORT, PROVIDERS, clientKeys, configuredProviders, isConfigured } from "./config.ts";
+import { PORT, PROVIDERS, clientKeys, configuredProviders, isConfigured, providerStatus } from "./config.ts";
 import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, createSeat, disableSeat, disableSeatByExternalId, enterpriseMode, extractLastUsage, identifySeat, listSeats, loadPolicy, modelAllowed, savePolicy, upsertSeatForSSO, usageSummary, validatePolicy } from "./enterprise.ts";
 import { allowedUsers, isAllowed, verifyIdentity } from "./identity.ts";
-import { auth, verifyBetterAuth } from "./auth.ts";
+import { auth, betterAuthEnabled, verifyBetterAuth } from "./auth.ts";
 import { toNodeHandler } from "better-auth/node";
 
 const betterAuthHandler = toNodeHandler(auth);
+
+// Minimal approval page for the CLI device flow: sign in (if needed) → approve the code.
+const DEVICE_PAGE = `<!doctype html><meta charset="utf-8"><title>ada — device sign-in</title>
+<body style="font-family:system-ui;background:#0d0f12;color:#c5cdd6;display:flex;justify-content:center;padding-top:12vh">
+<div style="width:320px">
+<h2 style="color:#fff">ada device sign-in</h2>
+<div id="signin">
+  <p style="font-size:13px;opacity:.7">Sign in to approve the device.</p>
+  <input id="em" placeholder="email" style="width:100%;padding:8px;margin:4px 0;border-radius:6px;border:1px solid #2e353e;background:#12151a;color:inherit">
+  <input id="pw" type="password" placeholder="password" style="width:100%;padding:8px;margin:4px 0;border-radius:6px;border:1px solid #2e353e;background:#12151a;color:inherit">
+  <button id="si" style="width:100%;padding:8px;margin-top:6px;border-radius:6px;border:0;background:#9da5b0;color:#0d0f12;font-weight:600;cursor:pointer">Sign in</button>
+</div>
+<div id="approve" style="display:none">
+  <p style="font-size:13px;opacity:.7">Enter the code shown in your terminal.</p>
+  <input id="code" placeholder="code" style="width:100%;padding:8px;margin:4px 0;border-radius:6px;border:1px solid #2e353e;background:#12151a;color:inherit;text-transform:uppercase">
+  <button id="ap" style="width:100%;padding:8px;margin-top:6px;border-radius:6px;border:0;background:#9da5b0;color:#0d0f12;font-weight:600;cursor:pointer">Approve device</button>
+</div>
+<p id="msg" style="font-size:13px;min-height:18px"></p>
+<script>
+const q=(s)=>document.querySelector(s); const msg=(t,ok)=>{q('#msg').textContent=t;q('#msg').style.color=ok?'#3ecf8e':'#ff6b6b'};
+const code=new URLSearchParams(location.search).get('user_code'); if(code) q('#code').value=code;
+async function session(){try{const r=await fetch('/api/auth/get-session');const j=await r.json();return j&&j.user}catch{return null}}
+async function refresh(){const u=await session(); q('#signin').style.display=u?'none':'block'; q('#approve').style.display=u?'block':'none'; if(u) msg('Signed in as '+u.email,true);}
+q('#si').onclick=async()=>{const r=await fetch('/api/auth/sign-in/email',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:q('#em').value,password:q('#pw').value})}); if(r.ok){await refresh()}else msg('sign-in failed',false);};
+q('#ap').onclick=async()=>{const uc=q('#code').value.trim(); await fetch('/api/auth/device?user_code='+encodeURIComponent(uc)); const r=await fetch('/api/auth/device/approve',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userCode:uc})}); if(r.ok){msg('Device approved — return to your terminal.',true)}else{const j=await r.json().catch(()=>({}));msg('approve failed: '+(j.message||r.status),false)}};
+refresh();
+</script></div>`;
 import { assertOidcConfig, discover, isProvisionAllowed, mapIdentityToSeatFields, oidcConfig, oidcEnabled, verifyOidcToken } from "./oidc.ts";
 import { adapterFor } from "./providers/registry.ts";
 import { route } from "./router.ts";
@@ -27,7 +54,7 @@ function readBody(req: IncomingMessage): Promise<string> {
 function locked(): boolean {
   // OIDC must lock the backend the instant ADA_OIDC_ISSUER is set — BEFORE any seat exists — else a
   // fresh SSO deployment with zero seats would fall through identify() to dev-open.
-  return enterpriseMode() || clientKeys() !== null || allowedUsers() !== null || oidcEnabled() || !!process.env.ADA_REQUIRE_LOGIN;
+  return enterpriseMode() || clientKeys() !== null || allowedUsers() !== null || oidcEnabled() || betterAuthEnabled() || !!process.env.ADA_REQUIRE_LOGIN;
 }
 
 /** Resolve a request to WHO is making it. Order: seat key / ADA_ADMIN_KEY (enterprise), legacy
@@ -46,6 +73,10 @@ async function identify(req: IncomingMessage): Promise<Identity | "corrupt" | nu
       throw e;
     }
     if (seat) return seat;
+    // Dev-open backend (nothing configured): everyone is "dev". Return NOW — before any GitHub/Google/
+    // BetterAuth verification. Those are for LOCKED backends only; running them for a `dev` token just
+    // to attribute an open backend is pointless and (on a slow/unreachable network) hangs the request.
+    if (!locked()) return { user: "dev", role: "dev" };
     // Legacy ADA_CLIENT_KEYS are NOT honored once seats/admin-key exist — enterprise supersedes them,
     // so a disabled seat can't be resurrected via a still-configured shared key. They're ALSO refused
     // whenever OIDC is the org's IdP (single identity authority) — else a still-set shared key would
@@ -58,8 +89,15 @@ async function identify(req: IncomingMessage): Promise<Identity | "corrupt" | nu
       const id = await verifyIdentity(token); // GitHub / Google login
       if (id && isAllowed(id.user)) return { user: id.user, role: "dev" };
     }
-    // Better Auth session token or API key (accounts served at /api/auth/*)
-    if (await verifyBetterAuth(token)) return { user: "account", role: "dev" };
+    // Better Auth session token (accounts served at /api/auth/*) — attributed to the real user.
+    // GATED on betterAuthEnabled(): the /api/auth/* signup route is always mounted (pre-auth) with
+    // emailAndPassword on, so honoring these tokens unconditionally would let anyone self-register an
+    // account and bypass a backend locked by seats / admin key / ADA_CLIENT_KEYS / allowlist / OIDC.
+    // Accounts are a valid credential only when Better Auth is the intended gate. Allowlist applies too.
+    if (betterAuthEnabled()) {
+      const acct = await verifyBetterAuth(token);
+      if (acct && isAllowed(acct)) return { user: acct, role: "dev" };
+    }
   }
   return locked() ? null : { user: "dev", role: "dev" }; // dev mode: open
 }
@@ -258,6 +296,11 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/v1/auth/oidc/exchange") return await handleOidcExchange(req, res);
     // Better Auth: accounts, sessions, social login, API keys, device flow.
     if (url.pathname.startsWith("/api/auth")) return betterAuthHandler(req, res);
+    // Device-flow approval page (the verification_uri the CLI prints).
+    if (req.method === "GET" && url.pathname === "/device") {
+      res.writeHead(200, { "content-type": "text/html" });
+      return res.end(DEVICE_PAGE);
+    }
 
     const who = await identify(req);
     if (who === "corrupt") return json(res, 503, { error: { message: "auth store unreadable — refusing all requests (fail-closed). Fix ~/.ada/server/users.json." } });
@@ -268,6 +311,16 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "GET" && url.pathname === "/v1/models") {
       return await handleModels(res);
+    }
+    if (req.method === "GET" && url.pathname === "/v1/providers") {
+      // Which services this backend can route to, and how each is configured. Ollama is keyless so
+      // "configured" says nothing — probe it (fast, localhost) so clients can show "not running".
+      const list: Array<Record<string, unknown>> = providerStatus();
+      const o = list.find((p) => p.name === "ollama");
+      if (o) {
+        o.reachable = await fetch(`${PROVIDERS.ollama.baseURL}/models`, { signal: AbortSignal.timeout(700) }).then((r) => r.ok, () => false);
+      }
+      return json(res, 200, { providers: list });
     }
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
       return await handleChat(req, res, who);

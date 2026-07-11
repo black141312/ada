@@ -27,7 +27,9 @@ import { notify, readClipboard, readClipboardImage } from "./platform.ts";
 import { undoAll } from "./checkpoint.ts";
 import { restore as restoreSnapshot, snapshot } from "./snapshot.ts";
 import { catalogText, prefetch } from "./models-dev.ts";
-import { ensureBackend } from "./autostart.ts";
+import { ensureBackend, isLocalBackend } from "./autostart.ts";
+import { popularModels } from "./models.ts";
+import { route } from "../server/router.ts"; // pure model-id → provider mapping (static table, safe client-side)
 import { renderJobs, startJob } from "./background.ts";
 import { renderTodos } from "./todos.ts";
 import { track } from "./telemetry.ts";
@@ -37,6 +39,12 @@ type RL = ReturnType<typeof createInterface>;
 
 // Which backend the client talks to: env wins, then a saved /connect setting, then local default.
 const BACKEND = process.env.ADA_BACKEND_URL ?? loadSettings(false).backendUrl ?? "http://localhost:8787/v1";
+// The client's route() table is only authoritative for a LOCAL, same-version backend (the one we
+// autostart). Against a remote/custom backend the provider is the backend's business — we must not
+// assert "@provider" as fact. So provider tags are shown only when the backend is local.
+const LOCAL_BACKEND = isLocalBackend(BACKEND);
+/** route(m) as a display tag — empty for remote backends, where our static table may not match. */
+const routeTag = (m: string): string => (LOCAL_BACKEND ? route(m) : "");
 
 /** A stored login credential, sent as the bearer so the backend can identify us. An OIDC SSO seat
  *  key (ada_sk_…) wins — it's a durable, server-minted, disableable bearer (see oidcLogin). A seat
@@ -142,11 +150,62 @@ function fuzzyPick(query: string, ids: string[]): string | null {
   return null;
 }
 
-async function fetchModelIds(client: OpenAI): Promise<string[]> {
+async function fetchModelIds(client: OpenAI, timeoutMs?: number): Promise<string[]> {
   const ids: string[] = [];
-  const res = await client.models.list();
+  const res = await client.models.list(timeoutMs ? { timeout: timeoutMs } : undefined); // bound best-effort calls (maxRetries is 0, so no retry multiplication)
   for await (const m of res) ids.push(m.id);
   return ids.sort();
+}
+
+interface ProviderInfo {
+  name: string;
+  configured: boolean;
+  source: "env" | "key" | "keyless" | "none";
+  reachable?: boolean;
+}
+
+/** What services the backend can actually route to (GET /v1/providers). Null if it can't say. */
+async function fetchProviders(): Promise<ProviderInfo[] | null> {
+  try {
+    const r = await fetch(`${BACKEND}/providers`, { headers: { authorization: `Bearer ${clientKey()}` }, signal: AbortSignal.timeout(3000) });
+    if (!r.ok) return null;
+    return ((await r.json()) as { providers?: ProviderInfo[] }).providers ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** One dim line of truth: which services the BACKEND can route to. e.g. "services: openrouter ✓ ·
+ *  ollama ✗ not running". For a remote backend we qualify the wording — the facts describe the
+ *  backend host, not the user's machine, and local /connect can't change a remote backend. */
+function servicesLine(provs: ProviderInfo[]): string {
+  const parts: string[] = [];
+  for (const p of provs) {
+    if (p.name === "ollama") {
+      const down = LOCAL_BACKEND ? "not running" : "not reachable from backend";
+      parts.push(p.reachable ? "ollama \x1b[32m✓\x1b[0m\x1b[2m" : `ollama \x1b[31m✗\x1b[0m\x1b[2m ${down}`);
+    } else if (p.configured) {
+      parts.push(`${p.name} \x1b[32m✓\x1b[0m\x1b[2m${p.source === "env" ? " (env)" : ""}`);
+    }
+  }
+  const more = provs.filter((p) => !p.configured && p.name !== "ollama").length;
+  if (more) parts.push(LOCAL_BACKEND ? `+${more} connectable · \x1b[36m/connect\x1b[0m\x1b[2m` : `+${more} connectable on the backend`);
+  return `\x1b[2mservices: ${parts.join(" · ")}\x1b[0m`;
+}
+
+/** Render labeled rows inside a rounded box, accent labels aligned in a shared column. Rows longer
+ *  than the terminal width are truncated with … so the right border always aligns (matching the
+ *  design mockup, which horizontally clips a too-wide line rather than wrapping it). */
+function boxedRows(rows: Array<{ label: string; body: string }>): string[] {
+  const ACCENT = "\x1b[38;5;214m", DIM = "\x1b[2m", R = "\x1b[0m";
+  const labelW = Math.max(...rows.map((r) => r.label.length));
+  const plain = rows.map((r) => `${r.label.padEnd(labelW)}  ${r.body}`); // uncolored, for width/truncation math
+  const inner = Math.min(Math.max(...plain.map((p) => p.length)), Math.max(48, stdout.columns || 100) - 4);
+  const mid = plain.map((p) => {
+    const fit = p.length > inner ? `${p.slice(0, inner - 1)}…` : p.padEnd(inner);
+    return `${DIM}│${R} ${ACCENT}${fit.slice(0, labelW)}${R}${fit.slice(labelW)} ${DIM}│${R}`; // accent the label span
+  });
+  return [`${DIM}╭${"─".repeat(inner + 2)}╮${R}`, ...mid, `${DIM}╰${"─".repeat(inner + 2)}╯${R}`];
 }
 
 function reportModelsError(e: unknown): void {
@@ -165,15 +224,8 @@ async function printModels(client: OpenAI): Promise<void> {
   }
 }
 
-async function pickModel(client: OpenAI, rl: RL): Promise<string> {
-  console.log("Fetching available models…");
-  let ids: string[] = [];
-  try {
-    ids = await fetchModelIds(client);
-  } catch (e) {
-    reportModelsError(e);
-  }
-  if (!ids.length) return (await rl.question("Enter a model id: ")).trim();
+/** Full-list fallback: arrow-select the first 40 ids (TTY) or a numbered list, or type an id. */
+async function pickFromAll(ids: string[], rl: RL): Promise<string> {
   const shown = ids.slice(0, 40);
   if (stdin.isTTY) {
     const choice = await select(rl, "Select a model  (↑/↓ · Enter · Esc to type an id):", shown);
@@ -185,6 +237,62 @@ async function pickModel(client: OpenAI, rl: RL): Promise<string> {
   const n = Number(a);
   if (Number.isInteger(n) && n >= 1 && n <= ids.length) return ids[n - 1]!;
   return fuzzyPick(a, ids) ?? a;
+}
+
+async function pickModel(client: OpenAI, rl: RL, preIds?: string[]): Promise<string> {
+  let ids = preIds;
+  if (!ids) {
+    console.log("Fetching available models…");
+    try {
+      ids = await fetchModelIds(client);
+    } catch (e) {
+      reportModelsError(e);
+      ids = [];
+    }
+  }
+  if (!ids.length) return (await rl.question("Enter a model id: ")).trim();
+
+  // Lead with a curated shortlist of popular models (newest per family) — easier than scrolling the
+  // full OpenRouter list. Plus an escape to type any id, and to browse everything.
+  const pop = popularModels(ids);
+  if (pop.length && stdin.isTTY) {
+    const ENTER = "\x1b[36m✎ enter a model id…\x1b[0m";
+    const ALL = `\x1b[36m▸ browse all ${ids.length} models…\x1b[0m`;
+    const items = [...pop.map((p) => `${p.label.padEnd(13)} \x1b[2m${p.id}\x1b[0m`), ENTER, ...(ids.length > pop.length ? [ALL] : [])];
+    const i = await select(rl, "Popular models  (↑/↓ · Enter · Esc to type an id):", items);
+    if (i === null || items[i] === ENTER) return (await rl.question("model id: ")).trim();
+    if (items[i] === ALL) return pickFromAll(ids, rl);
+    return pop[i]!.id;
+  }
+  return pickFromAll(ids, rl);
+}
+
+/** Resolve a model at interactive startup. If none are reachable (Ollama down, no provider key), we
+ *  DON'T show the "enter a model id" prompt — we offer to /connect a provider instead of dead-ending,
+ *  then re-check. Returns "" if the user declines or still has nothing (caller exits cleanly). */
+async function resolveModel(client: OpenAI, rl: RL): Promise<string> {
+  // Distinguish "backend answered with an empty list" (→ offer /connect) from "backend threw"
+  // (unreachable / 401). A local provider key can't fix a down or remote backend, so on a throw we
+  // report the real cause instead of steering into /connect.
+  let ids: string[];
+  try {
+    ids = await fetchModelIds(client);
+  } catch (e) {
+    reportModelsError(e);
+    return "";
+  }
+  if (!ids.length) {
+    console.log("\x1b[33mNo model is reachable yet.\x1b[0m Run local models with `ollama serve`, or connect a hosted provider.");
+    const ans = (await rl.question("Connect a provider now (OpenRouter, etc.)? [Y/n] ")).trim().toLowerCase();
+    if (ans === "n" || ans === "no") return "";
+    await connectCommand(rl); // a provider key takes effect immediately — the backend re-reads creds
+    ids = await fetchModelIds(client).catch(() => [] as string[]);
+    if (!ids.length) {
+      console.log("Still no model — start Ollama or finish /connect, then run ada again.");
+      return "";
+    }
+  }
+  return pickModel(client, rl, ids); // pass the ids we already have — no re-fetch, no extra prompt
 }
 
 async function pickSession(rl: RL): Promise<string | null> {
@@ -402,8 +510,46 @@ async function oidcLogin(): Promise<boolean> {
   }
 }
 
+/** Better Auth account login — device flow served by the ada backend itself (no external IdP).
+ *  The session token is stored under the "oidc" credential so clientKey() picks it up exactly
+ *  like a seat key, with zero extra wiring. */
+async function accountLogin(): Promise<boolean> {
+  const origin = BACKEND.replace(/\/v1\/?$/, "");
+  try {
+    const r = await fetch(`${origin}/api/auth/device/code`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_id: "ada-cli" }),
+    });
+    if (!r.ok) throw new Error(`device/code HTTP ${r.status}`);
+    const d = (await r.json()) as { device_code: string; user_code: string; verification_uri: string; verification_uri_complete?: string; interval?: number; expires_in?: number };
+    console.log(`Open ${origin}${d.verification_uri_complete ?? d.verification_uri} and enter code: ${d.user_code}`);
+    const deadline = Date.now() + (d.expires_in ?? 600) * 1000;
+    let interval = (d.interval ?? 5) * 1000;
+    while (Date.now() < deadline) {
+      await new Promise((res) => setTimeout(res, interval));
+      const t = await fetch(`${origin}/api/auth/device/token`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code: d.device_code, client_id: "ada-cli" }),
+      });
+      const j = (await t.json().catch(() => ({}))) as { access_token?: string; error?: string };
+      if (j.access_token) {
+        await setCredential("oidc", { type: "oauth", key: j.access_token });
+        console.log("Logged in — account session stored.");
+        return true;
+      }
+      if (j.error === "slow_down") interval += 5000;
+      else if (j.error && j.error !== "authorization_pending") throw new Error(j.error);
+    }
+    throw new Error("device code expired");
+  } catch (e) {
+    console.error(`account login failed: ${e instanceof Error ? e.message : e}`);
+    return false;
+  }
+}
+
 /** Run the device flow for `provider`; returns true on success (credential stored). */
 async function loginFlow(provider: string): Promise<boolean> {
+  if (provider === "account" || provider === "email") return accountLogin();
   if (provider === "oidc" || provider === "sso") return oidcLogin();
   const cfg = oauthConfig(provider);
   if (!cfg) {
@@ -455,7 +601,7 @@ async function applyOrgPolicy(): Promise<void> {
 async function ensureAuth(rl: RL, client: OpenAI): Promise<OpenAI> {
   let status: number;
   try {
-    const r = await fetch(`${BACKEND}/whoami`, { headers: { authorization: `Bearer ${clientKey()}` } });
+    const r = await fetch(`${BACKEND}/whoami`, { headers: { authorization: `Bearer ${clientKey()}` }, signal: AbortSignal.timeout(3000) });
     status = r.status;
   } catch {
     return client; // backend unreachable — the model fetch will report it
@@ -501,7 +647,12 @@ async function connectCommand(rl: RL, arg?: string): Promise<void> {
     console.log(`unknown target "${arg}". Run /connect for the menu, or pass a provider name or a backend URL.`);
     return;
   }
-  const items = [...CONNECTABLE.map((p) => `${p}${getCredential(p)?.key ? "  \x1b[2m✓ connected\x1b[0m" : ""}`), "custom backend / Cloudflare Worker URL…"];
+  // Connected-state from the BACKEND's point of view (it holds the keys). Local credentials are only
+  // a meaningful fallback for a LOCAL backend — against a remote one they don't reflect its keys, so
+  // we don't claim "✓ connected" from them (would be a false positive).
+  const backendProvs = await fetchProviders();
+  const connected = (p: string): boolean => (backendProvs ? !!backendProvs.find((b) => b.name === p)?.configured : LOCAL_BACKEND && !!getCredential(p)?.key);
+  const items = [...CONNECTABLE.map((p) => `${p}${connected(p) ? "  \x1b[2m✓ connected\x1b[0m" : ""}`), "custom backend / Cloudflare Worker URL…"];
   const i = await select(rl, "Connect ada to:", items);
   if (i == null) return;
   return i < CONNECTABLE.length ? connectProvider(rl, CONNECTABLE[i]!) : connectBackend(rl);
@@ -1283,11 +1434,12 @@ async function main(): Promise<void> {
 
   let model = flags.model ?? process.env.ADA_MODEL ?? settings.model ?? scoped[0] ?? "";
   if (!model) {
-    model = await pickModel(client, rl);
-    if (!model) {
-      rl.close();
-      return;
-    }
+    model = await resolveModel(client, rl);
+    if (model) setGlobal({ model }); // remember the pick — so next launch boots straight to chat, not the picker
+  }
+  if (!model) {
+    rl.close();
+    return;
   }
 
   const autoApprove = !!flags.yolo || process.env.ADA_AUTO_APPROVE === "1" || !!settings.autoApprove;
@@ -1414,20 +1566,26 @@ async function main(): Promise<void> {
     return;
   }
 
-  console.log(`\nada — model ${model} via ${BACKEND}`);
-  console.log("commands: /model [id]  /models  /next  /reasoning [low|medium|high|off]  /compact  /context  /exit");
-  console.log("          \x1b[1mmode:\x1b[0m /ask /plan /auto (or /mode to cycle)  ·  /run  /fork  /tree  /rewind  /undo  /todos  /cost  /image  /paste");
+  console.log(`\nada — model ${model} ${routeTag(model) ? `\x1b[2m→ ${routeTag(model)}\x1b[0m ` : ""}via ${BACKEND}`);
+  {
+    const provs = await fetchProviders();
+    if (provs) console.log(servicesLine(provs));
+  }
+  for (const line of boxedRows([
+    { label: "commands", body: "/model [id]  /models  /next  /reasoning [low|medium|high|off]  /compact  /context  /exit" },
+    { label: "mode", body: "/ask /plan /auto  (/mode to cycle)  ·  /run  /fork  /tree  /rewind  /undo  /todos  /cost  /image  /paste" },
+  ])) console.log(line);
   if (prompts.size) console.log(`prompt templates: ${[...prompts.keys()].map((k) => `/${k}`).join("  ")}`);
   if (exts.length) console.log(`extensions: ${exts.join("  ")}`);
-  if (skills.length) console.log(`skills: ${skills.map((s) => s.name).join("  ")}`);
   if (mcp.length) console.log(`mcp: ${mcp.join("  ")}`);
   console.log("\x1b[2mduring a turn: Esc/Ctrl+C = interrupt · type + Enter = steer\x1b[0m\n");
 
   const pendingImages: string[] = []; // images attached via /image or /paste, sent with the next message
+  let lastServedNote = ""; // last "↳ served by" we printed, so alias resolution is announced once
   for (;;) {
     if (stdin.isTTY) {
       const modeTag = mode === "plan" ? " · \x1b[33mplan\x1b[0m\x1b[2m" : mode === "auto" ? " · \x1b[31mauto\x1b[0m\x1b[2m" : " · ask";
-      process.stdout.write(`\x1b[2m${model}${modeTag} · ~${agent.contextTokens()} tok\x1b[0m\n`);
+      process.stdout.write(`\x1b[2m${model}${routeTag(model) ? `@${routeTag(model)}` : ""}${modeTag} · ~${agent.contextTokens()} tok\x1b[0m\n`);
     }
     let line: string;
     try {
@@ -1521,12 +1679,25 @@ async function main(): Promise<void> {
     }
     if (line === "/model" || line.startsWith("/model ")) {
       const id = line.slice("/model".length).trim();
-      if (id) {
-        agent.setModel(id);
-        model = id;
-        console.log(`model → ${id}`);
-      } else {
-        console.log(`current model: ${model}`);
+      const next = id || (await pickModel(client, rl)); // bare /model opens the picker; /model <id> sets directly
+      if (next && next !== model) {
+        if (id) {
+          // A hand-typed id that isn't in the backend's list is usually a typo — warn with the closest
+          // real id, but still allow it (some upstreams accept ids the list doesn't show, e.g.
+          // OpenRouter's `~family`). Bound the lookup (3s) so a slow provider can't stall a switch,
+          // and accept the documented `groq/…`, `together/…`, `copilot/…` prefixes (upstream lists
+          // are bare — the adapter strips the prefix before forwarding).
+          const ids = await fetchModelIds(client, 3000).catch(() => [] as string[]);
+          const bare = next.startsWith(`${route(next)}/`) ? next.slice(route(next).length + 1) : next;
+          if (ids.length && !ids.includes(next) && !ids.includes(bare)) {
+            const close = fuzzyPick(bare.replace(/^~/, ""), ids);
+            console.log(`\x1b[33m⚠ '${next}' isn't in the backend's model list${close ? ` — did you mean ${close}?` : ""} (sending anyway)\x1b[0m`);
+          }
+        }
+        agent.setModel(next);
+        model = next;
+        setGlobal({ model: next }); // persist — ada remembers your last model across launches
+        console.log(`model → ${next}${routeTag(next) ? ` \x1b[2m(${routeTag(next)})\x1b[0m` : ""}`);
       }
       continue;
     }
@@ -1534,7 +1705,7 @@ async function main(): Promise<void> {
       if (scoped.length) {
         model = scoped[(scoped.indexOf(model) + 1) % scoped.length]!;
         agent.setModel(model);
-        console.log(`model → ${model}`);
+        console.log(`model → ${model}${routeTag(model) ? ` \x1b[2m(${routeTag(model)})\x1b[0m` : ""}`);
       } else {
         console.log("no --models scope set (start with --models a,b,c)");
       }
@@ -1655,6 +1826,16 @@ async function main(): Promise<void> {
     process.stdout.write("\n\x1b[38;5;214m◆\x1b[0m \x1b[1mada\x1b[0m\n");
     try {
       await agent.send(toSend, { signal: abort.signal, steer, images: imgs });
+      // Ground truth: if the upstream reported serving a DIFFERENT model than requested (alias ids,
+      // e.g. OpenRouter's `~family`, resolve server-side), say so once — not every turn. Compare
+      // against the id the backend actually forwarded: it strips the `groq/…`/`together/…`/`copilot/…`
+      // routing prefix, so the upstream echoes the bare id (which is not a real substitution).
+      const served = agent.served();
+      const forwarded = model.startsWith(`${route(model)}/`) ? model.slice(route(model).length + 1) : model;
+      if (served && served !== model && served !== forwarded && served !== lastServedNote) {
+        lastServedNote = served;
+        console.log(`\x1b[2m↳ served by ${served}\x1b[0m`);
+      }
       if (!abort.signal.aborted && Date.now() - turnStart > 8000) notify("ada", "task complete");
     } catch (e) {
       track("error", { message: e instanceof Error ? e.message : String(e) });

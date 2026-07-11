@@ -25,13 +25,21 @@ export const auth = betterAuth({
   ],
 });
 
-/** True if the bearer token is a valid Better Auth session token. (Long-lived seat
- *  keys stay on the native ada_sk_ system — no duplicate key store.) */
-export async function verifyBetterAuth(token: string): Promise<boolean> {
+/** Resolve a Better Auth session token to WHO it is (email, else user id), or null. Returning the
+ *  identity — not just a boolean — keeps per-user metering/audit intact for account logins. (Long-lived
+ *  seat keys stay on the native ada_sk_ system — no duplicate key store.) */
+export async function verifyBetterAuth(token: string): Promise<string | null> {
   try {
     const s = await auth.api.getSession({ headers: new Headers({ authorization: `Bearer ${token}` }) });
-    return !!s?.user;
+    return s?.user ? (s.user.email ?? s.user.id) : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+/** Whether Better Auth accounts GATE the backend. Opt-in via BETTER_AUTH_ENABLED — the /api/auth
+ *  routes are always mounted (so accounts can be created), but only this flag makes login REQUIRED
+ *  (adds to locked()), so turning on accounts can't leave the backend dev-open. */
+export function betterAuthEnabled(): boolean {
+  return process.env.BETTER_AUTH_ENABLED === "1" || process.env.BETTER_AUTH_ENABLED === "true";
 }

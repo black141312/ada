@@ -65,3 +65,13 @@ export function isConfigured(p: ProviderName): boolean {
 export function configuredProviders(): ProviderName[] {
   return (Object.keys(PROVIDERS) as ProviderName[]).filter(isConfigured);
 }
+
+/** Every provider + whether/how it's configured — the truth behind "what is ada connected to?".
+ *  source: env = key env var set · key = stored credential (/connect) · keyless = no key needed (Ollama). */
+export function providerStatus(): Array<{ name: ProviderName; configured: boolean; source: "env" | "key" | "keyless" | "none" }> {
+  return (Object.keys(PROVIDERS) as ProviderName[]).map((p) => {
+    const env = PROVIDERS[p].keyEnv;
+    const source = env === "" ? "keyless" : process.env[env] ? "env" : getCredential(p) ? "key" : p === "copilot" && process.env.COPILOT_GITHUB_TOKEN ? "env" : "none";
+    return { name: p, configured: source !== "none", source };
+  });
+}
