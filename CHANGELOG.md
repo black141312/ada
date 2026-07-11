@@ -4,6 +4,22 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.12.2] — 2026-07-11
+
+### Changed — REPL UI
+- **A live "thinking" indicator** in the default prompt (previously only under `--tui`): a spinner +
+  cycling verb + elapsed timer + `esc to interrupt`, cleared when the reply starts.
+- **Replies stream inline** after the `◆` bullet (no `ada` label): `◆  <reply>`.
+- **Tool approval is now an arrow-select list** — `Yes` · `Yes, and don't ask again this session` ·
+  `No` — collapsing to a one-line confirmation after you choose (Esc / Ctrl-C → No, fail-safe).
+- **Slimmer pre-prompt status line** — just `~N tok` (plus a `plan`/`auto` tag when in those modes);
+  the model/provider stay in the startup header.
+- Dropped the `↳ served by <model>` note (the status line already names the model).
+
+### Added — skill
+- **`render-diagram`** — draw a diagram inline in Unicode, or render mermaid to a self-contained HTML
+  file and open it in the browser (composes `write_file` + `bash`; no new dependency).
+
 ## [0.12.1] — 2026-07-11
 
 ### Security
