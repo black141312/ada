@@ -2,7 +2,7 @@
 // backend can use them as provider keys. Writes are atomic (temp + rename) and guarded by a
 // coarse cross-process lock (an atomically-created lock dir) so a token refresh can't race.
 
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -27,10 +27,18 @@ function read(): Store {
 }
 
 function write(s: Store): void {
-  mkdirSync(dirname(FILE), { recursive: true });
+  // Owner-only: this file holds raw provider API keys + OAuth tokens. writeFileSync's mode applies to
+  // the freshly-created tmp inode; chmodSync then guarantees 0600 even if credentials.json pre-existed
+  // with looser perms. (On Windows chmod only toggles read-only — POSIX/Docker is where this matters.)
+  mkdirSync(dirname(FILE), { recursive: true, mode: 0o700 });
   const tmp = `${FILE}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(s, null, 2), "utf8");
+  writeFileSync(tmp, JSON.stringify(s, null, 2), { encoding: "utf8", mode: 0o600 });
   renameSync(tmp, FILE); // atomic replace
+  try {
+    chmodSync(FILE, 0o600);
+  } catch {
+    /* best-effort */
+  }
 }
 
 async function withLock<T>(fn: () => T): Promise<T> {

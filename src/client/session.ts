@@ -8,7 +8,7 @@ const DIR = resolve(process.cwd(), ".ada", "sessions");
 export type StoredMessage = Record<string, unknown>;
 
 function ensureDir(): void {
-  mkdirSync(DIR, { recursive: true });
+  mkdirSync(DIR, { recursive: true, mode: 0o700 }); // transcripts can contain secrets from tool output
 }
 
 function newId(): string {
@@ -55,7 +55,7 @@ export class Session {
   append(msg: unknown): void {
     try {
       ensureDir();
-      appendFileSync(this.file, `${JSON.stringify(msg)}\n`, "utf8");
+      appendFileSync(this.file, `${JSON.stringify(msg)}\n`, { encoding: "utf8", mode: 0o600 });
     } catch {
       /* persistence is best-effort; never crash the agent over it */
     }

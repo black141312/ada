@@ -6,6 +6,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { registerTool } from "./tools.ts";
+import { scrubbedEnv } from "./secret-env.ts";
 
 interface RpcClient {
   call(method: string, params?: unknown): Promise<Record<string, unknown>>;
@@ -140,7 +141,9 @@ export async function loadMcpServers(includeProject: boolean): Promise<string[]>
       if (def.url) {
         rpc = makeHttpClient(def.url, def.headers ?? {});
       } else if (def.command) {
-        rpc = makeClient(spawn(def.command, def.args ?? [], { env: { ...process.env, ...def.env }, stdio: ["pipe", "pipe", "ignore"] }));
+        // Scrub ada's own secrets from the third-party server's env; keep the server's OWN configured
+        // creds (def.env) so it still works — but don't hand it every provider/admin/seat key.
+        rpc = makeClient(spawn(def.command, def.args ?? [], { env: scrubbedEnv(def.env), stdio: ["pipe", "pipe", "ignore"] }));
       } else {
         console.error(`mcp ${name}: needs a "command" (stdio) or "url" (http)`);
         continue;

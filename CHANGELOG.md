@@ -4,6 +4,27 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.12.3] — 2026-07-11
+
+### Security — credential-leak hardening
+Found by an adversarial multi-agent audit (loop-until-dry hunt → per-finding verification), then each
+fix confirmed by hand and re-reviewed.
+
+- **The `bash` tool no longer hands ada's secrets to the shell (CRITICAL).** It ran model-chosen
+  commands with the full `process.env`, so a prompt-injected model could `echo $OPENROUTER_API_KEY` /
+  `$ADA_ADMIN_KEY` / `$ADA_CLIENT_KEY` and exfiltrate the value in a tool result. The shell (and
+  third-party **MCP** servers) now get a scrubbed env: ada's provider/admin/seat keys + auth secret are
+  removed; `PATH`, `HOME`, and the user's own tool creds (`GITHUB_TOKEN`, …) pass through.
+- **`BETTER_AUTH_SECRET` dev default is refused when accounts are enabled.** The server now fails to
+  start if `BETTER_AUTH_ENABLED` is on and the secret is unset or left at the built-in dev value
+  (which shipped in the repo → forgeable sessions).
+- **Secret stores are written owner-only (`0600`).** `~/.ada/credentials.json` (provider keys + OAuth
+  tokens), the seat store `users.json` (full `ada_sk_` keys), `settings.json` (`backendKey`), and
+  session transcripts — previously world-readable, a risk on shared/Docker hosts. *(chmod is a no-op
+  on Windows; this hardens POSIX/Docker.)*
+- **Auto-memory secret gate** now also catches Google/Gemini `AIza…` keys and hyphenated `sk-ant-` /
+  `sk-or-` provider keys.
+
 ## [0.12.2] — 2026-07-11
 
 ### Changed — REPL UI

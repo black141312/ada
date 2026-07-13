@@ -1,7 +1,7 @@
 // Layered settings: global (~/.ada/settings.json) merged with project (.ada/settings.json),
 // project winning. Also the project-trust list — project files are only loaded for trusted dirs.
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -40,8 +40,15 @@ function readJson(p: string): Settings {
 
 function writeGlobal(s: Settings): void {
   try {
-    mkdirSync(dirname(GLOBAL), { recursive: true });
-    writeFileSync(GLOBAL, JSON.stringify(s, null, 2), "utf8");
+    // Owner-only: settings.json can hold `backendKey` (a seat/bearer key). This is an in-place write,
+    // so writeFileSync's mode is ignored for a pre-existing file — chmod explicitly to fix 0644 leftovers.
+    mkdirSync(dirname(GLOBAL), { recursive: true, mode: 0o700 });
+    writeFileSync(GLOBAL, JSON.stringify(s, null, 2), { encoding: "utf8", mode: 0o600 });
+    try {
+      chmodSync(GLOBAL, 0o600);
+    } catch {
+      /* best-effort (no-op on Windows) */
+    }
   } catch {
     /* best-effort */
   }

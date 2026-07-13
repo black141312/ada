@@ -66,9 +66,12 @@ const usageFile = (dir: string): string => join(dir, "usage.jsonl");
 const auditFile = (dir: string): string => join(dir, "audit.jsonl");
 
 function atomicWrite(file: string, data: string): void {
-  mkdirSync(join(file, ".."), { recursive: true });
+  // Owner-only: users.json holds full `ada_sk_` seat/admin keys (plaintext bearer secrets). The mode
+  // applies to the per-pid tmp inode and survives the rename. (Windows chmod is a no-op — this guards
+  // POSIX/Docker, e.g. the documented ADA_DATA_DIR `/data` volume.)
+  mkdirSync(join(file, ".."), { recursive: true, mode: 0o700 });
   const tmp = `${file}.tmp.${process.pid}`;
-  writeFileSync(tmp, data);
+  writeFileSync(tmp, data, { mode: 0o600 });
   renameSync(tmp, file); // atomic on the same filesystem — a crash can't leave a torn file
 }
 

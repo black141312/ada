@@ -2,6 +2,7 @@
 
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
+import { scrubbedEnv } from "./secret-env.ts";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { glob as fsGlob } from "node:fs/promises";
 import { dirname, extname, join, relative, resolve } from "node:path";
@@ -92,7 +93,7 @@ export function formatFile(abs: string): boolean {
   const fmt = FORMATTERS.find((f) => f.exts.includes(ext) && findBin(f.bin));
   if (!fmt) return false;
   try {
-    return spawnSync(findBin(fmt.bin)!, fmt.args(abs), { timeout: 10_000, encoding: "utf8", shell: process.platform === "win32" }).status === 0;
+    return spawnSync(findBin(fmt.bin)!, fmt.args(abs), { timeout: 10_000, encoding: "utf8", shell: process.platform === "win32", env: scrubbedEnv() }).status === 0;
   } catch {
     return false;
   }
@@ -127,7 +128,7 @@ function runPty(command: string, timeoutMs = 120_000): Promise<{ output: string;
     const win = process.platform === "win32";
     const shell = win ? process.env.COMSPEC ?? "cmd.exe" : process.env.SHELL ?? "/bin/bash";
     const shellArgs = win ? ["/c", command] : ["-lc", command];
-    const p = getPty()!.spawn(shell, shellArgs, { name: "xterm-256color", cols: 120, rows: 30, cwd: process.cwd(), env: process.env as Record<string, string> });
+    const p = getPty()!.spawn(shell, shellArgs, { name: "xterm-256color", cols: 120, rows: 30, cwd: process.cwd(), env: scrubbedEnv() });
     let out = "";
     const cap = 10 * 1024 * 1024;
     p.onData((d) => {
@@ -372,7 +373,7 @@ export const tools: Tool[] = [
         return { output: `exit ${code ?? "null"}\n${spillIfHuge(stripAnsi(output).trim() || "(no output)")}`, isError: code !== 0 };
       }
       // fallback: native PTY unavailable on this platform
-      const res = spawnSync(command, { shell: true, encoding: "utf8", timeout: 120_000, maxBuffer: 10 * 1024 * 1024, cwd: process.cwd() });
+      const res = spawnSync(command, { shell: true, encoding: "utf8", timeout: 120_000, maxBuffer: 10 * 1024 * 1024, cwd: process.cwd(), env: scrubbedEnv() });
       const out = [res.stdout, res.stderr].filter(Boolean).join("\n").trim() || "(no output)";
       return { output: `exit ${res.status ?? "null"}\n${spillIfHuge(out)}`, isError: res.status !== 0 };
     },
@@ -454,7 +455,7 @@ export const tools: Tool[] = [
         const rgArgs = ["--no-heading", "--line-number", "--color", "never"];
         if (args.ignore_case) rgArgs.push("-i");
         rgArgs.push("-e", pattern, searchPath);
-        const r = spawnSync(rg, rgArgs, { cwd: process.cwd(), encoding: "utf8", maxBuffer: 10 * 1024 * 1024, timeout: 30_000 });
+        const r = spawnSync(rg, rgArgs, { cwd: process.cwd(), encoding: "utf8", maxBuffer: 10 * 1024 * 1024, timeout: 30_000, env: scrubbedEnv() });
         if (r.status === 0 || r.status === 1) {
           // 0 = matches, 1 = no matches
           const out = (r.stdout || "").split("\n").filter(Boolean).slice(0, MAX);
