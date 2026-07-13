@@ -57,7 +57,8 @@ function newId(): string {
 
 // ---- secret gate (refuse-on-suspicion; runs on every write AND at load) ----
 const SECRET_RES: RegExp[] = [
-  /sk-[A-Za-z0-9]{16,}/, // OpenAI
+  /\bsk-[A-Za-z0-9-]{16,}/, // OpenAI / Anthropic (sk-ant-…) / OpenRouter (sk-or-…); \b so it can't start mid-word (disk-…, task-…)
+  /AIza[0-9A-Za-z_-]{35}/, // Google / Gemini API key
   /AKIA[0-9A-Z]{16}/, // AWS access key id
   /gh[opsu]_[A-Za-z0-9]{20,}/, // GitHub tokens
   /github_pat_[A-Za-z0-9_]{20,}/,

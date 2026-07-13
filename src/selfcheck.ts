@@ -467,6 +467,9 @@ async function main(): Promise<void> {
       assert.ok(mem.redactScan("the base commit is a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2").ok, "a plain hex sha is not flagged");
       assert.ok(!mem.redactScan("deploy token ZXCVBNM1234567890ASDFGHJKLQWERTY").ok, "two-class high-entropy key refused (was the gate bypass)");
       assert.ok(mem.redactScan("the auth handler is verifyBetterAuthSession").ok, "a long camelCase identifier is not flagged as a secret");
+      assert.ok(!mem.redactScan("gemini key AIzaSyA1234567890abcdefghijklmnopqrstuvwx").ok, "a Gemini AIza key is refused");
+      assert.ok(!mem.redactScan("anthropic sk-ant-api03-abcdefghijklmnopqrstuvwxyz012345").ok, "a hyphenated sk-ant key is refused");
+      assert.ok(mem.redactScan("the disk-usage-monitoring-dashboard and task-tracker-service-account are green").ok, "kebab-case identifiers are NOT flagged (sk- must be word-anchored)");
       assert.ok(!mem.rememberFact({ text: "the template marker is <!-- here -->" }).ok, "a comment marker in fact text is refused");
 
       // recall: relevant surfaces, off-topic injects nothing
@@ -722,6 +725,21 @@ async function main(): Promise<void> {
     for (const s of st) assert.equal(s.configured, s.source !== "none", "configured ⇔ has a source");
     assert.equal(route("~moonshotai/kimi-latest"), "openrouter", "alias ids with / still route to openrouter");
     assert.equal(route("claude-opus-4-8"), "anthropic");
+  }
+
+  // --- secret-env scrub (env handed to bash / MCP subprocesses) ---
+  {
+    const { isSecretEnvKey, scrubbedEnv } = await import("./client/secret-env.ts");
+    for (const k of ["OPENROUTER_API_KEY", "ADA_ADMIN_KEY", "ADA_CLIENT_KEY", "BETTER_AUTH_SECRET", "CLOUDFLARE_API_TOKEN", "GEMINI_API_KEY", "GITHUB_CLIENT_SECRET", "GOOGLE_CLIENT_SECRET"]) assert.ok(isSecretEnvKey(k), `${k} is a crown-jewel secret`);
+    for (const k of ["PATH", "HOME", "GITHUB_TOKEN", "AWS_REGION", "COMSPEC"]) assert.ok(!isSecretEnvKey(k), `${k} passes through (not ada's secret)`);
+    process.env.ZZ_API_KEY = "sekret";
+    process.env.ZZ_SAFE = "ok";
+    const e = scrubbedEnv();
+    assert.ok(!("ZZ_API_KEY" in e), "scrub removes a provider-shaped key");
+    assert.equal(e.ZZ_SAFE, "ok", "scrub keeps ordinary vars");
+    assert.equal(scrubbedEnv({ ZZ_API_KEY: "provided" }).ZZ_API_KEY, "provided", "explicitly-provided (MCP-own) creds survive the scrub");
+    delete process.env.ZZ_API_KEY;
+    delete process.env.ZZ_SAFE;
   }
 
   console.log("selfcheck OK");

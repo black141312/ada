@@ -13,9 +13,19 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
   socialProviders.google = { clientId: process.env.GOOGLE_CLIENT_ID, clientSecret: process.env.GOOGLE_CLIENT_SECRET };
 }
 
+// The signing/encryption secret. A dev fallback is fine ONLY while Better Auth is off (its tokens
+// aren't honored then). The instant accounts gate the backend, a real, non-default secret is REQUIRED
+// — else the constant that ships in this repo would let anyone forge sessions. Fail closed.
+const DEV_SECRET = "ada-dev-secret-change-in-production";
+const rawSecret = process.env.BETTER_AUTH_SECRET?.trim();
+const authSecret = rawSecret || DEV_SECRET; // truthiness, not ??: a blank/whitespace value also falls to the default so the guard below catches it
+if (betterAuthEnabled() && authSecret === DEV_SECRET) {
+  throw new Error("BETTER_AUTH_SECRET must be set to a strong, unique value when BETTER_AUTH_ENABLED is on (the built-in dev default is refused).");
+}
+
 export const auth = betterAuth({
   baseURL: process.env.BETTER_AUTH_URL ?? `http://localhost:${process.env.PORT ?? 8787}`,
-  secret: process.env.BETTER_AUTH_SECRET ?? "ada-dev-secret-change-in-production",
+  secret: authSecret,
   database: new Database(process.env.ADA_AUTH_DB ?? "ada-auth.db"),
   emailAndPassword: { enabled: true },
   socialProviders,
