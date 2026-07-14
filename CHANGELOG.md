@@ -4,6 +4,23 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.13.0] — 2026-07-14
+
+### Added — embeddable server + stable package surface (open-core seam)
+- **`ada-agent/server` factory.** `src/server/index.ts` no longer listens on import — it exports
+  `createAdaServer()` (builds the HTTP server without binding a port; validates OIDC config) and
+  `startAdaServer(port?)` (the `ada-server` entrypoint). This lets a wrapper (e.g. a hosted control
+  plane) construct or sit in front of the backend without forking it.
+- **`exports` map in `package.json`** pinning the stable surface — `.` / `./sdk` (the typed client)
+  and `./server` (the factory). Internals (`router.ts`, etc.) are now private-by-omission: deep
+  imports like `ada-agent/src/server/router.ts` no longer resolve. *(The package ships `.ts` source,
+  so library consumers load it via `tsx`.)*
+
+### Added — docs
+- **[docs/deploy-worker.md](docs/deploy-worker.md)** — host `ada-server` on Cloudflare Workers +
+  point ada-ide at it (deploy, mint seat keys, wire the IDE). `wrangler.toml` gains the
+  `OPENROUTER_API_KEY` secret + a seat-mint example.
+
 ## [0.12.3] — 2026-07-11
 
 ### Security — credential-leak hardening

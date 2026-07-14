@@ -742,6 +742,17 @@ async function main(): Promise<void> {
     delete process.env.ZZ_SAFE;
   }
 
+  // --- server factory: constructs WITHOUT listening (the stable ./server surface the hosted wrap uses) ---
+  {
+    process.env.ADA_AUTH_DB = ":memory:"; // avoid writing a stray ada-auth.db during the import
+    const { createAdaServer, startAdaServer } = await import("./server/index.ts");
+    assert.equal(typeof createAdaServer, "function", "./server exports createAdaServer");
+    assert.equal(typeof startAdaServer, "function", "./server exports startAdaServer");
+    const srv = createAdaServer();
+    assert.ok(!srv.listening, "createAdaServer() builds the server without calling listen()");
+    srv.close();
+  }
+
   console.log("selfcheck OK");
   process.exit(0); // a spawned stub MCP subprocess can hold stdin open — exit cleanly
 }
