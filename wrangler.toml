@@ -4,9 +4,14 @@
 #   npx wrangler d1 create ada                  # → paste the database_id below
 #   npx wrangler d1 execute ada --file src/worker/schema.sql --remote
 #   npx wrangler secret put ADA_ADMIN_KEY       # bootstrap admin (any long random string)
+#   npx wrangler secret put OPENROUTER_API_KEY  # the provider you route through (Claude/GPT/… via OpenRouter)
+#   npx wrangler deploy                          # → prints your https://ada-server.<sub>.workers.dev URL
+# Optional — only for Cloudflare Workers AI (@cf/* models):
 #   npx wrangler secret put CLOUDFLARE_API_TOKEN
-#   npx wrangler secret put CLOUDFLARE_ACCOUNT_ID   # for Workers AI @cf/* models
-#   npx wrangler deploy
+#   npx wrangler secret put CLOUDFLARE_ACCOUNT_ID
+# After deploy, mint a seat key for each user (admin key = ADA_ADMIN_KEY):
+#   curl -X POST https://<your-worker>/v1/users -H "authorization: Bearer $ADA_ADMIN_KEY" \
+#        -H "content-type: application/json" -d '{"name":"alice","role":"dev"}'   # → returns ada_sk_… (shown once)
 name = "ada-server"
 main = "src/worker/index.ts"
 compatibility_date = "2024-11-01"

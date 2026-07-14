@@ -2,7 +2,7 @@
 // Client → here (auth → route → dispatch to an adapter) → upstream providers.
 // Provider keys live ONLY here; the client never sees them.
 
-import { createServer } from "node:http";
+import { createServer, type Server } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { PORT, PROVIDERS, clientKeys, configuredProviders, isConfigured, providerStatus } from "./config.ts";
 import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, createSeat, disableSeat, disableSeatByExternalId, enterpriseMode, extractLastUsage, identifySeat, listSeats, loadPolicy, modelAllowed, savePolicy, upsertSeatForSSO, usageSummary, validatePolicy } from "./enterprise.ts";
@@ -284,7 +284,7 @@ async function handleOidcExchange(req: IncomingMessage, res: ServerResponse): Pr
   return json(res, 200, { seat_key: key, user: name, role });
 }
 
-const server = createServer(async (req, res) => {
+async function handleRequest(req: IncomingMessage, res: ServerResponse) {
   try {
     const url = new URL(req.url ?? "/", "http://localhost");
     if (url.pathname === "/" || url.pathname === "/health") {
@@ -421,29 +421,39 @@ const server = createServer(async (req, res) => {
         /* ignore */
       }
   }
-});
-
-// Fail fast on bad OIDC config (multi-tenant issuer, missing allow-surface, …) — never boot into a
-// state where SSO would provision seats unsafely.
-try {
-  assertOidcConfig();
-} catch (e) {
-  console.error(`\x1b[31m[fatal] OIDC misconfigured: ${e instanceof Error ? e.message : e}\x1b[0m`);
-  process.exit(1);
 }
 
-server.listen(PORT, () => {
-  if ((enterpriseMode() || oidcEnabled()) && clientKeys()) console.warn("\x1b[33m[warn] ADA_CLIENT_KEYS is set but ignored in enterprise/OIDC mode (seats/SSO supersede it) — unset it to avoid confusion.\x1b[0m");
-  const seats = listSeats().filter((s) => !s.disabled).length;
-  const sso = oidcEnabled() ? " + OIDC SSO" : "";
-  const auth = enterpriseMode()
-    ? `ENTERPRISE (${seats} seat${seats === 1 ? "" : "s"}${process.env.ADA_ADMIN_KEY ? " + admin key" : ""}${sso})`
-    : oidcEnabled()
-      ? `OIDC SSO (0 seats — awaiting first login)`
-      : locked()
-        ? `auth ON (client keys + GitHub/Google login${allowedUsers() ? `, allowlist: ${allowedUsers()!.length}` : ""})`
-        : "AUTH DISABLED (dev) — set ADA_CLIENT_KEYS or ADA_ADMIN_KEY to lock down";
-  const provs = configuredProviders();
-  console.log(`ada backend → http://localhost:${PORT}  [${auth}]`);
-  console.log(`providers: ${provs.length ? provs.join(", ") : "(none configured — set provider API keys)"}`);
-});
+/** Build the ada backend HTTP server WITHOUT listening — for embedding, tests, and the hosted control
+ *  plane to WRAP (it sits in front over HTTP and proxies, adding tenancy/billing). Validates OIDC
+ *  config (throws on misconfig — never construct a server that would provision seats unsafely). */
+export function createAdaServer(): Server {
+  assertOidcConfig();
+  return createServer(handleRequest);
+}
+
+/** Construct the server and listen — the `ada-server` entrypoint (called by bin/ada-server.mjs). */
+export function startAdaServer(port: number = PORT): Server {
+  let server: Server;
+  try {
+    server = createAdaServer();
+  } catch (e) {
+    console.error(`\x1b[31m[fatal] OIDC misconfigured: ${e instanceof Error ? e.message : e}\x1b[0m`);
+    process.exit(1);
+  }
+  server.listen(port, () => {
+    if ((enterpriseMode() || oidcEnabled()) && clientKeys()) console.warn("\x1b[33m[warn] ADA_CLIENT_KEYS is set but ignored in enterprise/OIDC mode (seats/SSO supersede it) — unset it to avoid confusion.\x1b[0m");
+    const seats = listSeats().filter((s) => !s.disabled).length;
+    const sso = oidcEnabled() ? " + OIDC SSO" : "";
+    const auth = enterpriseMode()
+      ? `ENTERPRISE (${seats} seat${seats === 1 ? "" : "s"}${process.env.ADA_ADMIN_KEY ? " + admin key" : ""}${sso})`
+      : oidcEnabled()
+        ? `OIDC SSO (0 seats — awaiting first login)`
+        : locked()
+          ? `auth ON (client keys + GitHub/Google login${allowedUsers() ? `, allowlist: ${allowedUsers()!.length}` : ""})`
+          : "AUTH DISABLED (dev) — set ADA_CLIENT_KEYS or ADA_ADMIN_KEY to lock down";
+    const provs = configuredProviders();
+    console.log(`ada backend → http://localhost:${port}  [${auth}]`);
+    console.log(`providers: ${provs.length ? provs.join(", ") : "(none configured — set provider API keys)"}`);
+  });
+  return server;
+}

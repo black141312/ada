@@ -3,4 +3,5 @@
 import { register } from "tsx/esm/api";
 
 register();
-await import(new URL("../src/server/index.ts", import.meta.url));
+const { startAdaServer } = await import(new URL("../src/server/index.ts", import.meta.url));
+startAdaServer();

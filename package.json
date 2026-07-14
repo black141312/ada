@@ -1,9 +1,15 @@
 {
   "name": "ada-agent",
-  "version": "0.12.3",
+  "version": "0.13.0",
   "description": "A from-zero terminal coding agent with a Cursor-style routing backend, ~285 skills, MCP connectors, and ask/plan/auto modes",
   "type": "module",
   "license": "MIT",
+  "exports": {
+    ".": "./src/sdk/index.ts",
+    "./sdk": "./src/sdk/index.ts",
+    "./server": "./src/server/index.ts",
+    "./package.json": "./package.json"
+  },
   "author": "Aditya",
   "homepage": "https://github.com/black141312/ada#readme",
   "repository": {
