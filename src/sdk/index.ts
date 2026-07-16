@@ -26,7 +26,7 @@ export type SessionEvent =
   | { type: "tool_call"; callId: string; name: string; detail: string }
   | { type: "tool_result"; callId: string; name: string; output: string; isError: boolean }
   | { type: "approval_request"; id: string; name: string; summary: string }
-  | { type: "done"; text: string; usage: string }
+  | { type: "done"; text: string; usage: string; context?: number }
   | { type: "error"; message: string };
 
 export interface AdaSession {

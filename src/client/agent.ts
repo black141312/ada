@@ -22,7 +22,7 @@ export type AgentEvent =
   | { type: "text"; delta: string }
   | { type: "tool_call"; callId: string; name: string; detail: string }
   | { type: "tool_result"; callId: string; name: string; output: string; isError: boolean; display?: string }
-  | { type: "done"; text: string; usage: string };
+  | { type: "done"; text: string; usage: string; context?: number };
 type SendCtrl = { signal?: AbortSignal; steer?: string[]; quiet?: boolean; images?: string[]; onReplyStart?: () => void; onEvent?: (e: AgentEvent) => void };
 type ToolCall = { id: string; name: string; args: string };
 type StepResult = { content: string; toolCalls: ToolCall[] };
@@ -557,7 +557,7 @@ export class Agent {
 
     const engine = this.makeEngine(ctrl, say, interrupted, drainSteer);
     await (ORCHESTRATORS[this.strategy] ?? reAct).run(engine);
-    ctrl?.onEvent?.({ type: "done", text: this.lastAssistant, usage: this.usageReport() });
+    ctrl?.onEvent?.({ type: "done", text: this.lastAssistant, usage: this.usageReport(), context: this.contextTokens() });
     return this.lastAssistant;
   }
 
