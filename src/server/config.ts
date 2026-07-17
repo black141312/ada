@@ -37,7 +37,8 @@ export const PROVIDERS: Record<ProviderName, ProviderDef> = {
   ollama: { baseURL: process.env.OLLAMA_BASE_URL ?? "http://localhost:11434/v1", keyEnv: "" },
 };
 
-export const PORT = Number(process.env.ADA_PORT) || 8787;
+// ADA_PORT wins for local dev; PORT is the convention PaaS hosts (Render, Cloud Run, Railway) inject.
+export const PORT = Number(process.env.ADA_PORT || process.env.PORT) || 8787;
 
 /** The ada client keys allowed to use this backend. null = auth disabled (dev mode). */
 export function clientKeys(): string[] | null {
