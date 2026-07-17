@@ -66,6 +66,7 @@
     "better-auth": "^1.6.23",
     "better-sqlite3": "^12.11.1",
     "openai": "^6.45.0",
+    "pg": "^8.22.0",
     "tsx": "^4.22.4"
   },
   "optionalDependencies": {
@@ -75,6 +76,7 @@
     "@cloudflare/workers-types": "^4.20260702.1",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^26.0.1",
+    "@types/pg": "^8.20.0",
     "typescript": "^6.0.3"
   }
 }
