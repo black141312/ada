@@ -4,6 +4,13 @@
 import { betterAuth } from "better-auth";
 import { bearer, deviceAuthorization } from "better-auth/plugins";
 import Database from "better-sqlite3";
+import { Pool } from "pg";
+
+// Storage: a hosted Postgres (Supabase) when DATABASE_URL is set — makes the backend STATELESS, so it
+// runs on any serverless/container host without a persistent disk. Falls back to local SQLite for dev.
+const authDatabase = process.env.DATABASE_URL
+  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  : new Database(process.env.ADA_AUTH_DB ?? "ada-auth.db");
 
 const socialProviders: Record<string, { clientId: string; clientSecret: string }> = {};
 if (process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET) {
@@ -26,7 +33,7 @@ if (betterAuthEnabled() && authSecret === DEV_SECRET) {
 export const auth = betterAuth({
   baseURL: process.env.BETTER_AUTH_URL ?? `http://localhost:${process.env.PORT ?? 8787}`,
   secret: authSecret,
-  database: new Database(process.env.ADA_AUTH_DB ?? "ada-auth.db"),
+  database: authDatabase,
   emailAndPassword: { enabled: true },
   socialProviders,
   plugins: [
