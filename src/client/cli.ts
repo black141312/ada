@@ -1262,19 +1262,30 @@ async function main(): Promise<void> {
         req.on("data", (c) => (body += c));
         req.on("end", () => {
           let mode: string | undefined;
+          let model: string | undefined;
           try {
-            mode = (JSON.parse(body || "{}") as { mode?: string }).mode;
+            const parsed = JSON.parse(body || "{}") as { mode?: string; model?: string };
+            mode = parsed.mode;
+            model = parsed.model;
           } catch {
-            /* stays undefined */
+            /* both stay undefined */
           }
-          if (mode !== "ask" && mode !== "plan" && mode !== "auto") {
+          if (mode !== undefined && mode !== "ask" && mode !== "plan" && mode !== "auto") {
             res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: 'mode must be "ask" | "plan" | "auto"' }));
             return;
           }
-          rec.mode = mode;
-          rec.agent.setPlanMode(mode === "plan");
-          rec.agent.setAutoApprove(mode === "auto");
-          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, mode }));
+          if (mode === undefined && model === undefined) {
+            res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: "nothing to update — send mode and/or model" }));
+            return;
+          }
+          if (mode !== undefined) {
+            rec.mode = mode;
+            rec.agent.setPlanMode(mode === "plan");
+            rec.agent.setAutoApprove(mode === "auto");
+          }
+          // Models are stateless — the context lives in the transcript, so switching mid-session is safe.
+          if (model !== undefined && model.trim()) rec.agent.setModel(model.trim());
+          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, mode: rec.mode, model: rec.agent.model }));
         });
         return;
       }
