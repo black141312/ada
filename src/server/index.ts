@@ -100,11 +100,21 @@ function json(res: ServerResponse, status: number, obj: unknown): void {
   res.end(JSON.stringify(obj));
 }
 
-async function handleModels(res: ServerResponse): Promise<void> {
+// Freemium: with ADA_FREE_TIER=1, unauthenticated requests may use `:free` models only (they cost
+// nothing upstream). Signed-in users get the full catalog. Off by default — locked stays locked.
+function freeTierEnabled(): boolean {
+  return process.env.ADA_FREE_TIER === "1" || process.env.ADA_FREE_TIER === "true";
+}
+const isFreeModel = (id: string) => /:free$/i.test(id);
+
+async function handleModels(res: ServerResponse, freeOnly = false): Promise<void> {
   const data: Array<{ id: string; object: "model"; owned_by: string }> = [];
   for (const p of configuredProviders()) {
     const ids = await adapterFor(p).listModels(p);
-    for (const id of ids) data.push({ id, object: "model", owned_by: p });
+    for (const id of ids) {
+      if (freeOnly && !isFreeModel(id)) continue;
+      data.push({ id, object: "model", owned_by: p });
+    }
   }
   json(res, 200, { object: "list", data });
 }
@@ -120,6 +130,10 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
 
   const model = String(body.model ?? "");
   if (!model) return json(res, 400, { error: { message: "missing 'model'" } });
+  // Anonymous free tier may only touch `:free` models — everything else needs sign-in.
+  if (who.user === "anon" && String(who.role) === "free" && !isFreeModel(model)) {
+    return json(res, 403, { error: { message: `sign in to use ${model} — without an account only :free models are available` } });
+  }
 
   // Org policy: model allowlist (enterprise). Enforced server-side so a modified client can't skip it.
   let policy: import("./enterprise.ts").Policy;
@@ -295,15 +309,23 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       return res.end(DEVICE_PAGE);
     }
 
-    const who = await identify(req);
+    let who = await identify(req);
     if (who === "corrupt") return json(res, 503, { error: { message: "auth store unreadable — refusing all requests (fail-closed). Fix ~/.ada/server/users.json." } });
+    if (!who && freeTierEnabled()) {
+      // Anonymous free tier: models list (free subset) + chat on `:free` models only. Everything
+      // else still requires sign-in — enforced below via the "free" role.
+      if ((req.method === "GET" && url.pathname === "/v1/models") || (req.method === "POST" && url.pathname === "/v1/chat/completions")) {
+        who = { user: "anon", role: "free" as never };
+      }
+    }
     if (!who) return json(res, 401, { error: { message: "unauthorized — invalid client key, seat key, or login" } });
+    const isAnon = who.user === "anon" && String(who.role) === "free";
 
     if (req.method === "GET" && url.pathname === "/v1/whoami") {
       return json(res, 200, { ok: true, user: who.user, role: who.role });
     }
     if (req.method === "GET" && url.pathname === "/v1/models") {
-      return await handleModels(res);
+      return await handleModels(res, isAnon);
     }
     if (req.method === "GET" && url.pathname === "/v1/providers") {
       // Which services this backend can route to, and how each is configured. Ollama is keyless so
