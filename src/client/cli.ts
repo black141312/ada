@@ -1040,7 +1040,9 @@ async function main(): Promise<void> {
     return;
   }
   if (sub === "serve") {
-    const trusted = isTrusted(process.cwd());
+    // ADA_TRUST_CWD=1: the caller (the Ada IDE) vouches for this cwd — the user explicitly opened
+    // the folder there, and worktree copies of it are never in the interactive trustedDirs list.
+    const trusted = process.env.ADA_TRUST_CWD === "1" || isTrusted(process.cwd());
     const settings = loadSettings(trusted);
     await loadExtensions(trusted);
     registerSkillTool(loadSkills(trusted)); registerMemoryTools(trusted);
