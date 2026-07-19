@@ -3,7 +3,7 @@
 // Config: { "servers": { "fs": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."] } } }
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { registerTool } from "./tools.ts";
 import { scrubbedEnv } from "./secret-env.ts";
@@ -126,16 +126,26 @@ interface McpServerDef {
 
 export async function loadMcpServers(includeProject: boolean): Promise<string[]> {
   if (!includeProject) return []; // MCP servers run code — trusted projects only
-  const cfgPath = resolve(process.cwd(), ".ada", "mcp.json");
-  if (!existsSync(cfgPath)) return [];
-  let cfg: { servers?: Record<string, McpServerDef> };
+  // Plugin-provided servers first, then .ada/mcp.json — so the project file wins on name collision.
+  const servers: Record<string, McpServerDef> = {};
+  const readServers = (p: string): void => {
+    if (!existsSync(p)) return;
+    try {
+      const cfg = JSON.parse(readFileSync(p, "utf8")) as { servers?: Record<string, McpServerDef> };
+      Object.assign(servers, cfg.servers ?? {});
+    } catch {
+      /* bad json — skip */
+    }
+  };
+  const pluginRoot = resolve(process.cwd(), ".ada", "plugins");
   try {
-    cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+    for (const plugin of readdirSync(pluginRoot)) readServers(resolve(pluginRoot, plugin, "mcp.json"));
   } catch {
-    return [];
+    /* no plugins dir */
   }
+  readServers(resolve(process.cwd(), ".ada", "mcp.json"));
   const loaded: string[] = [];
-  for (const [name, def] of Object.entries(cfg.servers ?? {})) {
+  for (const [name, def] of Object.entries(servers)) {
     try {
       let rpc: RpcClient;
       if (def.url) {
@@ -143,7 +153,10 @@ export async function loadMcpServers(includeProject: boolean): Promise<string[]>
       } else if (def.command) {
         // Scrub ada's own secrets from the third-party server's env; keep the server's OWN configured
         // creds (def.env) so it still works — but don't hand it every provider/admin/seat key.
-        rpc = makeClient(spawn(def.command, def.args ?? [], { env: scrubbedEnv(def.env), stdio: ["pipe", "pipe", "ignore"] }));
+        // shell:true so Windows resolves npx.cmd etc.; error handler so a missing command logs instead of crashing the process
+        const proc = spawn(def.command, def.args ?? [], { env: scrubbedEnv(def.env), stdio: ["pipe", "pipe", "ignore"], shell: process.platform === "win32" });
+        proc.on("error", (e) => console.error(`mcp ${name}: ${e.message}`));
+        rpc = makeClient(proc);
       } else {
         console.error(`mcp ${name}: needs a "command" (stdio) or "url" (http)`);
         continue;
@@ -251,6 +264,15 @@ export function addConnector(name: string): { ok: boolean; envVars: string[]; er
   cfg.servers[name] = entry.server;
   writeConfig(cfg);
   return { ok: true, envVars: Object.keys(entry.server.env ?? {}) };
+}
+
+/** Add a custom (non-catalog) server to .ada/mcp.json. */
+export function addCustomServer(name: string, def: McpServerDef): { ok: boolean; error?: string } {
+  if (!def.command && !def.url) return { ok: false, error: 'needs a "command" (stdio) or "url" (http)' };
+  const cfg = readConfig();
+  cfg.servers[name] = def;
+  writeConfig(cfg);
+  return { ok: true };
 }
 
 /** Remove a connector from .ada/mcp.json. */

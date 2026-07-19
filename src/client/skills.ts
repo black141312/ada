@@ -90,8 +90,18 @@ export interface Skill {
 
 function skillDirs(includeProject: boolean): string[] {
   const global = resolve(homedir(), ".ada", "skills");
-  // Precedence (first match wins): project → global → bundled built-ins.
-  return includeProject ? [resolve(process.cwd(), ".ada", "skills"), global, BUNDLED] : [global, BUNDLED];
+  if (!includeProject) return [global, BUNDLED];
+  // Precedence (first match wins): project → plugins → global → bundled built-ins.
+  const pluginRoot = resolve(process.cwd(), ".ada", "plugins");
+  let pluginDirs: string[] = [];
+  try {
+    pluginDirs = readdirSync(pluginRoot)
+      .map((p) => join(pluginRoot, p, "skills"))
+      .filter((d) => existsSync(d));
+  } catch {
+    /* no plugins dir */
+  }
+  return [resolve(process.cwd(), ".ada", "skills"), ...pluginDirs, global, BUNDLED];
 }
 
 /** Read one `key: value` line from a SKILL.md's `---` front-matter. */
