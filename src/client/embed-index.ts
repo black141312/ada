@@ -9,8 +9,12 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
+import { LOCAL_MODEL, embedLocal } from "./embed-local.ts";
 
-const EMBED_MODEL = process.env.ADA_EMBED_MODEL ?? "nomic-embed-text";
+// Embeddings run LOCALLY by default (in-process, no key/backend — see embed-local.ts). Set
+// ADA_EMBED_REMOTE=1 to instead POST to the backend's /v1/embeddings (Ollama/Gemini/OpenAI).
+const REMOTE = process.env.ADA_EMBED_REMOTE === "1";
+const EMBED_MODEL = REMOTE ? (process.env.ADA_EMBED_MODEL ?? "text-embedding-004") : LOCAL_MODEL;
 const BACKEND = process.env.ADA_BACKEND_URL ?? "http://localhost:8787/v1";
 const SKIP = new Set(["node_modules", ".git", "dist", ".ada", ".next", "build", "coverage"]);
 const TEXT_EXT = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|cs|c|h|cpp|hpp|md|txt|json|yaml|yml|toml|css|scss|html|sql|sh|svelte|vue)$/i;
@@ -85,6 +89,7 @@ export function walkFiles(root: string, dir = root, out: string[] = []): string[
 }
 
 async function embed(texts: string[], kind: "document" | "query" = "document"): Promise<number[][]> {
+  if (!REMOTE) return embedLocal(texts); // default: in-process, no key/backend
   // nomic-embed models are trained asymmetric: prefixing queries/documents differently measurably
   // improves retrieval (code stops losing to prose). Other models get the raw text.
   const input = EMBED_MODEL.includes("nomic") ? texts.map((t) => `search_${kind}: ${t}`) : texts;
@@ -94,7 +99,7 @@ async function embed(texts: string[], kind: "document" | "query" = "document"): 
     body: JSON.stringify({ model: EMBED_MODEL, input }),
     signal: AbortSignal.timeout(60_000),
   });
-  if (!res.ok) throw new Error(`embeddings HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)} — is the backend up, and is "${EMBED_MODEL}" pulled in Ollama? (ollama pull nomic-embed-text, or set ADA_EMBED_MODEL)`);
+  if (!res.ok) throw new Error(`embeddings HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 200)} — is the backend up and an embedding provider configured?`);
   const j = (await res.json()) as { data?: Array<{ index: number; embedding: number[] }> };
   if (!j.data?.length) throw new Error("embeddings response had no data");
   return [...j.data].sort((a, b) => a.index - b.index).map((d) => d.embedding);

@@ -4,6 +4,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type OpenAI from "openai";
+import { loadBrain } from "./brain.ts";
 import { compact, estimateTokens, isContextOverflowError } from "./compaction.ts";
 import { MarkdownStreamer } from "./render.ts";
 import { type Tool, type ToolResult, isDestructive, toolByName, tools } from "./tools.ts";
@@ -32,17 +33,27 @@ export type ApprovalDecision = "yes" | "all" | "no";
 export type OnApprove = (toolName: string, summary: string) => Promise<ApprovalDecision>;
 
 function projectContext(): string {
+  let guide = "";
   for (const f of ["AGENTS.md", "CLAUDE.md"]) {
     const p = resolve(process.cwd(), f);
     if (existsSync(p)) {
       try {
-        return `\n\nProject guide (${f}):\n${readFileSync(p, "utf8").slice(0, 8000)}`;
+        guide = `\n\nProject guide (${f}):\n${readFileSync(p, "utf8").slice(0, 8000)}`;
+        break;
       } catch {
         /* ignore unreadable */
       }
     }
   }
-  return "";
+  // Repo map ("brain") — cached folder structure + symbols so the agent starts oriented.
+  let brain = "";
+  try {
+    const map = loadBrain();
+    if (map) brain = `\n\nProject map (auto-generated — file paths and their top-level symbols; use grep/codebase_search to go deeper):\n${map}`;
+  } catch {
+    /* brain is best-effort — never block a session on it */
+  }
+  return guide + brain;
 }
 
 function systemPrompt(includeProject: boolean): string {

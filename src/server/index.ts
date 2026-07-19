@@ -4,7 +4,8 @@
 
 import { createServer, type Server } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { PORT, PROVIDERS, clientKeys, configuredProviders, isConfigured, providerStatus } from "./config.ts";
+import type { ProviderName } from "../shared/types.ts";
+import { PORT, PROVIDERS, clientKeys, configuredProviders, isConfigured, providerKey, providerStatus } from "./config.ts";
 import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, createSeat, disableSeat, disableSeatByExternalId, enterpriseMode, extractLastUsage, identifySeat, listSeats, loadPolicy, modelAllowed, savePolicy, upsertSeatForSSO, usageSummary, validatePolicy } from "./enterprise.ts";
 import { allowedUsers, isAllowed, verifyIdentity } from "./identity.ts";
 import { auth, betterAuthEnabled, verifyBetterAuth } from "./auth.ts";
@@ -188,9 +189,26 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
   await adapterFor(provider).chat({ provider, model, body, res });
 }
 
-/** Embeddings for @codebase semantic search — forwarded to the ollama provider's
- *  OpenAI-compatible endpoint (embedding models only live there for now). Subject to the same org
- *  model allowlist as chat, and metered/attributed. */
+// Which upstream serves embeddings, and its default model. OpenRouter has no embeddings endpoint, so
+// the hosted backend routes to whatever embedding-capable provider is configured. Auto-pick: an
+// explicit ADA_EMBED_PROVIDER wins, else the first configured cloud embedder (Gemini free tier →
+// OpenAI), else local Ollama for dev. Set ADA_EMBED_MODEL to override the model per provider.
+const EMBED_DEFAULT_MODEL: Partial<Record<ProviderName, string>> = {
+  google: "text-embedding-004", // Gemini, free tier, 768-dim, via Google's OpenAI-compatible endpoint
+  openai: "text-embedding-3-small",
+  ollama: "nomic-embed-text",
+};
+function embedProvider(): ProviderName {
+  const forced = process.env.ADA_EMBED_PROVIDER as ProviderName | undefined;
+  if (forced && PROVIDERS[forced]) return forced;
+  if (isConfigured("google")) return "google";
+  if (isConfigured("openai")) return "openai";
+  return "ollama"; // keyless local dev; no-op in the cloud where it isn't reachable
+}
+
+/** Embeddings for @codebase semantic search — forwarded to a configured embedding provider
+ *  (Gemini/OpenAI in the cloud, Ollama locally). Subject to the same org model allowlist as chat,
+ *  and metered/attributed. */
 async function handleEmbeddings(req: IncomingMessage, res: ServerResponse, who: Identity): Promise<void> {
   const raw = await readBody(req);
   let body: Record<string, unknown>;
@@ -199,7 +217,10 @@ async function handleEmbeddings(req: IncomingMessage, res: ServerResponse, who: 
   } catch {
     return json(res, 400, { error: { message: "invalid JSON body" } });
   }
-  const model = String(body.model ?? "");
+  const provider = embedProvider();
+  // The client may send a model name tied to a different provider (e.g. the local default
+  // nomic-embed-text). Substitute this provider's embedding model so the upstream call is valid.
+  const model = process.env.ADA_EMBED_MODEL || EMBED_DEFAULT_MODEL[provider] || String(body.model ?? "");
   let policy: import("./enterprise.ts").Policy;
   try {
     policy = loadPolicy();
@@ -211,14 +232,18 @@ async function handleEmbeddings(req: IncomingMessage, res: ServerResponse, who: 
     appendAudit({ ts: Date.now(), user: who.user, event: "policy_denied_model", detail: `embeddings:${model}` });
     return json(res, 403, { error: { message: `embedding model '${model}' is not allowed by org policy` } });
   }
-  const upstream = await fetch(`${PROVIDERS.ollama.baseURL}/embeddings`, {
+  if (provider !== "ollama" && !providerKey(provider)) {
+    return json(res, 503, { error: { message: `semantic search needs an embedding provider — set a key for '${provider}' (e.g. GEMINI_API_KEY) on the backend` } });
+  }
+  const key = providerKey(provider);
+  const upstream = await fetch(`${PROVIDERS[provider].baseURL}/embeddings`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: raw,
+    headers: { "content-type": "application/json", ...(key ? { authorization: `Bearer ${key}` } : {}) },
+    body: JSON.stringify({ ...body, model }),
   });
   const text = await upstream.text();
   const u = extractLastUsage(text); // embedding responses report prompt_tokens
-  if (u) appendUsage({ ts: Date.now(), user: who.user, model, provider: "ollama", promptTokens: u.promptTokens, completionTokens: 0 });
+  if (u) appendUsage({ ts: Date.now(), user: who.user, model, provider, promptTokens: u.promptTokens, completionTokens: 0 });
   res.writeHead(upstream.status, { "content-type": "application/json" });
   res.end(text);
 }
