@@ -19,7 +19,7 @@ import { getCommands, loadExtensions } from "./extensions.ts";
 import { registerTool, setAsker } from "./tools.ts";
 import { addRemoteSkill, loadSkills, registerSkillTool } from "./skills.ts";
 import { memoryCommand, registerMemoryTools } from "./memory.ts";
-import { addConnector, listConnectors, loadMcpServers, removeConnector } from "./mcp.ts";
+import { addConnector, addCustomServer, configuredServers, listConnectors, loadMcpServers, removeConnector } from "./mcp.ts";
 import { addExtension, selfUpdate } from "./pkg.ts";
 import { runTui } from "./tui-mode.ts";
 import { loadImage } from "./image.ts";
@@ -1122,6 +1122,44 @@ async function main(): Promise<void> {
       // List on-disk transcripts (survive an `ada serve` restart) so an IDE can offer "resume".
       if (req.method === "GET" && url.pathname === "/v1/sessions") {
         res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessions: list() }));
+        return;
+      }
+      // Skills & MCP management — lets an IDE render settings pages off the same loaders the agent uses.
+      if (req.method === "GET" && url.pathname === "/v1/skills") {
+        const cwd = process.cwd();
+        const skills = loadSkills(trusted).map((s) => ({
+          name: s.name,
+          description: s.description,
+          category: s.category,
+          source: s.path.startsWith(join(cwd, ".ada", "plugins")) ? "plugin" : s.path.startsWith(join(cwd, ".ada")) ? "project" : s.path.startsWith(join(homedir(), ".ada")) ? "global" : "bundled",
+        }));
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ skills }));
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/v1/mcp") {
+        const catalog = listConnectors();
+        const custom = configuredServers().filter((n) => !catalog.some((c) => c.name === n))
+          .map((name) => ({ name, description: "custom server", configured: true, needsEnv: [] as string[] }));
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ connectors: [...catalog, ...custom] }));
+        return;
+      }
+      const mcpName = url.pathname.match(/^\/v1\/mcp\/([\w.-]+)$/)?.[1];
+      if (mcpName && (req.method === "POST" || req.method === "DELETE")) {
+        if (req.method === "DELETE") {
+          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: removeConnector(mcpName) }));
+          return;
+        }
+        let body = "";
+        req.on("data", (c) => (body += c));
+        req.on("end", () => {
+          try {
+            const j = JSON.parse(body || "{}") as { server?: { command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> } };
+            const r = j.server ? addCustomServer(mcpName, j.server) : addConnector(mcpName);
+            res.writeHead(r.ok ? 200 : 400, { "content-type": "application/json" }).end(JSON.stringify(r));
+          } catch (e) {
+            res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }));
+          }
+        });
         return;
       }
       if (req.method === "POST" && url.pathname === "/v1/sessions") {
