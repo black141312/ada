@@ -9,6 +9,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
+import { projectRootOf } from "./brain.ts";
 import { LOCAL_MODEL, embedLocal } from "./embed-local.ts";
 
 // Embeddings run LOCALLY by default (in-process, no key/backend — see embed-local.ts). Set
@@ -106,7 +107,8 @@ async function embed(texts: string[], kind: "document" | "query" = "document"): 
 }
 
 function indexPath(root: string): string {
-  return resolve(root, ".ada", "index.json");
+  // Worktree sessions share the main project's index — same files, and visible in the project's .ada.
+  return resolve(projectRootOf(root), ".ada", "index.json");
 }
 
 // Cache key includes an embedding-scheme tag: changing the model OR how text is prefixed makes old
@@ -125,7 +127,7 @@ function loadIndex(root: string): Index {
 
 function saveIndex(root: string, idx: Index): void {
   try {
-    mkdirSync(resolve(root, ".ada"), { recursive: true });
+    mkdirSync(resolve(projectRootOf(root), ".ada"), { recursive: true });
     writeFileSync(indexPath(root), JSON.stringify(idx));
   } catch {
     /* cache is best-effort */

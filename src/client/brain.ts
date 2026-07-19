@@ -128,12 +128,29 @@ interface BrainCache {
   map: string;
 }
 
+/** If `cwd` is a git WORKTREE copy, the main project root; else `cwd`. Worktrees have identical
+ *  files, so caches belong in the project's own .ada — visible to the user and shared across
+ *  sessions instead of rebuilt per worktree. (A worktree's .git is a file: "gitdir: <main>/.git/worktrees/<id>") */
+export function projectRootOf(cwd: string): string {
+  try {
+    const dotGit = resolve(cwd, ".git");
+    if (existsSync(dotGit) && statSync(dotGit).isFile()) {
+      const m = readFileSync(dotGit, "utf8").match(/^gitdir:\s*(.+?)[\/\\]\.git[\/\\]worktrees[\/\\]/m);
+      if (m?.[1] && existsSync(m[1])) return m[1];
+    }
+  } catch {
+    /* fall through — treat as a normal checkout */
+  }
+  return cwd;
+}
+
 /** Build (or load from cache) the repo map for `cwd`. Returns "" if the folder has no code files. */
 export function loadBrain(cwd: string = process.cwd()): string {
   const files = walk(cwd);
   if (!files.length) return "";
   const fp = fingerprint(files);
-  const cachePath = resolve(cwd, ".ada", "brain.json");
+  const cacheRoot = projectRootOf(cwd);
+  const cachePath = resolve(cacheRoot, ".ada", "brain.json");
 
   try {
     if (existsSync(cachePath)) {
@@ -146,7 +163,7 @@ export function loadBrain(cwd: string = process.cwd()): string {
 
   const map = render(files);
   try {
-    mkdirSync(resolve(cwd, ".ada"), { recursive: true });
+    mkdirSync(resolve(cacheRoot, ".ada"), { recursive: true });
     writeFileSync(cachePath, JSON.stringify({ fingerprint: fp, map } satisfies BrainCache));
   } catch {
     /* read-only fs — still return the freshly built map */
