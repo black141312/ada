@@ -63,6 +63,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.106.0",
+    "@huggingface/transformers": "^4.2.0",
     "better-auth": "^1.6.23",
     "better-sqlite3": "^12.11.1",
     "openai": "^6.45.0",

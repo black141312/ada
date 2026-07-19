@@ -544,7 +544,7 @@ export const tools: Tool[] = [
   {
     name: "codebase_search",
     description:
-      "Semantic (meaning-based) search over the codebase — finds code by what it DOES, not by exact strings. Use when grep's literal matching won't work (\"where do we handle auth?\", \"how are sessions persisted?\"). First call indexes the repo (needs an Ollama embedding model, e.g. nomic-embed-text); later calls are incremental.",
+      "Semantic (meaning-based) search over the codebase — finds code by what it DOES, not by exact strings. Use when grep's literal matching won't work (\"where do we handle auth?\", \"how are sessions persisted?\"). First call indexes the repo locally (embeddings run in-process — no key or network beyond a one-time model download); later calls are incremental.",
     parameters: {
       type: "object",
       properties: {
