@@ -178,14 +178,25 @@ export interface Orchestrator {
 const reAct: Orchestrator = {
   name: "react", // reason → act → observe → repeat (the default; = the original loop)
   async run(e) {
+    let nudged = false; // guard so a stubbornly-silent model can't loop forever
     for (;;) {
       const turn = await e.step();
       if (!turn) return;
       if (!turn.toolCalls.length) {
+        // Some models (e.g. after marking a todo list "done") end a turn with NO tool calls and NO
+        // text — leaving the user with tool output but no answer. Nudge once for the final response.
+        if (!turn.content.trim() && !nudged) {
+          nudged = true;
+          e.addSystem(
+            "You stopped without giving the user an answer. Based on what you've already found, write your final response to the user now. Don't call more tools unless truly necessary.",
+          );
+          continue;
+        }
         e.say("\n");
         if (e.drainSteer()) continue;
         return;
       }
+      nudged = false; // real work resumed — allow another nudge later if needed
       await e.runTools(turn.toolCalls);
       if (e.aborted()) {
         e.interrupted();
