@@ -4,6 +4,19 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [Unreleased]
+
+### Added — built-in PPTX generation
+- **`generate_pptx` tool.** ada can now produce a real, editable PowerPoint deck with zero external
+  dependencies — no Python, no npm. The model emits structured JSON (slides with titles, subtitles,
+  bullets with nesting, local images, speaker notes) and a deterministic renderer
+  (`src/client/pptx.ts`, a from-scratch OPC zip + OOXML writer on top of `node:zlib`) turns it into
+  a valid 16:9 `.pptx` — so even weak local models can make decks, since they only write content,
+  never python-pptx code. Approval-gated like `write_file`; images keep their aspect ratio; input is
+  lenient about common weak-model shapes (JSON-stringified arrays, newline-joined bullets). The
+  `pptx-deck` skill now routes to the tool first, keeping python-pptx as the advanced path for
+  corporate templates and on-slide charts.
+
 ## [0.13.0] — 2026-07-14
 
 ### Added — embeddable server + stable package surface (open-core seam)
