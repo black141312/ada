@@ -12,6 +12,7 @@ import * as checkpoint from "./checkpoint.ts";
 import { renderTodos, setTodos, type Todo } from "./todos.ts";
 import { isTrusted, loadSettings } from "./settings.ts";
 import { getDiagnostics } from "./lsp.ts";
+import { buildPptx, type PptxSlideSpec } from "./pptx.ts";
 
 const MAX_OUTPUT = 30_000;
 
@@ -753,6 +754,67 @@ export const tools: Tool[] = [
         }
       }
       return { output: lines.join("\n"), isError: anyErr };
+    },
+  },
+  {
+    name: "generate_pptx",
+    description:
+      "Create a real, editable PowerPoint .pptx file from structured slide content — no Python, npm, or external tools needed. Provide the finished text for every slide (this tool renders; it does not write copy). Bullets accept plain strings or {text, level} for nesting; a slide with a subtitle and no bullets renders as a centered title slide; `image` embeds a local png/jpg/gif; `notes` become speaker notes.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Output file path ending in .pptx." },
+        title: { type: "string", description: "Deck title for document properties." },
+        slides: {
+          type: "array",
+          description: "One entry per slide, in order.",
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              subtitle: { type: "string" },
+              bullets: { type: "array", items: {}, description: 'Strings, or {"text": "...", "level": 1} for indented sub-bullets.' },
+              image: { type: "string", description: "Path to a local png/jpg/gif to embed." },
+              notes: { type: "string", description: "Speaker notes for this slide." },
+            },
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["path", "slides"],
+      additionalProperties: false,
+    },
+    needsApproval: true,
+    async run(args) {
+      const rel = String(args.path);
+      const abs = resolve(process.cwd(), rel);
+      if (!abs.toLowerCase().endsWith(".pptx")) return { output: `generate_pptx: path must end in .pptx (got ${rel})`, isError: true };
+      return withFileLock(abs, async () => {
+        if (isProtected(abs)) return { output: `Refused: ${rel} is a protected path.`, isError: true };
+        checkpoint.record(abs);
+        try {
+          // Weak models often JSON-stringify the nested array — accept that too.
+          let slides = args.slides;
+          if (typeof slides === "string") {
+            try {
+              slides = JSON.parse(slides);
+            } catch {
+              /* leave as-is; buildPptx reports the clear error */
+            }
+          }
+          args = { ...args, slides };
+          const buf = buildPptx({ title: args.title == null ? undefined : String(args.title), slides: slides as PptxSlideSpec[] });
+          mkdirSync(dirname(abs), { recursive: true });
+          writeFileSync(abs, buf);
+          const n = (args.slides as unknown[]).length;
+          return {
+            output: `Wrote ${rel}: ${n} slide${n === 1 ? "" : "s"}, ${buf.length} bytes.`,
+            display: green(`+ ${rel} (${n} slide${n === 1 ? "" : "s"}, ${buf.length} bytes)`),
+          };
+        } catch (e) {
+          return { output: e instanceof Error ? e.message : String(e), isError: true };
+        }
+      });
     },
   },
   {

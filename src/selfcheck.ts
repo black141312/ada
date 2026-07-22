@@ -93,6 +93,29 @@ async function main(): Promise<void> {
   r = await tool("read_file").run({ path: crlf });
   assert.ok(r.output.includes("\r\n") && r.output.includes("TWO"), JSON.stringify(r.output));
 
+  // generate_pptx: structured slides -> valid OPC zip with all required parts
+  const png = join(dir, "dot.png");
+  writeFileSync(png, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64"));
+  const pptxPath = join(dir, "deck.pptx");
+  r = await tool("generate_pptx").run({
+    path: pptxPath,
+    title: "Selfcheck deck",
+    slides: [
+      { title: "ada", subtitle: "a deck from the selfcheck" },
+      { title: "Bullets", bullets: ["one", { text: "nested", level: 1 }, "two & <escaped>"], notes: "speaker notes here" },
+      { title: "Image", image: png },
+    ],
+  });
+  assert.ok(!r.isError, r.output);
+  const pptxBytes = readFileSync(pptxPath);
+  assert.equal(pptxBytes.readUInt32LE(0), 0x04034b50, "pptx must start with a zip local-file header");
+  for (const part of ["[Content_Types].xml", "ppt/presentation.xml", "ppt/slides/slide3.xml", "ppt/notesSlides/notesSlide2.xml", "ppt/media/image1.png", "ppt/theme/theme1.xml"])
+    assert.ok(pptxBytes.includes(part), `pptx missing part: ${part}`);
+  r = await tool("generate_pptx").run({ path: join(dir, "empty.pptx"), slides: [] });
+  assert.ok(r.isError, "empty slides should error");
+  r = await tool("generate_pptx").run({ path: join(dir, "deck.txt"), slides: [{ title: "x" }] });
+  assert.ok(r.isError, "non-.pptx path should error");
+
   rmSync(dir, { recursive: true, force: true });
 
   // --- session append -> load round-trip ---
