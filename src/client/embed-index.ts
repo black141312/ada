@@ -1,13 +1,17 @@
-// @codebase semantic search. Chunks the working tree, embeds chunks through the backend's
-// /v1/embeddings (which forwards to Ollama — `ollama pull nomic-embed-text`, or set
-// ADA_EMBED_MODEL), caches vectors in .ada/index.json keyed by content hash, and answers queries
-// by cosine similarity. Exposed to the model as the read-only `codebase_search` tool.
+// @codebase semantic search. Chunks the working tree, embeds chunks (locally by default), and answers
+// queries by cosine similarity. Exposed to the model as the read-only `codebase_search` tool.
 //
-// ponytail: brute-force cosine over a JSON cache — fine to ~50k chunks; an ANN index and a binary
-// vector format are the upgrade path if repos outgrow it.
+// Storage is SSD-friendly: vectors live in a binary append-only blob (.ada/index.vec, packed Float32),
+// and a tiny JSON manifest (.ada/index.json) maps files → chunk metadata + blob offsets. Editing one
+// file appends only its vectors and rewrites the small manifest — NOT the whole index. The blob is
+// only fully rewritten during occasional compaction, once dead space (from replaced/deleted files)
+// exceeds a threshold. This keeps write volume proportional to what changed, not the index size.
+//
+// ponytail: brute-force cosine over the in-memory blob — fine to ~50k chunks; an ANN index is the
+// next upgrade if repos outgrow it.
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { projectRootOf } from "./brain.ts";
 import { LOCAL_MODEL, embedLocal } from "./embed-local.ts";
@@ -27,14 +31,22 @@ export interface Chunk {
   end: number;
   text: string;
 }
-interface IndexedFile {
+// A file's chunk vectors sit contiguously in the blob starting at float offset `base`; chunk i's
+// vector occupies floats [base + i*dim, base + (i+1)*dim). Only line ranges live in the manifest.
+interface FileEntry {
   hash: string;
-  chunks: Array<{ start: number; end: number; vec: number[] }>;
+  base: number;
+  chunks: Array<{ start: number; end: number }>;
 }
-interface Index {
+interface Manifest {
+  v: number; // format version — a bump forces a rebuild
   model: string;
-  files: Record<string, IndexedFile>;
+  dim: number; // vector dimension (0 until the first file is embedded)
+  used: number; // floats written to the blob (the append cursor)
+  dead: number; // floats orphaned by replaced/deleted files, awaiting compaction
+  files: Record<string, FileEntry>;
 }
+const FORMAT = 2;
 
 /** Split file text into fixed-size line windows, char-capped so minified/long-line files can't
  *  blow the embedding model's context window. */
@@ -48,14 +60,16 @@ export function chunkText(text: string, lines = CHUNK_LINES): Chunk[] {
   return out;
 }
 
-export function cosine(a: number[], b: number[]): number {
+export function cosine(a: ArrayLike<number>, b: ArrayLike<number>): number {
   let dot = 0;
   let na = 0;
   let nb = 0;
   for (let i = 0; i < a.length; i++) {
-    dot += a[i]! * b[i]!;
-    na += a[i]! * a[i]!;
-    nb += b[i]! * b[i]!;
+    const ai = a[i]!;
+    const bi = b[i]!;
+    dot += ai * bi;
+    na += ai * ai;
+    nb += bi * bi;
   }
   const d = Math.sqrt(na) * Math.sqrt(nb);
   return d ? dot / d : 0;
@@ -106,40 +120,98 @@ async function embed(texts: string[], kind: "document" | "query" = "document"): 
   return [...j.data].sort((a, b) => a.index - b.index).map((d) => d.embedding);
 }
 
-function indexPath(root: string): string {
-  // Worktree sessions share the main project's index — same files, and visible in the project's .ada.
-  return resolve(projectRootOf(root), ".ada", "index.json");
+// Worktree sessions share the main project's .ada, so the index is built once and visible there.
+function adaDir(root: string): string {
+  return resolve(projectRootOf(root), ".ada");
+}
+function manifestPath(root: string): string {
+  return join(adaDir(root), "index.json");
+}
+function blobPath(root: string): string {
+  return join(adaDir(root), "index.vec");
 }
 
 // Cache key includes an embedding-scheme tag: changing the model OR how text is prefixed makes old
 // vectors incomparable, and both must force a rebuild.
 const SCHEME = EMBED_MODEL.includes("nomic") ? `${EMBED_MODEL}#affix1` : EMBED_MODEL;
+const COMPACT_AT = 0.4; // rewrite the blob once dead space exceeds this fraction of it
 
-function loadIndex(root: string): Index {
+function emptyManifest(): Manifest {
+  return { v: FORMAT, model: SCHEME, dim: 0, used: 0, dead: 0, files: {} };
+}
+function loadManifest(root: string): Manifest {
   try {
-    const idx = JSON.parse(readFileSync(indexPath(root), "utf8")) as Index;
-    if (idx.model === SCHEME) return idx; // scheme changed → vectors incomparable, rebuild
+    const m = JSON.parse(readFileSync(manifestPath(root), "utf8")) as Manifest;
+    if (m.v === FORMAT && m.model === SCHEME) return m; // else format/scheme changed → rebuild
   } catch {
-    /* no cache yet */
+    /* none yet or unreadable */
   }
-  return { model: SCHEME, files: {} };
+  return emptyManifest();
+}
+function saveManifest(root: string, m: Manifest): void {
+  try {
+    mkdirSync(adaDir(root), { recursive: true });
+    writeFileSync(manifestPath(root), JSON.stringify(m));
+  } catch {
+    /* best-effort */
+  }
+}
+/** Read the whole vector blob into an aligned Float32Array (copied, so it's safe to view/slice). */
+function readBlob(root: string): Float32Array {
+  try {
+    const buf = readFileSync(blobPath(root));
+    const n = Math.floor(buf.byteLength / 4);
+    const ab = new ArrayBuffer(n * 4);
+    new Uint8Array(ab).set(buf.subarray(0, n * 4));
+    return new Float32Array(ab);
+  } catch {
+    return new Float32Array(0);
+  }
+}
+function appendVectors(root: string, floats: Float32Array): void {
+  appendFileSync(blobPath(root), Buffer.from(floats.buffer, floats.byteOffset, floats.byteLength));
+}
+/** Rewrite the blob keeping only live vectors (the ONLY full rewrite; happens rarely). */
+function compact(root: string, m: Manifest): void {
+  const blob = readBlob(root);
+  const liveFloats = Object.values(m.files).reduce((n, f) => n + f.chunks.length * m.dim, 0);
+  const out = new Float32Array(liveFloats);
+  let cur = 0;
+  for (const f of Object.values(m.files)) {
+    const n = f.chunks.length * m.dim;
+    out.set(blob.subarray(f.base, f.base + n), cur);
+    f.base = cur;
+    cur += n;
+  }
+  mkdirSync(adaDir(root), { recursive: true });
+  writeFileSync(blobPath(root), Buffer.from(out.buffer, out.byteOffset, out.byteLength));
+  m.used = cur;
+  m.dead = 0;
 }
 
-function saveIndex(root: string, idx: Index): void {
-  try {
-    mkdirSync(resolve(projectRootOf(root), ".ada"), { recursive: true });
-    writeFileSync(indexPath(root), JSON.stringify(idx));
-  } catch {
-    /* cache is best-effort */
-  }
-}
-
-/** Bring the index up to date (embed new/changed files, drop deleted ones). Returns chunk count. */
+/** Bring the index up to date (embed new/changed files, drop deleted ones). Returns chunk count.
+ *  Writes are incremental: only changed files' vectors are appended; the blob is fully rewritten
+ *  only when dead space passes COMPACT_AT. */
 export async function refreshIndex(root = process.cwd(), onProgress?: (msg: string) => void): Promise<number> {
-  const idx = loadIndex(root);
+  const m = loadManifest(root);
+  // Fresh manifest (first run, or format/scheme change) → start the blob clean so old bytes can't leak.
+  if (m.used === 0) {
+    try {
+      mkdirSync(adaDir(root), { recursive: true });
+      writeFileSync(blobPath(root), Buffer.alloc(0));
+    } catch {
+      /* best-effort */
+    }
+  }
+
   const files = walkFiles(root);
   const live = new Set(files);
-  for (const known of Object.keys(idx.files)) if (!live.has(known)) delete idx.files[known];
+  for (const rel of Object.keys(m.files)) {
+    if (!live.has(rel)) {
+      m.dead += m.files[rel]!.chunks.length * m.dim; // deleted → its vectors are now dead
+      delete m.files[rel];
+    }
+  }
 
   const stale: Array<{ rel: string; hash: string; chunks: Chunk[] }> = [];
   for (const rel of files) {
@@ -150,7 +222,7 @@ export async function refreshIndex(root = process.cwd(), onProgress?: (msg: stri
       continue;
     }
     const hash = sha1(text);
-    if (idx.files[rel]?.hash === hash) continue;
+    if (m.files[rel]?.hash === hash) continue;
     stale.push({ rel, hash, chunks: chunkText(text) });
   }
 
@@ -158,15 +230,26 @@ export async function refreshIndex(root = process.cwd(), onProgress?: (msg: stri
   for (const f of stale) {
     const vecs: number[][] = [];
     for (let i = 0; i < f.chunks.length; i += 32) {
-      const batch = f.chunks.slice(i, i + 32);
-      vecs.push(...(await embed(batch.map((c) => c.text))));
+      vecs.push(...(await embed(f.chunks.slice(i, i + 32).map((c) => c.text))));
     }
-    idx.files[f.rel] = { hash: f.hash, chunks: f.chunks.map((c, i) => ({ start: c.start, end: c.end, vec: vecs[i]! })) };
+    if (!m.dim && vecs[0]) m.dim = vecs[0].length;
+    const old = m.files[f.rel];
+    if (old) m.dead += old.chunks.length * m.dim; // replaced → old vectors are now dead
+    // Pack this file's vectors and append them to the blob at the current cursor.
+    const flat = new Float32Array(vecs.length * m.dim);
+    for (let i = 0; i < vecs.length; i++) flat.set(vecs[i]!, i * m.dim);
+    appendVectors(root, flat);
+    m.files[f.rel] = { hash: f.hash, base: m.used, chunks: f.chunks.map((c) => ({ start: c.start, end: c.end })) };
+    m.used += flat.length;
     done++;
     if (onProgress && done % 20 === 0) onProgress(`indexed ${done}/${stale.length} changed files…`);
   }
-  if (stale.length) saveIndex(root, idx);
-  return Object.values(idx.files).reduce((n, f) => n + f.chunks.length, 0);
+
+  if (stale.length || m.dead) {
+    if (m.used > 0 && m.dead / m.used > COMPACT_AT) compact(root, m);
+    saveManifest(root, m);
+  }
+  return Object.values(m.files).reduce((n, f) => n + f.chunks.length, 0);
 }
 
 export interface Hit {
@@ -180,12 +263,16 @@ export interface Hit {
 /** Top-k chunks most similar to the query. Refreshes the index first (incremental). */
 export async function searchCodebase(query: string, k = 6, root = process.cwd()): Promise<Hit[]> {
   await refreshIndex(root);
-  const idx = loadIndex(root);
+  const m = loadManifest(root);
+  const blob = readBlob(root);
+  const dim = m.dim;
   const [qvec] = await embed([query], "query");
   const hits: Hit[] = [];
-  for (const [rel, f] of Object.entries(idx.files)) {
-    for (const c of f.chunks) {
-      hits.push({ file: rel, start: c.start, end: c.end, score: cosine(qvec!, c.vec), snippet: "" });
+  for (const [rel, f] of Object.entries(m.files)) {
+    for (let i = 0; i < f.chunks.length; i++) {
+      const off = f.base + i * dim;
+      const c = f.chunks[i]!;
+      hits.push({ file: rel, start: c.start, end: c.end, score: cosine(qvec!, blob.subarray(off, off + dim)), snippet: "" });
     }
   }
   hits.sort((a, b) => b.score - a.score);
