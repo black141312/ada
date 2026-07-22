@@ -370,6 +370,8 @@ export function describeCall(name: string, args: Record<string, unknown>): { lab
       return { label: "edit", detail: s(a.path) };
     case "apply_patch":
       return { label: "patch", detail: "" };
+    case "generate_pptx":
+      return { label: "pptx", detail: `${s(a.path)} (${Array.isArray(a.slides) ? a.slides.length : "?"} slides)` };
     case "ls":
       return { label: "list", detail: s(a.path) || "." };
     case "glob":
@@ -396,6 +398,7 @@ export function describeCall(name: string, args: Record<string, unknown>): { lab
 export function permPhrase(name: string, destructive: boolean): string {
   if (name === "bash") return destructive ? "⚠ run a shell command that may modify your system" : "run a shell command on your machine";
   if (name === "write_file" || name === "edit_file" || name === "apply_patch") return "create or modify files on disk";
+  if (name === "generate_pptx") return "write a PowerPoint (.pptx) file to disk";
   if (name === "web_fetch" || name === "web_search") return "make a network request";
   if (name.includes("__")) return `use the ${name.split("__")[0]} connector`;
   return `run the ${name} tool`;
