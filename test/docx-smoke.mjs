@@ -33,6 +33,21 @@ const buf = buildDocx({
         ["macOS", "yes"],
       ],
     },
+    {
+      type: "metrics",
+      items: [
+        { value: "340+", label: "models" },
+        { value: "286", label: "skills" },
+      ],
+    },
+    {
+      type: "chart",
+      data: [
+        { label: "Explore", value: 42 },
+        { label: "Edit", value: 78 },
+      ],
+      unit: "k",
+    },
     { type: "pageBreak" },
     { type: "paragraph", text: "Appendix." },
   ],
@@ -88,6 +103,8 @@ assert.ok(doc.includes('<w:numId w:val="1"/>'), "bullet list missing");
 assert.ok(doc.includes('<w:numId w:val="2"/>'), "numbered list missing");
 assert.ok(doc.includes('<w:ilvl w:val="1"/>'), "nested bullet level missing");
 assert.ok(doc.includes("<w:tbl>"), "table missing");
+assert.ok(doc.includes('w:fill="4472C4"'), "chart bar fill missing");
+assert.ok(doc.includes('w:fill="F4F6FA"'), "metric tile fill missing");
 assert.ok(doc.includes('<w:br w:type="page"/>'), "page break missing");
 assert.ok(doc.includes("<w:sectPr>"), "section properties missing");
 // XML-escaping must survive user text

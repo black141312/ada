@@ -870,7 +870,7 @@ export const tools: Tool[] = [
     description:
       "Create a real, editable Word .docx from structured blocks — no Python, npm, or external tools needed. " +
       "This tool RENDERS; you supply the finished prose. Blocks are typed: heading (level 1-3), paragraph, bullets " +
-      "(nestable via {text, level}), numbered, table ({headers, rows}), image (local png/jpg/gif), pageBreak. " +
+      "(nestable via {text, level}), numbered, table ({headers, rows}), chart ({data:[{label,value}], unit}), metrics ({items:[{value,label}]}), image (local png/jpg/gif), pageBreak. " +
       "Write real content, not an outline: a document of bare headings is rejected. Prefer tables for comparisons and " +
       "structured data, and embed screenshots or diagrams with image. A bare filename lands in docs/.",
     parameters: {
@@ -885,7 +885,7 @@ export const tools: Tool[] = [
           items: {
             type: "object",
             properties: {
-              type: { type: "string", enum: ["heading", "paragraph", "bullets", "numbered", "table", "image", "pageBreak"] },
+              type: { type: "string", enum: ["heading", "paragraph", "bullets", "numbered", "table", "chart", "metrics", "image", "pageBreak"] },
               text: { type: "string", description: "For heading and paragraph." },
               level: { type: "number", description: "Heading level 1-3." },
               bold: { type: "boolean" },
@@ -893,6 +893,8 @@ export const tools: Tool[] = [
               items: { type: "array", items: {}, description: 'For bullets/numbered: strings, or {"text": "...", "level": 1} to nest.' },
               headers: { type: "array", items: { type: "string" }, description: "For table: the header row." },
               rows: { type: "array", items: { type: "array", items: { type: "string" } }, description: "For table: the body rows." },
+              data: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "number" } }, required: ["label", "value"], additionalProperties: false }, description: "For chart: the bars." },
+              unit: { type: "string", description: 'For chart: suffix on each value, e.g. "%".' },
               path: { type: "string", description: "For image: path to a local png/jpg/gif." },
               width: { type: "number", description: "For image: width in inches (default 6)." },
             },
@@ -993,7 +995,8 @@ export const tools: Tool[] = [
             const r = await fetch(`${base}/images/generations`, {
               method: "POST",
               headers: { "content-type": "application/json", authorization: `Bearer ${process.env.ADA_CLIENT_KEY ?? "dev"}` },
-              body: JSON.stringify({ model: "gpt-image-1", prompt: String(args.prompt), size }),
+              // No model here on purpose: the backend picks one for whichever image provider it has.
+              body: JSON.stringify({ prompt: String(args.prompt), size }),
               signal: AbortSignal.timeout(180_000),
             });
             const text = await r.text();

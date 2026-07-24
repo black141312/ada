@@ -19,6 +19,8 @@ export type DocxBlock =
   | { type: "bullets"; items: (string | { text: string; level?: number })[] }
   | { type: "numbered"; items: string[] }
   | { type: "table"; headers?: string[]; rows: string[][] }
+  | { type: "chart"; data: { label: string; value: number }[]; unit?: string } // bar chart, no image needed
+  | { type: "metrics"; items: { value: string; label?: string }[] } // KPI row
   | { type: "image"; path: string; width?: number } // width in inches (default 6)
   | { type: "pageBreak" };
 
@@ -82,6 +84,67 @@ function tableXml(t: DocxTable): string {
   const head = t.headers?.length ? `<w:tr>${t.headers.map((h) => cell(h, true)).join("")}</w:tr>` : "";
   const body = rows.map((r) => `<w:tr>${Array.from({ length: cols }, (_, i) => cell((r ?? [])[i] ?? "", false)).join("")}</w:tr>`).join("");
   return `<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/>${borders}</w:tblPr>${head}${body}</w:tbl>`;
+}
+
+/** Bar chart as a borderless table: label | bar (a shaded cell scaled to the value) | value.
+ *  Word has no lightweight inline shape, and a shaded cell renders identically everywhere. */
+function chartXml(data: { label: string; value: number }[], unit = ""): string {
+  const rows = data.slice(0, 12).filter((d) => d && typeof d.label === "string");
+  if (!rows.length) return "";
+  const max = Math.max(...rows.map((d) => Math.abs(Number(d.value) || 0)), 1);
+  const LABEL_W = 2200;
+  const TRACK_W = 6000;
+  const VALUE_W = 1100;
+  const cell = (w: number, inner: string, shade?: string): string =>
+    `<w:tc><w:tcPr><w:tcW w:w="${w}" w:type="dxa"/><w:vAlign w:val="center"/>${shade ? `<w:shd w:val="clear" w:fill="${shade}"/>` : ""}</w:tcPr>${inner}</w:tc>`;
+  const body = rows
+    .map((d) => {
+      const v = Number(d.value) || 0;
+      const filled = Math.max(1, Math.round((Math.abs(v) / max) * TRACK_W));
+      const rest = Math.max(1, TRACK_W - filled);
+      // the bar is a nested 2-cell table so the filled portion scales precisely
+      const bar =
+        `<w:tbl><w:tblPr><w:tblW w:w="${TRACK_W}" w:type="dxa"/><w:tblBorders>` +
+        ["top", "left", "bottom", "right", "insideH", "insideV"].map((s) => `<w:${s} w:val="none" w:sz="0" w:space="0" w:color="auto"/>`).join("") +
+        `</w:tblBorders></w:tblPr><w:tr>` +
+        cell(filled, paragraph(run(" ", { sz: 16 }), { spaceAfter: 0 }), COLOR.accent) +
+        cell(rest, paragraph(run(" ", { sz: 16 }), { spaceAfter: 0 }), "EDF0F6") +
+        `</w:tr></w:tbl><w:p><w:pPr><w:spacing w:after="0"/></w:pPr></w:p>`;
+      return (
+        `<w:tr>` +
+        cell(LABEL_W, paragraph(run(d.label, { sz: 20 }), { spaceAfter: 0 })) +
+        cell(TRACK_W, bar) +
+        cell(VALUE_W, paragraph(run(`${v}${unit}`, { sz: 20, bold: true, color: COLOR.heading }), { spaceAfter: 0 })) +
+        `</w:tr>`
+      );
+    })
+    .join("");
+  const noBorders =
+    `<w:tblBorders>` +
+    ["top", "left", "bottom", "right", "insideH", "insideV"].map((s) => `<w:${s} w:val="none" w:sz="0" w:space="0" w:color="auto"/>`).join("") +
+    `</w:tblBorders>`;
+  return `<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/>${noBorders}</w:tblPr>${body}</w:tbl>`;
+}
+
+/** KPI row: one shaded cell per metric, big figure over a caption. */
+function metricsXml(items: { value: string; label?: string }[]): string {
+  const cells = items.slice(0, 4).filter((m) => m && (m.value != null || m.label));
+  if (!cells.length) return "";
+  const w = Math.floor(9360 / cells.length);
+  const body = cells
+    .map(
+      (m) =>
+        `<w:tc><w:tcPr><w:tcW w:w="${w}" w:type="dxa"/><w:shd w:val="clear" w:fill="F4F6FA"/><w:tcMar><w:top w:w="160" w:type="dxa"/><w:bottom w:w="160" w:type="dxa"/></w:tcMar></w:tcPr>` +
+        paragraph(run(String(m.value ?? ""), { sz: 44, bold: true, color: COLOR.accent }), { align: "center", spaceAfter: 40 }) +
+        (m.label ? paragraph(run(m.label, { sz: 18, color: COLOR.muted }), { align: "center", spaceAfter: 0 }) : paragraph("", { spaceAfter: 0 })) +
+        `</w:tc>`,
+    )
+    .join("");
+  const noBorders =
+    `<w:tblBorders>` +
+    ["top", "left", "bottom", "right", "insideH", "insideV"].map((s) => `<w:${s} w:val="none" w:sz="0" w:space="0" w:color="auto"/>`).join("") +
+    `</w:tblBorders>`;
+  return `<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/>${noBorders}</w:tblPr><w:tr>${body}</w:tr></w:tbl>`;
 }
 
 function imageXml(relId: string, cx: number, cy: number, id: number): string {
@@ -190,6 +253,14 @@ export function buildDocx(spec: DocxSpec, cwd = process.cwd()): Buffer {
         body.push(tableXml({ headers: blk.headers, rows: blk.rows }));
         body.push(paragraph("", { spaceAfter: 160 })); // Word needs a paragraph after a table
         break;
+      case "chart":
+        body.push(chartXml(Array.isArray(blk.data) ? blk.data : [], blk.unit ?? ""));
+        body.push(paragraph("", { spaceAfter: 160 }));
+        break;
+      case "metrics":
+        body.push(metricsXml(Array.isArray(blk.items) ? blk.items : []));
+        body.push(paragraph("", { spaceAfter: 160 }));
+        break;
       case "image": {
         const p = String(blk.path ?? "");
         const abs = isAbsolute(p) ? p : resolve(cwd, p);
@@ -213,7 +284,7 @@ export function buildDocx(spec: DocxSpec, cwd = process.cwd()): Buffer {
         body.push(`<w:p><w:r><w:br w:type="page"/></w:r></w:p>`);
         break;
       default:
-        throw new Error(`generate_docx: block ${i + 1}: unknown type "${(blk as { type?: string }).type}" (heading|paragraph|bullets|numbered|table|image|pageBreak)`);
+        throw new Error(`generate_docx: block ${i + 1}: unknown type "${(blk as { type?: string }).type}" (heading|paragraph|bullets|numbered|table|chart|metrics|image|pageBreak)`);
     }
   });
 

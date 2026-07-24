@@ -258,10 +258,13 @@ async function handleImages(req: IncomingMessage, res: ServerResponse, who: Iden
   } catch {
     return json(res, 400, { error: { message: "invalid JSON body" } });
   }
-  const key = providerKey("openai");
-  if (!key) return json(res, 503, { error: { message: "image generation is not configured on this backend (no OPENAI_API_KEY)" } });
-  const model = String(body.model ?? "gpt-image-1");
-  const upstream = await fetch(`${PROVIDERS.openai.baseURL}/images/generations`, {
+  // Use whichever image-capable provider is configured. OpenRouter exposes an OpenAI-compatible
+  // /images/generations surface, so the same request shape works for both — no extra key needed.
+  const provider: ProviderName = providerKey("openai") ? "openai" : "openrouter";
+  const key = providerKey(provider);
+  if (!key) return json(res, 503, { error: { message: "image generation is not configured on this backend (no OPENAI_API_KEY or OPENROUTER_API_KEY)" } });
+  const model = String(body.model ?? (provider === "openrouter" ? process.env.ADA_IMAGE_MODEL || "google/gemini-2.5-flash-image" : "gpt-image-1"));
+  const upstream = await fetch(`${PROVIDERS[provider].baseURL}/images/generations`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
     body: JSON.stringify({ ...body, model }),
