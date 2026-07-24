@@ -132,6 +132,8 @@ function parseArgs(argv: string[]): Flags {
       f.rpc = true;
     } else if (a === "--tui") {
       f.tui = true;
+    } else if (a === "--no-tui") {
+      f.tui = false;
     } else if (a === "--strategy") {
       f.strategy = argv[++i];
     } else if (a === "--agent") {
@@ -463,8 +465,8 @@ async function approvePrompt(rl: RL, name: string, summary: string): Promise<App
   const width = stdout.columns || 80;
   const titleRows = Math.max(1, Math.ceil(title.replace(/\x1b\[[0-9;]*m/g, "").length / width));
   stdout.write(`\x1b[${items.length + titleRows}A\x1b[0J`);
-  const mark = val === "no" ? "\x1b[31m✗\x1b[0m no" : val === "auto" ? "\x1b[32m✓\x1b[0m yes · won't ask again" : "\x1b[32m✓\x1b[0m yes";
-  stdout.write(`${mark} \x1b[2m${what}\x1b[0m\n`);
+  const mark = val === "no" ? "\x1b[31m✗ denied\x1b[0m" : val === "auto" ? "\x1b[32m✓ approved · always this session\x1b[0m" : "\x1b[32m✓ approved\x1b[0m";
+  stdout.write(`${mark} \x1b[2m— ${what}\x1b[0m\n`);
   return val;
 }
 
@@ -1638,9 +1640,11 @@ async function main(): Promise<void> {
   };
   setMode(autoApprove ? "auto" : "ask"); // apply the initial mode (e.g. --yolo → auto) consistently
 
-  if (flags.tui && stdin.isTTY) {
+  if (flags.tui !== false && stdin.isTTY) {
     rl.close(); // hand stdin to the TUI so readline doesn't echo keystrokes too
-    await runTui(agent, model);
+    // Ink UI by default; ADA_TUI=inline falls back to the hand-rolled renderer.
+    if (process.env.ADA_TUI === "inline") await runTui(agent, model);
+    else await (await import("./ink-tui.tsx")).runInkTui(agent, model);
     return;
   }
 

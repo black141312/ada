@@ -29,8 +29,9 @@ model is **zero code**, and a new OpenAI-compatible provider is **two lines**.
   pyright, gopls, rust-analyzer) and returns errors/warnings; servers are reused, trusted-project only.
 - **Real PTY shell** — `bash` runs in a pseudo-terminal (node-pty), so TTY-only programs, colour, and
   progress output behave; ANSI is stripped from what the model sees.
-- **Two front-ends** — a classic readline REPL and an inline **TUI** (`--tui`) with a live "thinking"
-  spinner and Claude-style turn markers.
+- **Two front-ends** — an Ink-based **TUI** (default) with a live "thinking" spinner, Claude-style
+  turn markers, and boxed approval prompts, plus a classic readline REPL (`--no-tui`) where the full
+  slash-command set lives.
 - **Permission modes — ask / plan / auto** — `/ask` confirms each tool, `/plan` is read-only (ada
   plans, `/run` to execute), `/auto` runs freely (destructive `bash` still confirms). Each approval
   states in plain words what it wants ("ada wants to run a shell command…") instead of raw args.
@@ -136,7 +137,8 @@ start it manually first — `ada` will detect and reuse it.
 
 ```bash
 ada                      # interactive; pick a model on first run
-ada --tui                # inline TUI front-end
+ada                      # Ink TUI front-end (default in a terminal)
+ada --no-tui             # classic readline REPL (all slash commands)
 ada --model <id>         # start on a specific model
 ada --list-models        # everything your keys can reach (via the backend)
 ada --continue           # resume the most recent session

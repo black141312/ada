@@ -420,14 +420,19 @@ function isTransient(e: unknown): boolean {
 }
 
 /** Run `fn`, retrying transient failures (429/5xx/network) with exponential backoff. */
-async function withRetry<T>(fn: () => Promise<T>, signal: AbortSignal | undefined, max = 3): Promise<T> {
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  signal: AbortSignal | undefined,
+  notice: (s: string) => void = (s) => process.stdout.write(s),
+  max = 3,
+): Promise<T> {
   let delay = 800;
   for (let attempt = 0; ; attempt++) {
     try {
       return await fn();
     } catch (e) {
       if (signal?.aborted || attempt >= max || !isTransient(e)) throw e;
-      process.stdout.write(`\x1b[2m[retrying in ${(delay / 1000).toFixed(1)}s — ${e instanceof Error ? e.message : e}]\x1b[0m\n`);
+      notice(`\x1b[2m[retrying in ${(delay / 1000).toFixed(1)}s — ${e instanceof Error ? e.message : e}]\x1b[0m\n`);
       await new Promise((r) => setTimeout(r, delay));
       delay *= 2;
     }
@@ -645,7 +650,7 @@ export class Agent {
         );
       let stream: Awaited<ReturnType<typeof create>>;
       try {
-        stream = await withRetry(create, signal);
+        stream = await withRetry(create, signal, say);
       } catch (e) {
         if (signal?.aborted) {
           interrupted();
@@ -743,9 +748,9 @@ export class Agent {
     };
     const printResult = (callId: string, name: string, r: ToolResult): void => {
       ctrl?.onEvent?.({ type: "tool_result", callId, name, output: r.output, isError: !!r.isError, display: r.display });
-      if (r.display) return void say(`${r.display}\n`); // rich display (e.g. edit diff) is its own result block
-      const first = (r.output || "").split("\n").find((l) => l.trim()) ?? "";
-      const line = first.length > 80 ? `${first.slice(0, 79)}…` : first; // one-line summary under the ⏺ call
+      // ponytail: always a one-line ⎿ summary — the model sees the full output; the human chat stays clean
+      const first = (r.display ?? r.output ?? "").replace(/\x1b\[[0-9;]*m/g, "").split("\n").find((l) => l.trim())?.trim() ?? "";
+      const line = first.length > 80 ? `${first.slice(0, 79)}…` : first;
       if (r.isError) say(`\x1b[31m  ⎿ ${line}\x1b[0m\n`);
       else if (line) say(`\x1b[2m  ⎿ ${line}\x1b[0m\n`);
     };

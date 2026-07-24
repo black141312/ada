@@ -31,6 +31,9 @@ export function userBar(text: string, cols: number): string {
 
 export class Tui {
   private buf = "";
+  private cur = 0; // cursor index into buf
+  private pasting = false;
+  private paste = "";
   private status = "";
   private history: string[] = [];
   private hist = -1;
@@ -51,7 +54,7 @@ export class Tui {
     if (stdin.isTTY) stdin.setRawMode(true);
     stdin.resume();
     stdin.on("data", this.onData);
-    stdout.write("\x1b[?25l"); // hide the real cursor; the composer draws a fake block
+    stdout.write("\x1b[?25l\x1b[?2004h"); // hide the real cursor; enable bracketed paste
   }
 
   stop(): void {
@@ -59,7 +62,7 @@ export class Tui {
     stdin.off("data", this.onData);
     if (stdin.isTTY) stdin.setRawMode(false);
     stdin.pause(); // unref stdin so the process can exit
-    stdout.write("\x1b[?25h\n"); // show cursor, fresh line
+    stdout.write("\x1b[?2004l\x1b[?25h\n"); // show cursor, fresh line
   }
 
   setStatus(s: string): void {
@@ -70,6 +73,7 @@ export class Tui {
   readLine(): Promise<string | null> {
     this.mode = "line";
     this.buf = "";
+    this.cur = 0;
     this.hist = -1;
     this.renderComposer();
     return new Promise((res) => (this.lineResolve = res));
@@ -94,6 +98,7 @@ export class Tui {
     this.abort = abort;
     this.steer = steer;
     this.buf = "";
+    this.cur = 0;
     this.startThinking();
   }
 
@@ -120,12 +125,19 @@ export class Tui {
   private renderComposer(): void {
     const cols = stdout.columns || 80;
     const max = Math.max(8, cols - 3);
-    const shown = this.buf.length > max ? `…${this.buf.slice(this.buf.length - max + 1)}` : this.buf;
-    stdout.write(`\r\x1b[2K${GOLD}›${RST} ${shown}\x1b[7m \x1b[0m`); // trailing reverse-video = block cursor
+    const disp = this.buf.replace(/\n/g, "⏎"); // newlines (from paste) shown as ⏎ in the one-line composer
+    // Window the text so the cursor is always visible; ‹› marks scrolled-off text.
+    let start = 0;
+    if (disp.length + 1 > max) start = Math.min(Math.max(0, this.cur - max + 1), disp.length + 1 - max);
+    const view = disp.slice(start, start + max);
+    const c = this.cur - start;
+    const line = `${view.slice(0, c)}\x1b[7m${view[c] ?? " "}\x1b[0m${view.slice(c + 1)}`; // reverse-video = block cursor
+    stdout.write(`\r\x1b[2K${GOLD}${start > 0 ? "‹" : "›"}${RST} ${line}`);
   }
 
   private commitUser(text: string): void {
-    stdout.write(`\r\x1b[2K${userBar(text, stdout.columns || 80)}\n`); // composer line becomes the bar
+    const cols = stdout.columns || 80;
+    stdout.write(`\r\x1b[2K${text.split("\n").map((l) => userBar(l, cols)).join("\n")}\n`); // composer line becomes the bar
   }
 
   private startThinking(): void {
@@ -157,7 +169,42 @@ export class Tui {
     }
   }
 
+  /** Insert pasted text at the cursor as one blob — newlines kept, so a multi-line paste is one message. */
+  private insertPaste(text: string): void {
+    const clean = text.replace(/\r\n?/g, "\n");
+    this.buf = this.buf.slice(0, this.cur) + clean + this.buf.slice(this.cur);
+    this.cur += clean.length;
+    if (this.mode === "line") this.renderComposer();
+  }
+
   private key(s: string): void {
+    // Bracketed paste (\x1b[200~ … \x1b[201~): capture the payload instead of keystroke-replaying it.
+    if (this.pasting) {
+      const end = s.indexOf("\x1b[201~");
+      if (end < 0) {
+        this.paste += s;
+        return;
+      }
+      this.pasting = false;
+      this.insertPaste(this.paste + s.slice(0, end));
+      this.paste = "";
+      s = s.slice(end + 6);
+      if (!s) return;
+    }
+    const ps = s.indexOf("\x1b[200~");
+    if (ps >= 0) {
+      const rest = s.slice(ps + 6);
+      const end = rest.indexOf("\x1b[201~");
+      if (end < 0) {
+        this.pasting = true;
+        this.paste = rest;
+      } else {
+        this.insertPaste(rest.slice(0, end));
+      }
+      s = s.slice(0, ps);
+      if (!s) return;
+    }
+
     if (this.mode === "confirm") {
       const k = s.toLowerCase();
       if (k === "y") this.resolveConfirm("yes");
@@ -184,9 +231,26 @@ export class Tui {
         if (s === "\x1b[A") this.hist = this.hist < 0 ? this.history.length - 1 : Math.max(0, this.hist - 1);
         else this.hist = this.hist < 0 ? -1 : this.hist + 1;
         this.buf = this.hist >= 0 && this.hist < this.history.length ? this.history[this.hist]! : "";
+        this.cur = this.buf.length;
         this.renderComposer();
       }
       return;
+    }
+    // Cursor movement + forward delete.
+    if (s === "\x1b[D") return this.edit(() => (this.cur = Math.max(0, this.cur - 1)));
+    if (s === "\x1b[C") return this.edit(() => (this.cur = Math.min(this.buf.length, this.cur + 1)));
+    if (s === "\x1b[H" || s === "\x1b[1~" || s === "\x01") return this.edit(() => (this.cur = 0)); // Home / Ctrl+A
+    if (s === "\x1b[F" || s === "\x1b[4~" || s === "\x05") return this.edit(() => (this.cur = this.buf.length)); // End / Ctrl+E
+    if (s === "\x1b[3~") return this.edit(() => (this.buf = this.buf.slice(0, this.cur) + this.buf.slice(this.cur + 1))); // Delete
+    if (s === "\x15") return this.edit(() => ((this.buf = this.buf.slice(this.cur)), (this.cur = 0))); // Ctrl+U: kill to start
+    if (s === "\x0b") return this.edit(() => (this.buf = this.buf.slice(0, this.cur))); // Ctrl+K: kill to end
+    if (s === "\x17") {
+      // Ctrl+W: delete word before cursor
+      return this.edit(() => {
+        const head = this.buf.slice(0, this.cur).replace(/\S+\s*$/, "");
+        this.buf = head + this.buf.slice(this.cur);
+        this.cur = head.length;
+      });
     }
     if (s.startsWith("\x1b")) return; // ignore other escape sequences
 
@@ -194,6 +258,7 @@ export class Tui {
       if (ch === "\r" || ch === "\n") {
         const text = this.buf.trim();
         this.buf = "";
+        this.cur = 0;
         if (this.mode === "line") {
           if (text) {
             this.history.push(text);
@@ -208,13 +273,23 @@ export class Tui {
           stdout.write(`${DIM}  ↳ queued: ${text}${RST}\n`); // steer is captured blind, echoed on submit
         }
       } else if (ch === "\x7f" || ch === "\b") {
-        this.buf = this.buf.slice(0, -1);
+        if (this.cur > 0) {
+          this.buf = this.buf.slice(0, this.cur - 1) + this.buf.slice(this.cur);
+          this.cur--;
+        }
         if (this.mode === "line") this.renderComposer();
       } else if (ch >= " ") {
-        this.buf += ch;
+        this.buf = this.buf.slice(0, this.cur) + ch + this.buf.slice(this.cur);
+        this.cur++;
         if (this.mode === "line") this.renderComposer();
       }
     }
+  }
+
+  /** Apply a buffer/cursor mutation and repaint (line mode only). */
+  private edit(fn: () => unknown): void {
+    fn();
+    if (this.mode === "line") this.renderComposer();
   }
 
   private resolveConfirm(d: "yes" | "all" | "no"): void {

@@ -818,6 +818,52 @@ export const tools: Tool[] = [
     },
   },
   {
+    name: "generate_image",
+    description:
+      "Generate an image from a text prompt (OpenAI gpt-image-1) and save it as a PNG, then open it in the system viewer. Use for illustrations, scenes, concept art, and visual scenarios. Write a rich, specific prompt — style, mood, lighting, composition. Requires OPENAI_API_KEY.",
+    parameters: {
+      type: "object",
+      properties: {
+        prompt: { type: "string", description: "Detailed description of the image: subject, style, mood, lighting, composition." },
+        path: { type: "string", description: "Output file path ending in .png." },
+        size: { type: "string", enum: ["1024x1024", "1536x1024", "1024x1536"], description: "Dimensions: square (default), landscape, or portrait." },
+      },
+      required: ["prompt", "path"],
+      additionalProperties: false,
+    },
+    needsApproval: true,
+    async run(args) {
+      const rel = String(args.path);
+      const abs = resolve(process.cwd(), rel);
+      if (!abs.toLowerCase().endsWith(".png")) return { output: `generate_image: path must end in .png (got ${rel})`, isError: true };
+      if (!process.env.OPENAI_API_KEY) return { output: "generate_image: OPENAI_API_KEY is not set — export it to enable image generation.", isError: true };
+      return withFileLock(abs, async () => {
+        if (isProtected(abs)) return { output: `Refused: ${rel} is a protected path.`, isError: true };
+        try {
+          const { default: OpenAI } = await import("openai");
+          const client = new OpenAI(); // key from OPENAI_API_KEY; images need the real OpenAI API, not the router backend
+          const res = await client.images.generate({ model: "gpt-image-1", prompt: String(args.prompt), size: (args.size as "1024x1024") ?? "1024x1024" });
+          const b64 = res.data?.[0]?.b64_json;
+          if (!b64) return { output: "generate_image: API returned no image data.", isError: true };
+          checkpoint.record(abs);
+          mkdirSync(dirname(abs), { recursive: true });
+          const buf = Buffer.from(b64, "base64");
+          writeFileSync(abs, buf);
+          const [cmd, cargs] =
+            process.platform === "win32" ? ["cmd", ["/c", "start", "", abs]] : process.platform === "darwin" ? ["open", [abs]] : ["xdg-open", [abs]];
+          try {
+            spawnSync(cmd as string, cargs as string[], { stdio: "ignore" });
+          } catch {
+            /* opening the viewer is best-effort */
+          }
+          return { output: `Wrote ${rel} (${Math.round(buf.length / 1024)} KB) and opened it in the viewer.`, display: green(`+ ${rel} (${Math.round(buf.length / 1024)} KB image)`) };
+        } catch (e) {
+          return { output: e instanceof Error ? e.message : String(e), isError: true };
+        }
+      });
+    },
+  },
+  {
     name: "lsp_diagnostics",
     description: "Get language-server diagnostics (errors/warnings) for a file — call after editing to check it compiles/type-checks. Needs the language server installed (typescript-language-server, pyright, gopls, rust-analyzer) in a trusted project.",
     parameters: {
