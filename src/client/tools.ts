@@ -759,7 +759,14 @@ export const tools: Tool[] = [
   {
     name: "generate_pptx",
     description:
-      "Create a real, editable PowerPoint .pptx file from structured slide content — no Python, npm, or external tools needed. Provide the finished text for every slide (this tool renders; it does not write copy). Bullets accept plain strings or {text, level} for nesting; a slide with a subtitle and no bullets renders as a centered title slide; `image` embeds a local png/jpg/gif; `notes` become speaker notes.",
+      "Create a real, editable PowerPoint .pptx file from structured slide content — no Python, npm, or external tools needed. " +
+      "This tool RENDERS; it does not write copy — you must supply the finished content. Every content slide needs 3-6 substantive " +
+      "bullets carrying real specifics (facts, numbers, file/component names, decisions) — never bare titles or placeholders; a " +
+      "title-only deck is rejected. Bullets accept plain strings or {text, level} for nesting. A slide with a subtitle and no " +
+      "bullets is a centered title/section slide (use sparingly). `notes` adds speaker notes — include them. " +
+      "For VISUALS: `image` embeds a local png/jpg/gif, so create the picture first (an existing screenshot/asset, a chart or " +
+      "diagram you render to PNG with a script, or generate_image) and pass its path — decks with only text are weak. " +
+      "Close with a summary/next-steps slide.",
     parameters: {
       type: "object",
       properties: {
@@ -803,6 +810,24 @@ export const tools: Tool[] = [
             }
           }
           args = { ...args, slides };
+          // Guard against title-only decks: a slide with no bullets/subtitle/image is an empty shell.
+          // Models routinely emit an outline and call it done — make that a hard error, not a bad deck.
+          if (Array.isArray(slides)) {
+            const empty = (slides as PptxSlideSpec[]).filter((s) => {
+              const b = Array.isArray(s?.bullets) ? s.bullets.length : 0;
+              return b === 0 && !s?.subtitle && !s?.image;
+            }).length;
+            if (slides.length > 1 && empty > 1) {
+              return {
+                output:
+                  `generate_pptx: refused — ${empty} of ${slides.length} slides have only a title (no bullets, subtitle, or image). ` +
+                  "That produces an empty outline, not a deck. Re-send with real content: 3-6 substantive bullets per content slide " +
+                  "(specific facts, numbers, names — not placeholders), `notes` for speaker notes, and `image` for any diagram or " +
+                  "screenshot. Only the opening/section slides may use a subtitle with no bullets.",
+                isError: true,
+              };
+            }
+          }
           const buf = buildPptx({ title: args.title == null ? undefined : String(args.title), slides: slides as PptxSlideSpec[] });
           mkdirSync(dirname(abs), { recursive: true });
           writeFileSync(abs, buf);
