@@ -248,6 +248,65 @@ async function handleEmbeddings(req: IncomingMessage, res: ServerResponse, who: 
   res.end(text);
 }
 
+// Prefer a FREE image model when the catalog has one, else the cheapest sensible paid default.
+// OpenRouter's free tier comes and goes, so this is resolved at runtime (cached an hour) rather than
+// hardcoded — the day a free image model appears, image generation starts costing nothing.
+const IMAGE_FALLBACK = "google/gemini-2.5-flash-image";
+let imageModelCache: { at: number; id: string } | null = null;
+
+async function pickImageModel(): Promise<string> {
+  if (process.env.ADA_IMAGE_MODEL) return process.env.ADA_IMAGE_MODEL;
+  if (imageModelCache && Date.now() - imageModelCache.at < 3_600_000) return imageModelCache.id;
+  let chosen = IMAGE_FALLBACK;
+  try {
+    const r = await fetch(`${PROVIDERS.openrouter.baseURL}/models`, { signal: AbortSignal.timeout(8000) });
+    if (r.ok) {
+      const list = ((await r.json()) as { data?: Array<Record<string, unknown>> }).data ?? [];
+      const isFree = (m: Record<string, unknown>): boolean => {
+        const p = (m.pricing ?? {}) as Record<string, string>;
+        return ["prompt", "completion", "image", "request"].every((k) => p[k] === undefined || Number(p[k]) === 0);
+      };
+      const emitsImages = (m: Record<string, unknown>): boolean =>
+        (((m.architecture ?? {}) as { output_modalities?: string[] }).output_modalities ?? []).includes("image");
+      const free = list.filter((m) => emitsImages(m) && isFree(m));
+      // ":free" variants are the explicit free tier; otherwise any zero-priced image model.
+      const pick = free.find((m) => String(m.id).endsWith(":free")) ?? free[0];
+      if (pick?.id) chosen = String(pick.id);
+    }
+  } catch {
+    /* catalog unreachable — fall back */
+  }
+  imageModelCache = { at: Date.now(), id: chosen };
+  return chosen;
+}
+
+/** Image generation for `generate_image` — proxied to whichever image provider the backend has, so
+ *  app users need no key of their own. Same auth/metering path as chat. */
+async function handleImages(req: IncomingMessage, res: ServerResponse, who: Identity): Promise<void> {
+  const raw = await readBody(req);
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return json(res, 400, { error: { message: "invalid JSON body" } });
+  }
+  // Use whichever image-capable provider is configured. OpenRouter exposes an OpenAI-compatible
+  // /images/generations surface, so the same request shape works for both — no extra key needed.
+  const provider: ProviderName = providerKey("openai") ? "openai" : "openrouter";
+  const key = providerKey(provider);
+  if (!key) return json(res, 503, { error: { message: "image generation is not configured on this backend (no OPENAI_API_KEY or OPENROUTER_API_KEY)" } });
+  const model = String(body.model ?? (provider === "openrouter" ? await pickImageModel() : "gpt-image-1"));
+  const upstream = await fetch(`${PROVIDERS[provider].baseURL}/images/generations`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+    body: JSON.stringify({ ...body, model }),
+  });
+  const text = await upstream.text();
+  if (upstream.ok) appendUsage({ ts: Date.now(), user: who.user, model, provider: "openai", promptTokens: 0, completionTokens: 0 });
+  res.writeHead(upstream.status, { "content-type": "application/json" });
+  res.end(text);
+}
+
 /** Public: advertise enabled login methods so the terminal client can self-configure (no OIDC env on
  *  the client). For OIDC it returns the issuer + client id + device/token endpoints (all public
  *  discovery values) plus the exchange path. Unauthenticated by design. */
@@ -367,6 +426,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     }
     if (req.method === "POST" && url.pathname === "/v1/embeddings") {
       return await handleEmbeddings(req, res, who);
+    }
+    if (req.method === "POST" && url.pathname === "/v1/images/generations") {
+      return await handleImages(req, res, who);
     }
 
     // ---- enterprise control plane ----

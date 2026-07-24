@@ -5,12 +5,22 @@
 // (explicit text boxes, no placeholder inheritance), optional embedded images and speaker notes.
 
 import { readFileSync } from "node:fs";
-import { deflateRawSync } from "node:zlib";
 import { extname, isAbsolute, resolve } from "node:path";
+import { EMU, IMAGE_TYPES, REL_NS, RT, XML_DECL, esc, imageSize, relsXml, zip } from "./ooxml.ts";
 
 export interface PptxBullet {
   text: string;
   level?: number; // 0-based indent level
+}
+
+export interface PptxChartDatum {
+  label: string;
+  value: number;
+}
+
+export interface PptxMetric {
+  value: string; // the headline figure, e.g. "340+" or "99.9%"
+  label?: string; // what it measures
 }
 
 export interface PptxSlideSpec {
@@ -18,6 +28,8 @@ export interface PptxSlideSpec {
   subtitle?: string; // present (with no bullets) ⇒ centered title-slide treatment
   bullets?: (string | PptxBullet)[];
   image?: string; // path to a local png/jpg/gif, embedded into the file
+  chart?: { data: PptxChartDatum[]; unit?: string }; // horizontal bar chart, drawn as native shapes
+  metrics?: PptxMetric[]; // a row of big KPI figures
   notes?: string; // speaker notes
 }
 
@@ -27,112 +39,16 @@ export interface PptxSpec {
   slides: PptxSlideSpec[];
 }
 
-// ---------------------------------------------------------------------------
-// Minimal ZIP writer (deflate, falls back to store) — enough for OPC packages.
 
-const CRC_TABLE = new Uint32Array(256).map((_, n) => {
-  let c = n;
-  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-  return c >>> 0;
-});
-
-function crc32(buf: Buffer): number {
-  let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]!) & 0xff]! ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
-}
-
-function zip(entries: { name: string; data: Buffer }[]): Buffer {
-  const locals: Buffer[] = [];
-  const centrals: Buffer[] = [];
-  let offset = 0;
-  const dosDate = ((2026 - 1980) << 9) | (1 << 5) | 1; // fixed 2026-01-01 for determinism
-  for (const { name, data } of entries) {
-    const nameBuf = Buffer.from(name, "utf8");
-    const deflated = deflateRawSync(data, { level: 9 });
-    const method = deflated.length < data.length ? 8 : 0;
-    const payload = method === 8 ? deflated : data;
-    const crc = crc32(data);
-    const local = Buffer.alloc(30);
-    local.writeUInt32LE(0x04034b50, 0);
-    local.writeUInt16LE(20, 4); // version needed
-    local.writeUInt16LE(0, 6); // flags
-    local.writeUInt16LE(method, 8);
-    local.writeUInt16LE(0, 10); // time
-    local.writeUInt16LE(dosDate, 12);
-    local.writeUInt32LE(crc, 14);
-    local.writeUInt32LE(payload.length, 18);
-    local.writeUInt32LE(data.length, 22);
-    local.writeUInt16LE(nameBuf.length, 26);
-    local.writeUInt16LE(0, 28); // extra len
-    locals.push(local, nameBuf, payload);
-    const central = Buffer.alloc(46);
-    central.writeUInt32LE(0x02014b50, 0);
-    central.writeUInt16LE(20, 4); // version made by
-    central.writeUInt16LE(20, 6); // version needed
-    central.writeUInt16LE(0, 8);
-    central.writeUInt16LE(method, 10);
-    central.writeUInt16LE(0, 12);
-    central.writeUInt16LE(dosDate, 14);
-    central.writeUInt32LE(crc, 16);
-    central.writeUInt32LE(payload.length, 20);
-    central.writeUInt32LE(data.length, 24);
-    central.writeUInt16LE(nameBuf.length, 28);
-    // comment/disk/attrs/offset fields
-    central.writeUInt32LE(offset, 42);
-    centrals.push(central, nameBuf);
-    offset += local.length + nameBuf.length + payload.length;
-  }
-  const centralSize = centrals.reduce((n, b) => n + b.length, 0);
-  const eocd = Buffer.alloc(22);
-  eocd.writeUInt32LE(0x06054b50, 0);
-  eocd.writeUInt16LE(entries.length, 8);
-  eocd.writeUInt16LE(entries.length, 10);
-  eocd.writeUInt32LE(centralSize, 12);
-  eocd.writeUInt32LE(offset, 16);
-  return Buffer.concat([...locals, ...centrals, eocd]);
-}
-
-// ---------------------------------------------------------------------------
-// Image handling: sniff dimensions so pictures keep their aspect ratio.
-
-const IMAGE_TYPES: Record<string, string> = { ".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".gif": "gif" };
-
-function imageSize(buf: Buffer, kind: string): { w: number; h: number } | null {
-  try {
-    if (kind === "png" && buf.readUInt32BE(12) === 0x49484452) return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
-    if (kind === "gif") return { w: buf.readUInt16LE(6), h: buf.readUInt16LE(8) };
-    if (kind === "jpeg") {
-      let i = 2;
-      while (i + 9 < buf.length) {
-        if (buf[i] !== 0xff) break;
-        const marker = buf[i + 1]!;
-        if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) return { w: buf.readUInt16BE(i + 7), h: buf.readUInt16BE(i + 5) };
-        i += 2 + buf.readUInt16BE(i + 2);
-      }
-    }
-  } catch {
-    /* fall through — caller uses the full bounding box */
-  }
-  return null;
-}
 
 // ---------------------------------------------------------------------------
 // OOXML part builders. All geometry in EMU (914400/inch); slide is 16:9.
 
-const EMU = 914400;
 const SLIDE_W = 12192000; // 13.333in
 const SLIDE_H = 6858000; // 7.5in
 const NS = `xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"`;
-const XML_DECL = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`;
-const REL_NS = `xmlns="http://schemas.openxmlformats.org/package/2006/relationships"`;
-const RT = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
 const COLOR = { title: "202124", body: "3C4043", accent: "4472C4", muted: "5F6368" };
-
-function esc(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
-}
 
 const inch = (n: number): number => Math.round(n * EMU);
 
@@ -186,6 +102,66 @@ function accentBar(id: number, box: Box): string {
   );
 }
 
+/** A filled rectangle (rounded when `round`) — the building block for charts and KPI tiles. */
+function rectShape(id: number, box: Box, fill: string, round = false): string {
+  return (
+    `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="Shape"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>` +
+    `<p:spPr><a:xfrm><a:off x="${Math.round(box.x)}" y="${Math.round(box.y)}"/><a:ext cx="${Math.max(1, Math.round(box.w))}" cy="${Math.max(1, Math.round(box.h))}"/></a:xfrm>` +
+    `<a:prstGeom prst="${round ? "roundRect" : "rect"}"><a:avLst${round ? `><a:gd name="adj" fmla="val 12000"/></a:avLst` : "/"}></a:prstGeom>` +
+    `<a:solidFill><a:srgbClr val="${fill}"/></a:solidFill><a:ln><a:noFill/></a:ln></p:spPr>` +
+    `<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr/></a:p></p:txBody></p:sp>`
+  );
+}
+
+/** Horizontal bar chart as native shapes: label, bar, value. Editable in PowerPoint, no image needed. */
+function chartShapes(startId: number, box: Box, data: PptxChartDatum[], unit = ""): { xml: string; nextId: number } {
+  const rows = data.slice(0, 10).filter((d) => d && typeof d.label === "string");
+  if (!rows.length) return { xml: "", nextId: startId };
+  const max = Math.max(...rows.map((d) => Math.abs(Number(d.value) || 0)), 1);
+  const rowH = Math.min(inch(0.62), box.h / rows.length);
+  const barH = Math.round(rowH * 0.52);
+  const labelW = Math.round(box.w * 0.28);
+  const valueW = inch(1.1);
+  const trackW = box.w - labelW - valueW - inch(0.2);
+  let id = startId;
+  const out: string[] = [];
+  rows.forEach((d, i) => {
+    const v = Number(d.value) || 0;
+    const y = box.y + i * rowH;
+    const barW = Math.max(inch(0.04), (Math.abs(v) / max) * trackW);
+    // label
+    out.push(
+      textShape(id++, "ChartLabel", { x: box.x, y: y + Math.round((rowH - barH) / 2) - inch(0.06), w: labelW, h: rowH }, para(d.label, { sz: 1200, color: COLOR.body })),
+    );
+    // track + bar
+    out.push(rectShape(id++, { x: box.x + labelW, y: y + (rowH - barH) / 2, w: trackW, h: barH }, "EDF0F6", true));
+    out.push(rectShape(id++, { x: box.x + labelW, y: y + (rowH - barH) / 2, w: barW, h: barH }, COLOR.accent, true));
+    // value
+    out.push(
+      textShape(id++, "ChartValue", { x: box.x + labelW + trackW + inch(0.15), y: y + Math.round((rowH - barH) / 2) - inch(0.06), w: valueW, h: rowH }, para(`${v}${unit}`, { sz: 1200, bold: true, color: COLOR.title })),
+    );
+  });
+  return { xml: out.join(""), nextId: id };
+}
+
+/** A row of KPI tiles: big figure over a caption. */
+function metricShapes(startId: number, box: Box, metrics: PptxMetric[]): { xml: string; nextId: number } {
+  const items = metrics.slice(0, 4).filter((m) => m && (m.value != null || m.label));
+  if (!items.length) return { xml: "", nextId: startId };
+  const gap = inch(0.25);
+  const w = (box.w - gap * (items.length - 1)) / items.length;
+  const h = Math.min(box.h, inch(1.9));
+  let id = startId;
+  const out: string[] = [];
+  items.forEach((m, i) => {
+    const x = box.x + i * (w + gap);
+    out.push(rectShape(id++, { x, y: box.y, w, h }, "F4F6FA", true));
+    out.push(textShape(id++, "MetricValue", { x, y: box.y + inch(0.28), w, h: inch(0.9) }, para(String(m.value ?? ""), { sz: 3600, bold: true, color: COLOR.accent, align: "ctr" })));
+    if (m.label) out.push(textShape(id++, "MetricLabel", { x, y: box.y + inch(1.15), w, h: inch(0.5) }, para(m.label, { sz: 1200, color: COLOR.muted, align: "ctr" })));
+  });
+  return { xml: out.join(""), nextId: id };
+}
+
 function picShape(id: number, relId: string, box: Box, natural: { w: number; h: number } | null): string {
   let { x, y, w, h } = box;
   if (natural && natural.w > 0 && natural.h > 0) {
@@ -225,10 +201,6 @@ function themeXml(name: string): string {
     `<a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst>` +
     `<a:bgFillStyleLst>${fills}</a:bgFillStyleLst></a:fmtScheme></a:themeElements></a:theme>`
   );
-}
-
-function relsXml(rels: { id: string; type: string; target: string }[]): string {
-  return `${XML_DECL}<Relationships ${REL_NS}>${rels.map((r) => `<Relationship Id="${r.id}" Type="${RT}/${r.type}" Target="${r.target}"/>`).join("")}</Relationships>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -300,13 +272,37 @@ export function buildPptx(spec: PptxSpec, cwd = process.cwd()): Buffer {
       if (s.subtitle) shapes.push(textShape(shapeId++, "Subtitle", { x: inch(0.6), y: inch(1.45), w: SLIDE_W - inch(1.2), h: inch(0.6) }, para(s.subtitle, { sz: 1600, color: COLOR.muted })));
       const bodyY = s.subtitle ? inch(2.1) : inch(1.6);
       const bodyH = SLIDE_H - bodyY - inch(0.5);
+      // KPI row sits above the body; bullets/visual share the remaining height.
+      let contentY = bodyY;
+      let contentH = bodyH;
+      const metrics = Array.isArray(s.metrics) ? s.metrics : null;
+      if (metrics?.length) {
+        const m = metricShapes(shapeId, { x: inch(0.6), y: contentY, w: SLIDE_W - inch(1.2), h: inch(1.9) }, metrics);
+        shapes.push(m.xml);
+        shapeId = m.nextId;
+        contentY += inch(2.15);
+        contentH -= inch(2.15);
+      }
+      const chartData = Array.isArray(s.chart?.data) ? s.chart!.data : null;
+      // A visual (chart or image) sits beside bullets when both are present, else fills the width.
+      const visual = chartData?.length ? "chart" : imageRel ? "image" : null;
       if (bullets.length) {
-        const bodyW = imageRel ? inch(6.4) : SLIDE_W - inch(1.2);
+        const bodyW = visual ? inch(6.4) : SLIDE_W - inch(1.2);
         const sz = bullets.length > 8 ? 1400 : 1800;
-        shapes.push(textShape(shapeId++, "Body", { x: inch(0.6), y: bodyY, w: bodyW, h: bodyH }, bullets.map((b) => para(b.text, { sz, color: COLOR.body, bullet: true, level: b.level })).join("")));
-        if (imageRel) shapes.push(picShape(shapeId++, imageRel, { x: inch(7.3), y: bodyY, w: SLIDE_W - inch(7.9), h: bodyH }, natural));
-      } else if (imageRel) {
-        shapes.push(picShape(shapeId++, imageRel, { x: inch(1), y: bodyY, w: SLIDE_W - inch(2), h: bodyH }, natural));
+        shapes.push(textShape(shapeId++, "Body", { x: inch(0.6), y: contentY, w: bodyW, h: contentH }, bullets.map((b) => para(b.text, { sz, color: COLOR.body, bullet: true, level: b.level })).join("")));
+        if (visual === "chart") {
+          const c = chartShapes(shapeId, { x: inch(7.1), y: contentY + inch(0.1), w: SLIDE_W - inch(7.7), h: contentH - inch(0.2) }, chartData!, s.chart?.unit ?? "");
+          shapes.push(c.xml);
+          shapeId = c.nextId;
+        } else if (visual === "image") {
+          shapes.push(picShape(shapeId++, imageRel!, { x: inch(7.3), y: contentY, w: SLIDE_W - inch(7.9), h: contentH }, natural));
+        }
+      } else if (visual === "chart") {
+        const c = chartShapes(shapeId, { x: inch(1.2), y: contentY + inch(0.2), w: SLIDE_W - inch(2.4), h: contentH - inch(0.4) }, chartData!, s.chart?.unit ?? "");
+        shapes.push(c.xml);
+        shapeId = c.nextId;
+      } else if (visual === "image") {
+        shapes.push(picShape(shapeId++, imageRel!, { x: inch(1), y: contentY, w: SLIDE_W - inch(2), h: contentH }, natural));
       }
     }
 

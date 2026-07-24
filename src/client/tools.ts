@@ -13,6 +13,7 @@ import { renderTodos, setTodos, type Todo } from "./todos.ts";
 import { isTrusted, loadSettings } from "./settings.ts";
 import { getDiagnostics } from "./lsp.ts";
 import { buildPptx, type PptxSlideSpec } from "./pptx.ts";
+import { buildDocx, type DocxBlock } from "./docx.ts";
 
 const MAX_OUTPUT = 30_000;
 
@@ -759,11 +760,19 @@ export const tools: Tool[] = [
   {
     name: "generate_pptx",
     description:
-      "Create a real, editable PowerPoint .pptx file from structured slide content — no Python, npm, or external tools needed. Provide the finished text for every slide (this tool renders; it does not write copy). Bullets accept plain strings or {text, level} for nesting; a slide with a subtitle and no bullets renders as a centered title slide; `image` embeds a local png/jpg/gif; `notes` become speaker notes.",
+      "Create a real, editable PowerPoint .pptx file from structured slide content — no Python, npm, or external tools needed. " +
+      "This tool RENDERS; it does not write copy — you must supply the finished content. Every content slide needs 3-6 substantive " +
+      "bullets carrying real specifics (facts, numbers, file/component names, decisions) — never bare titles or placeholders; a " +
+      "title-only deck is rejected. Bullets accept plain strings or {text, level} for nesting. A slide with a subtitle and no " +
+      "bullets is a centered title/section slide (use sparingly). `notes` adds speaker notes — include them. " +
+      "For VISUALS, prefer the built-ins — they need no files and stay editable: `chart` draws a horizontal bar chart from " +
+      "{label, value} data (comparisons, breakdowns, counts) and `metrics` renders up to 4 headline KPI tiles. Use `image` " +
+      "(local png/jpg/gif) for screenshots, architecture diagrams, or anything you generate with generate_image. " +
+      "A deck of pure text is weak — most decks want at least one chart or metrics row. Close with a summary/next-steps slide.",
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Output file path ending in .pptx." },
+        path: { type: "string", description: "Output file path ending in .pptx. A bare filename goes into docs/ (preferred) — pass a path only to override." },
         title: { type: "string", description: "Deck title for document properties." },
         slides: {
           type: "array",
@@ -775,6 +784,21 @@ export const tools: Tool[] = [
               subtitle: { type: "string" },
               bullets: { type: "array", items: {}, description: 'Strings, or {"text": "...", "level": 1} for indented sub-bullets.' },
               image: { type: "string", description: "Path to a local png/jpg/gif to embed." },
+              chart: {
+                type: "object",
+                description: "Horizontal bar chart drawn as native, editable shapes — no image file needed. Use for comparisons, breakdowns, or anything countable.",
+                properties: {
+                  data: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "number" } }, required: ["label", "value"], additionalProperties: false } },
+                  unit: { type: "string", description: 'Suffix appended to each value, e.g. "%" or "ms".' },
+                },
+                required: ["data"],
+                additionalProperties: false,
+              },
+              metrics: {
+                type: "array",
+                description: "Up to 4 headline KPI tiles (big figure + caption) rendered across the slide.",
+                items: { type: "object", properties: { value: { type: "string" }, label: { type: "string" } }, required: ["value"], additionalProperties: false },
+              },
               notes: { type: "string", description: "Speaker notes for this slide." },
             },
             additionalProperties: false,
@@ -786,9 +810,11 @@ export const tools: Tool[] = [
     },
     needsApproval: true,
     async run(args) {
-      const rel = String(args.path);
+      // Bare filename ⇒ keep decks out of the project root: default them into docs/.
+      const given = String(args.path);
+      const rel = /[\\/]/.test(given) ? given : join("docs", given);
       const abs = resolve(process.cwd(), rel);
-      if (!abs.toLowerCase().endsWith(".pptx")) return { output: `generate_pptx: path must end in .pptx (got ${rel})`, isError: true };
+      if (!abs.toLowerCase().endsWith(".pptx")) return { output: `generate_pptx: path must end in .pptx (got ${given})`, isError: true };
       return withFileLock(abs, async () => {
         if (isProtected(abs)) return { output: `Refused: ${rel} is a protected path.`, isError: true };
         checkpoint.record(abs);
@@ -803,13 +829,127 @@ export const tools: Tool[] = [
             }
           }
           args = { ...args, slides };
+          // Guard against title-only decks: a slide with no bullets/subtitle/image is an empty shell.
+          // Models routinely emit an outline and call it done — make that a hard error, not a bad deck.
+          if (Array.isArray(slides)) {
+            const empty = (slides as PptxSlideSpec[]).filter((s) => {
+              const b = Array.isArray(s?.bullets) ? s.bullets.length : 0;
+              return b === 0 && !s?.subtitle && !s?.image && !s?.chart && !s?.metrics;
+            }).length;
+            if (slides.length > 1 && empty > 1) {
+              return {
+                output:
+                  `generate_pptx: refused — ${empty} of ${slides.length} slides have only a title (no bullets, subtitle, or image). ` +
+                  "That produces an empty outline, not a deck. Re-send with real content: 3-6 substantive bullets per content slide " +
+                  "(specific facts, numbers, names — not placeholders), `notes` for speaker notes, and `image` for any diagram or " +
+                  "screenshot. Only the opening/section slides may use a subtitle with no bullets.",
+                isError: true,
+              };
+            }
+          }
           const buf = buildPptx({ title: args.title == null ? undefined : String(args.title), slides: slides as PptxSlideSpec[] });
           mkdirSync(dirname(abs), { recursive: true });
           writeFileSync(abs, buf);
           const n = (args.slides as unknown[]).length;
+          // End with the ABSOLUTE path so the user can open the deck straight from the reply.
           return {
-            output: `Wrote ${rel}: ${n} slide${n === 1 ? "" : "s"}, ${buf.length} bytes.`,
-            display: green(`+ ${rel} (${n} slide${n === 1 ? "" : "s"}, ${buf.length} bytes)`),
+            output:
+              `Wrote ${rel}: ${n} slide${n === 1 ? "" : "s"}, ${buf.length} bytes.\n` +
+              `Open it here: ${abs}\n` +
+              "Tell the user the deck is ready and end your reply with this full path on its own line.",
+            display: green(`+ ${rel} (${n} slide${n === 1 ? "" : "s"}, ${buf.length} bytes)\n  ${abs}`),
+          };
+        } catch (e) {
+          return { output: e instanceof Error ? e.message : String(e), isError: true };
+        }
+      });
+    },
+  },
+  {
+    name: "generate_docx",
+    description:
+      "Create a real, editable Word .docx from structured blocks — no Python, npm, or external tools needed. " +
+      "This tool RENDERS; you supply the finished prose. Blocks are typed: heading (level 1-3), paragraph, bullets " +
+      "(nestable via {text, level}), numbered, table ({headers, rows}), chart ({data:[{label,value}], unit}), metrics ({items:[{value,label}]}), image (local png/jpg/gif), pageBreak. " +
+      "Write real content, not an outline: a document of bare headings is rejected. Prefer tables for comparisons and " +
+      "structured data, and embed screenshots or diagrams with image. A bare filename lands in docs/.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Output file path ending in .docx. A bare filename goes into docs/ (preferred)." },
+        title: { type: "string", description: "Document title, rendered at the top and set in document properties." },
+        subtitle: { type: "string", description: "Optional subtitle under the title." },
+        blocks: {
+          type: "array",
+          description: "The document body, in order.",
+          items: {
+            type: "object",
+            properties: {
+              type: { type: "string", enum: ["heading", "paragraph", "bullets", "numbered", "table", "chart", "metrics", "image", "pageBreak"] },
+              text: { type: "string", description: "For heading and paragraph." },
+              level: { type: "number", description: "Heading level 1-3." },
+              bold: { type: "boolean" },
+              italic: { type: "boolean" },
+              items: { type: "array", items: {}, description: 'For bullets/numbered: strings, or {"text": "...", "level": 1} to nest.' },
+              headers: { type: "array", items: { type: "string" }, description: "For table: the header row." },
+              rows: { type: "array", items: { type: "array", items: { type: "string" } }, description: "For table: the body rows." },
+              data: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "number" } }, required: ["label", "value"], additionalProperties: false }, description: "For chart: the bars." },
+              unit: { type: "string", description: 'For chart: suffix on each value, e.g. "%".' },
+              path: { type: "string", description: "For image: path to a local png/jpg/gif." },
+              width: { type: "number", description: "For image: width in inches (default 6)." },
+            },
+            required: ["type"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["path", "blocks"],
+      additionalProperties: false,
+    },
+    needsApproval: true,
+    async run(args) {
+      const given = String(args.path);
+      const rel = /[\\/]/.test(given) ? given : join("docs", given);
+      const abs = resolve(process.cwd(), rel);
+      if (!abs.toLowerCase().endsWith(".docx")) return { output: `generate_docx: path must end in .docx (got ${given})`, isError: true };
+      return withFileLock(abs, async () => {
+        if (isProtected(abs)) return { output: `Refused: ${rel} is a protected path.`, isError: true };
+        checkpoint.record(abs);
+        try {
+          let blocks = args.blocks;
+          if (typeof blocks === "string") {
+            try {
+              blocks = JSON.parse(blocks);
+            } catch {
+              /* leave as-is; buildDocx reports the clear error */
+            }
+          }
+          // Same guard as decks: headings with no prose is an outline, not a document.
+          if (Array.isArray(blocks)) {
+            const substantive = (blocks as DocxBlock[]).filter((b) => b && b.type !== "heading" && b.type !== "pageBreak").length;
+            if (blocks.length > 1 && substantive === 0) {
+              return {
+                output:
+                  "generate_docx: refused — the document is only headings, with no paragraphs, lists, tables, or images. " +
+                  "Re-send with real content under each heading.",
+                isError: true,
+              };
+            }
+          }
+          const buf = buildDocx({
+            title: args.title == null ? undefined : String(args.title),
+            subtitle: args.subtitle == null ? undefined : String(args.subtitle),
+            blocks: blocks as DocxBlock[],
+          });
+          mkdirSync(dirname(abs), { recursive: true });
+          writeFileSync(abs, buf);
+          const n = (blocks as unknown[]).length;
+          return {
+            output:
+              `Wrote ${rel}: ${n} block${n === 1 ? "" : "s"}, ${buf.length} bytes.\n` +
+              `Open it here: ${abs}\n` +
+              "Tell the user the document is ready and end your reply with this full path on its own line.",
+            display: green(`+ ${rel} (${n} block${n === 1 ? "" : "s"}, ${buf.length} bytes)\n  ${abs}`),
           };
         } catch (e) {
           return { output: e instanceof Error ? e.message : String(e), isError: true };
@@ -820,7 +960,9 @@ export const tools: Tool[] = [
   {
     name: "generate_image",
     description:
-      "Generate an image from a text prompt (OpenAI gpt-image-1) and save it as a PNG, then open it in the system viewer. Use for illustrations, scenes, concept art, and visual scenarios. Write a rich, specific prompt — style, mood, lighting, composition. Requires OPENAI_API_KEY.",
+      "Generate an image from a text prompt (gpt-image-1) and save it as a PNG. Use for illustrations, concept art, cover art, and diagram-style visuals. Write a rich, specific prompt — subject, style, mood, lighting, composition. " +
+      "Pair it with generate_pptx/generate_docx: create the PNG first, then pass its path as a slide's `image` (or an image block) to illustrate a deck or document. " +
+      "Runs through the ada backend, so no local API key is needed.",
     parameters: {
       type: "object",
       properties: {
@@ -836,27 +978,53 @@ export const tools: Tool[] = [
       const rel = String(args.path);
       const abs = resolve(process.cwd(), rel);
       if (!abs.toLowerCase().endsWith(".png")) return { output: `generate_image: path must end in .png (got ${rel})`, isError: true };
-      if (!process.env.OPENAI_API_KEY) return { output: "generate_image: OPENAI_API_KEY is not set — export it to enable image generation.", isError: true };
       return withFileLock(abs, async () => {
         if (isProtected(abs)) return { output: `Refused: ${rel} is a protected path.`, isError: true };
         try {
-          const { default: OpenAI } = await import("openai");
-          const client = new OpenAI(); // key from OPENAI_API_KEY; images need the real OpenAI API, not the router backend
-          const res = await client.images.generate({ model: "gpt-image-1", prompt: String(args.prompt), size: (args.size as "1024x1024") ?? "1024x1024" });
-          const b64 = res.data?.[0]?.b64_json;
+          const size = (args.size as string) ?? "1024x1024";
+          let b64: string | undefined;
+          if (process.env.OPENAI_API_KEY) {
+            const { default: OpenAI } = await import("openai");
+            const client = new OpenAI(); // direct to OpenAI when the user has their own key
+            const res = await client.images.generate({ model: "gpt-image-1", prompt: String(args.prompt), size: size as "1024x1024" });
+            b64 = res.data?.[0]?.b64_json;
+          } else {
+            // No local key (the normal case in the desktop app): go through the ada backend, which
+            // holds the provider key. Keeps image generation working without any user setup.
+            const base = process.env.ADA_BACKEND_URL ?? "http://localhost:8787/v1";
+            const r = await fetch(`${base}/images/generations`, {
+              method: "POST",
+              headers: { "content-type": "application/json", authorization: `Bearer ${process.env.ADA_CLIENT_KEY ?? "dev"}` },
+              // No model here on purpose: the backend picks one for whichever image provider it has.
+              body: JSON.stringify({ prompt: String(args.prompt), size }),
+              signal: AbortSignal.timeout(180_000),
+            });
+            const text = await r.text();
+            if (!r.ok) return { output: `generate_image: backend HTTP ${r.status}: ${text.slice(0, 200)}`, isError: true };
+            b64 = (JSON.parse(text) as { data?: Array<{ b64_json?: string }> }).data?.[0]?.b64_json;
+          }
           if (!b64) return { output: "generate_image: API returned no image data.", isError: true };
           checkpoint.record(abs);
           mkdirSync(dirname(abs), { recursive: true });
           const buf = Buffer.from(b64, "base64");
           writeFileSync(abs, buf);
-          const [cmd, cargs] =
-            process.platform === "win32" ? ["cmd", ["/c", "start", "", abs]] : process.platform === "darwin" ? ["open", [abs]] : ["xdg-open", [abs]];
-          try {
-            spawnSync(cmd as string, cargs as string[], { stdio: "ignore" });
-          } catch {
-            /* opening the viewer is best-effort */
+          // Pop the viewer only in the interactive CLI. Under `serve` (the IDE) a deck with three
+          // illustrations would otherwise fling three image windows at the user.
+          if (process.stdout.isTTY) {
+            const [cmd, cargs] =
+              process.platform === "win32" ? ["cmd", ["/c", "start", "", abs]] : process.platform === "darwin" ? ["open", [abs]] : ["xdg-open", [abs]];
+            try {
+              spawnSync(cmd as string, cargs as string[], { stdio: "ignore" });
+            } catch {
+              /* opening the viewer is best-effort */
+            }
           }
-          return { output: `Wrote ${rel} (${Math.round(buf.length / 1024)} KB) and opened it in the viewer.`, display: green(`+ ${rel} (${Math.round(buf.length / 1024)} KB image)`) };
+          return {
+            output:
+              `Wrote ${rel} (${Math.round(buf.length / 1024)} KB).\nOpen it here: ${abs}\n` +
+              "To use it in a deck or document, pass this path as a slide's `image` (generate_pptx) or an image block (generate_docx).",
+            display: green(`+ ${rel} (${Math.round(buf.length / 1024)} KB image)\n  ${abs}`),
+          };
         } catch (e) {
           return { output: e instanceof Error ? e.message : String(e), isError: true };
         }
