@@ -13,11 +13,23 @@ export interface PptxBullet {
   level?: number; // 0-based indent level
 }
 
+export interface PptxChartDatum {
+  label: string;
+  value: number;
+}
+
+export interface PptxMetric {
+  value: string; // the headline figure, e.g. "340+" or "99.9%"
+  label?: string; // what it measures
+}
+
 export interface PptxSlideSpec {
   title?: string;
   subtitle?: string; // present (with no bullets) ⇒ centered title-slide treatment
   bullets?: (string | PptxBullet)[];
   image?: string; // path to a local png/jpg/gif, embedded into the file
+  chart?: { data: PptxChartDatum[]; unit?: string }; // horizontal bar chart, drawn as native shapes
+  metrics?: PptxMetric[]; // a row of big KPI figures
   notes?: string; // speaker notes
 }
 
@@ -186,6 +198,66 @@ function accentBar(id: number, box: Box): string {
   );
 }
 
+/** A filled rectangle (rounded when `round`) — the building block for charts and KPI tiles. */
+function rectShape(id: number, box: Box, fill: string, round = false): string {
+  return (
+    `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="Shape"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>` +
+    `<p:spPr><a:xfrm><a:off x="${Math.round(box.x)}" y="${Math.round(box.y)}"/><a:ext cx="${Math.max(1, Math.round(box.w))}" cy="${Math.max(1, Math.round(box.h))}"/></a:xfrm>` +
+    `<a:prstGeom prst="${round ? "roundRect" : "rect"}"><a:avLst${round ? `><a:gd name="adj" fmla="val 12000"/></a:avLst` : "/"}></a:prstGeom>` +
+    `<a:solidFill><a:srgbClr val="${fill}"/></a:solidFill><a:ln><a:noFill/></a:ln></p:spPr>` +
+    `<p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr/></a:p></p:txBody></p:sp>`
+  );
+}
+
+/** Horizontal bar chart as native shapes: label, bar, value. Editable in PowerPoint, no image needed. */
+function chartShapes(startId: number, box: Box, data: PptxChartDatum[], unit = ""): { xml: string; nextId: number } {
+  const rows = data.slice(0, 10).filter((d) => d && typeof d.label === "string");
+  if (!rows.length) return { xml: "", nextId: startId };
+  const max = Math.max(...rows.map((d) => Math.abs(Number(d.value) || 0)), 1);
+  const rowH = Math.min(inch(0.62), box.h / rows.length);
+  const barH = Math.round(rowH * 0.52);
+  const labelW = Math.round(box.w * 0.28);
+  const valueW = inch(1.1);
+  const trackW = box.w - labelW - valueW - inch(0.2);
+  let id = startId;
+  const out: string[] = [];
+  rows.forEach((d, i) => {
+    const v = Number(d.value) || 0;
+    const y = box.y + i * rowH;
+    const barW = Math.max(inch(0.04), (Math.abs(v) / max) * trackW);
+    // label
+    out.push(
+      textShape(id++, "ChartLabel", { x: box.x, y: y + Math.round((rowH - barH) / 2) - inch(0.06), w: labelW, h: rowH }, para(d.label, { sz: 1200, color: COLOR.body })),
+    );
+    // track + bar
+    out.push(rectShape(id++, { x: box.x + labelW, y: y + (rowH - barH) / 2, w: trackW, h: barH }, "EDF0F6", true));
+    out.push(rectShape(id++, { x: box.x + labelW, y: y + (rowH - barH) / 2, w: barW, h: barH }, COLOR.accent, true));
+    // value
+    out.push(
+      textShape(id++, "ChartValue", { x: box.x + labelW + trackW + inch(0.15), y: y + Math.round((rowH - barH) / 2) - inch(0.06), w: valueW, h: rowH }, para(`${v}${unit}`, { sz: 1200, bold: true, color: COLOR.title })),
+    );
+  });
+  return { xml: out.join(""), nextId: id };
+}
+
+/** A row of KPI tiles: big figure over a caption. */
+function metricShapes(startId: number, box: Box, metrics: PptxMetric[]): { xml: string; nextId: number } {
+  const items = metrics.slice(0, 4).filter((m) => m && (m.value != null || m.label));
+  if (!items.length) return { xml: "", nextId: startId };
+  const gap = inch(0.25);
+  const w = (box.w - gap * (items.length - 1)) / items.length;
+  const h = Math.min(box.h, inch(1.9));
+  let id = startId;
+  const out: string[] = [];
+  items.forEach((m, i) => {
+    const x = box.x + i * (w + gap);
+    out.push(rectShape(id++, { x, y: box.y, w, h }, "F4F6FA", true));
+    out.push(textShape(id++, "MetricValue", { x, y: box.y + inch(0.28), w, h: inch(0.9) }, para(String(m.value ?? ""), { sz: 3600, bold: true, color: COLOR.accent, align: "ctr" })));
+    if (m.label) out.push(textShape(id++, "MetricLabel", { x, y: box.y + inch(1.15), w, h: inch(0.5) }, para(m.label, { sz: 1200, color: COLOR.muted, align: "ctr" })));
+  });
+  return { xml: out.join(""), nextId: id };
+}
+
 function picShape(id: number, relId: string, box: Box, natural: { w: number; h: number } | null): string {
   let { x, y, w, h } = box;
   if (natural && natural.w > 0 && natural.h > 0) {
@@ -300,13 +372,37 @@ export function buildPptx(spec: PptxSpec, cwd = process.cwd()): Buffer {
       if (s.subtitle) shapes.push(textShape(shapeId++, "Subtitle", { x: inch(0.6), y: inch(1.45), w: SLIDE_W - inch(1.2), h: inch(0.6) }, para(s.subtitle, { sz: 1600, color: COLOR.muted })));
       const bodyY = s.subtitle ? inch(2.1) : inch(1.6);
       const bodyH = SLIDE_H - bodyY - inch(0.5);
+      // KPI row sits above the body; bullets/visual share the remaining height.
+      let contentY = bodyY;
+      let contentH = bodyH;
+      const metrics = Array.isArray(s.metrics) ? s.metrics : null;
+      if (metrics?.length) {
+        const m = metricShapes(shapeId, { x: inch(0.6), y: contentY, w: SLIDE_W - inch(1.2), h: inch(1.9) }, metrics);
+        shapes.push(m.xml);
+        shapeId = m.nextId;
+        contentY += inch(2.15);
+        contentH -= inch(2.15);
+      }
+      const chartData = Array.isArray(s.chart?.data) ? s.chart!.data : null;
+      // A visual (chart or image) sits beside bullets when both are present, else fills the width.
+      const visual = chartData?.length ? "chart" : imageRel ? "image" : null;
       if (bullets.length) {
-        const bodyW = imageRel ? inch(6.4) : SLIDE_W - inch(1.2);
+        const bodyW = visual ? inch(6.4) : SLIDE_W - inch(1.2);
         const sz = bullets.length > 8 ? 1400 : 1800;
-        shapes.push(textShape(shapeId++, "Body", { x: inch(0.6), y: bodyY, w: bodyW, h: bodyH }, bullets.map((b) => para(b.text, { sz, color: COLOR.body, bullet: true, level: b.level })).join("")));
-        if (imageRel) shapes.push(picShape(shapeId++, imageRel, { x: inch(7.3), y: bodyY, w: SLIDE_W - inch(7.9), h: bodyH }, natural));
-      } else if (imageRel) {
-        shapes.push(picShape(shapeId++, imageRel, { x: inch(1), y: bodyY, w: SLIDE_W - inch(2), h: bodyH }, natural));
+        shapes.push(textShape(shapeId++, "Body", { x: inch(0.6), y: contentY, w: bodyW, h: contentH }, bullets.map((b) => para(b.text, { sz, color: COLOR.body, bullet: true, level: b.level })).join("")));
+        if (visual === "chart") {
+          const c = chartShapes(shapeId, { x: inch(7.1), y: contentY + inch(0.1), w: SLIDE_W - inch(7.7), h: contentH - inch(0.2) }, chartData!, s.chart?.unit ?? "");
+          shapes.push(c.xml);
+          shapeId = c.nextId;
+        } else if (visual === "image") {
+          shapes.push(picShape(shapeId++, imageRel!, { x: inch(7.3), y: contentY, w: SLIDE_W - inch(7.9), h: contentH }, natural));
+        }
+      } else if (visual === "chart") {
+        const c = chartShapes(shapeId, { x: inch(1.2), y: contentY + inch(0.2), w: SLIDE_W - inch(2.4), h: contentH - inch(0.4) }, chartData!, s.chart?.unit ?? "");
+        shapes.push(c.xml);
+        shapeId = c.nextId;
+      } else if (visual === "image") {
+        shapes.push(picShape(shapeId++, imageRel!, { x: inch(1), y: contentY, w: SLIDE_W - inch(2), h: contentH }, natural));
       }
     }
 

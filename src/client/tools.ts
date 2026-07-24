@@ -764,9 +764,10 @@ export const tools: Tool[] = [
       "bullets carrying real specifics (facts, numbers, file/component names, decisions) — never bare titles or placeholders; a " +
       "title-only deck is rejected. Bullets accept plain strings or {text, level} for nesting. A slide with a subtitle and no " +
       "bullets is a centered title/section slide (use sparingly). `notes` adds speaker notes — include them. " +
-      "For VISUALS: `image` embeds a local png/jpg/gif, so create the picture first (an existing screenshot/asset, a chart or " +
-      "diagram you render to PNG with a script, or generate_image) and pass its path — decks with only text are weak. " +
-      "Close with a summary/next-steps slide.",
+      "For VISUALS, prefer the built-ins — they need no files and stay editable: `chart` draws a horizontal bar chart from " +
+      "{label, value} data (comparisons, breakdowns, counts) and `metrics` renders up to 4 headline KPI tiles. Use `image` " +
+      "(local png/jpg/gif) for screenshots, architecture diagrams, or anything you generate with generate_image. " +
+      "A deck of pure text is weak — most decks want at least one chart or metrics row. Close with a summary/next-steps slide.",
     parameters: {
       type: "object",
       properties: {
@@ -782,6 +783,21 @@ export const tools: Tool[] = [
               subtitle: { type: "string" },
               bullets: { type: "array", items: {}, description: 'Strings, or {"text": "...", "level": 1} for indented sub-bullets.' },
               image: { type: "string", description: "Path to a local png/jpg/gif to embed." },
+              chart: {
+                type: "object",
+                description: "Horizontal bar chart drawn as native, editable shapes — no image file needed. Use for comparisons, breakdowns, or anything countable.",
+                properties: {
+                  data: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "number" } }, required: ["label", "value"], additionalProperties: false } },
+                  unit: { type: "string", description: 'Suffix appended to each value, e.g. "%" or "ms".' },
+                },
+                required: ["data"],
+                additionalProperties: false,
+              },
+              metrics: {
+                type: "array",
+                description: "Up to 4 headline KPI tiles (big figure + caption) rendered across the slide.",
+                items: { type: "object", properties: { value: { type: "string" }, label: { type: "string" } }, required: ["value"], additionalProperties: false },
+              },
               notes: { type: "string", description: "Speaker notes for this slide." },
             },
             additionalProperties: false,
@@ -817,7 +833,7 @@ export const tools: Tool[] = [
           if (Array.isArray(slides)) {
             const empty = (slides as PptxSlideSpec[]).filter((s) => {
               const b = Array.isArray(s?.bullets) ? s.bullets.length : 0;
-              return b === 0 && !s?.subtitle && !s?.image;
+              return b === 0 && !s?.subtitle && !s?.image && !s?.chart && !s?.metrics;
             }).length;
             if (slides.length > 1 && empty > 1) {
               return {
