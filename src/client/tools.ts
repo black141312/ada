@@ -958,7 +958,9 @@ export const tools: Tool[] = [
   {
     name: "generate_image",
     description:
-      "Generate an image from a text prompt (OpenAI gpt-image-1) and save it as a PNG, then open it in the system viewer. Use for illustrations, scenes, concept art, and visual scenarios. Write a rich, specific prompt — style, mood, lighting, composition. Requires OPENAI_API_KEY.",
+      "Generate an image from a text prompt (gpt-image-1) and save it as a PNG. Use for illustrations, concept art, cover art, and diagram-style visuals. Write a rich, specific prompt — subject, style, mood, lighting, composition. " +
+      "Pair it with generate_pptx/generate_docx: create the PNG first, then pass its path as a slide's `image` (or an image block) to illustrate a deck or document. " +
+      "Runs through the ada backend, so no local API key is needed.",
     parameters: {
       type: "object",
       properties: {
@@ -974,27 +976,52 @@ export const tools: Tool[] = [
       const rel = String(args.path);
       const abs = resolve(process.cwd(), rel);
       if (!abs.toLowerCase().endsWith(".png")) return { output: `generate_image: path must end in .png (got ${rel})`, isError: true };
-      if (!process.env.OPENAI_API_KEY) return { output: "generate_image: OPENAI_API_KEY is not set — export it to enable image generation.", isError: true };
       return withFileLock(abs, async () => {
         if (isProtected(abs)) return { output: `Refused: ${rel} is a protected path.`, isError: true };
         try {
-          const { default: OpenAI } = await import("openai");
-          const client = new OpenAI(); // key from OPENAI_API_KEY; images need the real OpenAI API, not the router backend
-          const res = await client.images.generate({ model: "gpt-image-1", prompt: String(args.prompt), size: (args.size as "1024x1024") ?? "1024x1024" });
-          const b64 = res.data?.[0]?.b64_json;
+          const size = (args.size as string) ?? "1024x1024";
+          let b64: string | undefined;
+          if (process.env.OPENAI_API_KEY) {
+            const { default: OpenAI } = await import("openai");
+            const client = new OpenAI(); // direct to OpenAI when the user has their own key
+            const res = await client.images.generate({ model: "gpt-image-1", prompt: String(args.prompt), size: size as "1024x1024" });
+            b64 = res.data?.[0]?.b64_json;
+          } else {
+            // No local key (the normal case in the desktop app): go through the ada backend, which
+            // holds the provider key. Keeps image generation working without any user setup.
+            const base = process.env.ADA_BACKEND_URL ?? "http://localhost:8787/v1";
+            const r = await fetch(`${base}/images/generations`, {
+              method: "POST",
+              headers: { "content-type": "application/json", authorization: `Bearer ${process.env.ADA_CLIENT_KEY ?? "dev"}` },
+              body: JSON.stringify({ model: "gpt-image-1", prompt: String(args.prompt), size }),
+              signal: AbortSignal.timeout(180_000),
+            });
+            const text = await r.text();
+            if (!r.ok) return { output: `generate_image: backend HTTP ${r.status}: ${text.slice(0, 200)}`, isError: true };
+            b64 = (JSON.parse(text) as { data?: Array<{ b64_json?: string }> }).data?.[0]?.b64_json;
+          }
           if (!b64) return { output: "generate_image: API returned no image data.", isError: true };
           checkpoint.record(abs);
           mkdirSync(dirname(abs), { recursive: true });
           const buf = Buffer.from(b64, "base64");
           writeFileSync(abs, buf);
-          const [cmd, cargs] =
-            process.platform === "win32" ? ["cmd", ["/c", "start", "", abs]] : process.platform === "darwin" ? ["open", [abs]] : ["xdg-open", [abs]];
-          try {
-            spawnSync(cmd as string, cargs as string[], { stdio: "ignore" });
-          } catch {
-            /* opening the viewer is best-effort */
+          // Pop the viewer only in the interactive CLI. Under `serve` (the IDE) a deck with three
+          // illustrations would otherwise fling three image windows at the user.
+          if (process.stdout.isTTY) {
+            const [cmd, cargs] =
+              process.platform === "win32" ? ["cmd", ["/c", "start", "", abs]] : process.platform === "darwin" ? ["open", [abs]] : ["xdg-open", [abs]];
+            try {
+              spawnSync(cmd as string, cargs as string[], { stdio: "ignore" });
+            } catch {
+              /* opening the viewer is best-effort */
+            }
           }
-          return { output: `Wrote ${rel} (${Math.round(buf.length / 1024)} KB) and opened it in the viewer.`, display: green(`+ ${rel} (${Math.round(buf.length / 1024)} KB image)`) };
+          return {
+            output:
+              `Wrote ${rel} (${Math.round(buf.length / 1024)} KB).\nOpen it here: ${abs}\n` +
+              "To use it in a deck or document, pass this path as a slide's `image` (generate_pptx) or an image block (generate_docx).",
+            display: green(`+ ${rel} (${Math.round(buf.length / 1024)} KB image)\n  ${abs}`),
+          };
         } catch (e) {
           return { output: e instanceof Error ? e.message : String(e), isError: true };
         }

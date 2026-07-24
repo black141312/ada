@@ -248,6 +248,30 @@ async function handleEmbeddings(req: IncomingMessage, res: ServerResponse, who: 
   res.end(text);
 }
 
+/** Image generation for `generate_image` — proxied to OpenAI with the server-side key so app users
+ *  don't need their own OPENAI_API_KEY. Same auth/metering path as chat. */
+async function handleImages(req: IncomingMessage, res: ServerResponse, who: Identity): Promise<void> {
+  const raw = await readBody(req);
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return json(res, 400, { error: { message: "invalid JSON body" } });
+  }
+  const key = providerKey("openai");
+  if (!key) return json(res, 503, { error: { message: "image generation is not configured on this backend (no OPENAI_API_KEY)" } });
+  const model = String(body.model ?? "gpt-image-1");
+  const upstream = await fetch(`${PROVIDERS.openai.baseURL}/images/generations`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+    body: JSON.stringify({ ...body, model }),
+  });
+  const text = await upstream.text();
+  if (upstream.ok) appendUsage({ ts: Date.now(), user: who.user, model, provider: "openai", promptTokens: 0, completionTokens: 0 });
+  res.writeHead(upstream.status, { "content-type": "application/json" });
+  res.end(text);
+}
+
 /** Public: advertise enabled login methods so the terminal client can self-configure (no OIDC env on
  *  the client). For OIDC it returns the issuer + client id + device/token endpoints (all public
  *  discovery values) plus the exchange path. Unauthenticated by design. */
@@ -367,6 +391,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     }
     if (req.method === "POST" && url.pathname === "/v1/embeddings") {
       return await handleEmbeddings(req, res, who);
+    }
+    if (req.method === "POST" && url.pathname === "/v1/images/generations") {
+      return await handleImages(req, res, who);
     }
 
     // ---- enterprise control plane ----
