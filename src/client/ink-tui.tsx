@@ -6,7 +6,9 @@
 
 import { Box, Static, Text, render, useApp, useInput } from "ink";
 import TextInput from "ink-text-input";
-import { type JSX, useEffect, useRef, useState } from "react";
+// Default React import is required: when ada runs from another directory, tsx may not find
+// this repo's tsconfig and falls back to the classic JSX transform (React.createElement).
+import React, { type JSX, useEffect, useRef, useState } from "react";
 import type { Agent } from "./agent.ts";
 import { setAsker } from "./tools.ts";
 
