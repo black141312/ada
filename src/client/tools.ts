@@ -770,7 +770,7 @@ export const tools: Tool[] = [
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Output file path ending in .pptx." },
+        path: { type: "string", description: "Output file path ending in .pptx. A bare filename goes into docs/ (preferred) — pass a path only to override." },
         title: { type: "string", description: "Deck title for document properties." },
         slides: {
           type: "array",
@@ -793,9 +793,11 @@ export const tools: Tool[] = [
     },
     needsApproval: true,
     async run(args) {
-      const rel = String(args.path);
+      // Bare filename ⇒ keep decks out of the project root: default them into docs/.
+      const given = String(args.path);
+      const rel = /[\\/]/.test(given) ? given : join("docs", given);
       const abs = resolve(process.cwd(), rel);
-      if (!abs.toLowerCase().endsWith(".pptx")) return { output: `generate_pptx: path must end in .pptx (got ${rel})`, isError: true };
+      if (!abs.toLowerCase().endsWith(".pptx")) return { output: `generate_pptx: path must end in .pptx (got ${given})`, isError: true };
       return withFileLock(abs, async () => {
         if (isProtected(abs)) return { output: `Refused: ${rel} is a protected path.`, isError: true };
         checkpoint.record(abs);
