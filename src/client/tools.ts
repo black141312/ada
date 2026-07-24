@@ -13,6 +13,7 @@ import { renderTodos, setTodos, type Todo } from "./todos.ts";
 import { isTrusted, loadSettings } from "./settings.ts";
 import { getDiagnostics } from "./lsp.ts";
 import { buildPptx, type PptxSlideSpec } from "./pptx.ts";
+import { buildDocx, type DocxBlock } from "./docx.ts";
 
 const MAX_OUTPUT = 30_000;
 
@@ -857,6 +858,96 @@ export const tools: Tool[] = [
               `Open it here: ${abs}\n` +
               "Tell the user the deck is ready and end your reply with this full path on its own line.",
             display: green(`+ ${rel} (${n} slide${n === 1 ? "" : "s"}, ${buf.length} bytes)\n  ${abs}`),
+          };
+        } catch (e) {
+          return { output: e instanceof Error ? e.message : String(e), isError: true };
+        }
+      });
+    },
+  },
+  {
+    name: "generate_docx",
+    description:
+      "Create a real, editable Word .docx from structured blocks — no Python, npm, or external tools needed. " +
+      "This tool RENDERS; you supply the finished prose. Blocks are typed: heading (level 1-3), paragraph, bullets " +
+      "(nestable via {text, level}), numbered, table ({headers, rows}), image (local png/jpg/gif), pageBreak. " +
+      "Write real content, not an outline: a document of bare headings is rejected. Prefer tables for comparisons and " +
+      "structured data, and embed screenshots or diagrams with image. A bare filename lands in docs/.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Output file path ending in .docx. A bare filename goes into docs/ (preferred)." },
+        title: { type: "string", description: "Document title, rendered at the top and set in document properties." },
+        subtitle: { type: "string", description: "Optional subtitle under the title." },
+        blocks: {
+          type: "array",
+          description: "The document body, in order.",
+          items: {
+            type: "object",
+            properties: {
+              type: { type: "string", enum: ["heading", "paragraph", "bullets", "numbered", "table", "image", "pageBreak"] },
+              text: { type: "string", description: "For heading and paragraph." },
+              level: { type: "number", description: "Heading level 1-3." },
+              bold: { type: "boolean" },
+              italic: { type: "boolean" },
+              items: { type: "array", items: {}, description: 'For bullets/numbered: strings, or {"text": "...", "level": 1} to nest.' },
+              headers: { type: "array", items: { type: "string" }, description: "For table: the header row." },
+              rows: { type: "array", items: { type: "array", items: { type: "string" } }, description: "For table: the body rows." },
+              path: { type: "string", description: "For image: path to a local png/jpg/gif." },
+              width: { type: "number", description: "For image: width in inches (default 6)." },
+            },
+            required: ["type"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["path", "blocks"],
+      additionalProperties: false,
+    },
+    needsApproval: true,
+    async run(args) {
+      const given = String(args.path);
+      const rel = /[\\/]/.test(given) ? given : join("docs", given);
+      const abs = resolve(process.cwd(), rel);
+      if (!abs.toLowerCase().endsWith(".docx")) return { output: `generate_docx: path must end in .docx (got ${given})`, isError: true };
+      return withFileLock(abs, async () => {
+        if (isProtected(abs)) return { output: `Refused: ${rel} is a protected path.`, isError: true };
+        checkpoint.record(abs);
+        try {
+          let blocks = args.blocks;
+          if (typeof blocks === "string") {
+            try {
+              blocks = JSON.parse(blocks);
+            } catch {
+              /* leave as-is; buildDocx reports the clear error */
+            }
+          }
+          // Same guard as decks: headings with no prose is an outline, not a document.
+          if (Array.isArray(blocks)) {
+            const substantive = (blocks as DocxBlock[]).filter((b) => b && b.type !== "heading" && b.type !== "pageBreak").length;
+            if (blocks.length > 1 && substantive === 0) {
+              return {
+                output:
+                  "generate_docx: refused — the document is only headings, with no paragraphs, lists, tables, or images. " +
+                  "Re-send with real content under each heading.",
+                isError: true,
+              };
+            }
+          }
+          const buf = buildDocx({
+            title: args.title == null ? undefined : String(args.title),
+            subtitle: args.subtitle == null ? undefined : String(args.subtitle),
+            blocks: blocks as DocxBlock[],
+          });
+          mkdirSync(dirname(abs), { recursive: true });
+          writeFileSync(abs, buf);
+          const n = (blocks as unknown[]).length;
+          return {
+            output:
+              `Wrote ${rel}: ${n} block${n === 1 ? "" : "s"}, ${buf.length} bytes.\n` +
+              `Open it here: ${abs}\n` +
+              "Tell the user the document is ready and end your reply with this full path on its own line.",
+            display: green(`+ ${rel} (${n} block${n === 1 ? "" : "s"}, ${buf.length} bytes)\n  ${abs}`),
           };
         } catch (e) {
           return { output: e instanceof Error ? e.message : String(e), isError: true };

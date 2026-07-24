@@ -5,8 +5,8 @@
 // (explicit text boxes, no placeholder inheritance), optional embedded images and speaker notes.
 
 import { readFileSync } from "node:fs";
-import { deflateRawSync } from "node:zlib";
 import { extname, isAbsolute, resolve } from "node:path";
+import { EMU, IMAGE_TYPES, REL_NS, RT, XML_DECL, esc, imageSize, relsXml, zip } from "./ooxml.ts";
 
 export interface PptxBullet {
   text: string;
@@ -39,112 +39,16 @@ export interface PptxSpec {
   slides: PptxSlideSpec[];
 }
 
-// ---------------------------------------------------------------------------
-// Minimal ZIP writer (deflate, falls back to store) — enough for OPC packages.
 
-const CRC_TABLE = new Uint32Array(256).map((_, n) => {
-  let c = n;
-  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-  return c >>> 0;
-});
-
-function crc32(buf: Buffer): number {
-  let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]!) & 0xff]! ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
-}
-
-function zip(entries: { name: string; data: Buffer }[]): Buffer {
-  const locals: Buffer[] = [];
-  const centrals: Buffer[] = [];
-  let offset = 0;
-  const dosDate = ((2026 - 1980) << 9) | (1 << 5) | 1; // fixed 2026-01-01 for determinism
-  for (const { name, data } of entries) {
-    const nameBuf = Buffer.from(name, "utf8");
-    const deflated = deflateRawSync(data, { level: 9 });
-    const method = deflated.length < data.length ? 8 : 0;
-    const payload = method === 8 ? deflated : data;
-    const crc = crc32(data);
-    const local = Buffer.alloc(30);
-    local.writeUInt32LE(0x04034b50, 0);
-    local.writeUInt16LE(20, 4); // version needed
-    local.writeUInt16LE(0, 6); // flags
-    local.writeUInt16LE(method, 8);
-    local.writeUInt16LE(0, 10); // time
-    local.writeUInt16LE(dosDate, 12);
-    local.writeUInt32LE(crc, 14);
-    local.writeUInt32LE(payload.length, 18);
-    local.writeUInt32LE(data.length, 22);
-    local.writeUInt16LE(nameBuf.length, 26);
-    local.writeUInt16LE(0, 28); // extra len
-    locals.push(local, nameBuf, payload);
-    const central = Buffer.alloc(46);
-    central.writeUInt32LE(0x02014b50, 0);
-    central.writeUInt16LE(20, 4); // version made by
-    central.writeUInt16LE(20, 6); // version needed
-    central.writeUInt16LE(0, 8);
-    central.writeUInt16LE(method, 10);
-    central.writeUInt16LE(0, 12);
-    central.writeUInt16LE(dosDate, 14);
-    central.writeUInt32LE(crc, 16);
-    central.writeUInt32LE(payload.length, 20);
-    central.writeUInt32LE(data.length, 24);
-    central.writeUInt16LE(nameBuf.length, 28);
-    // comment/disk/attrs/offset fields
-    central.writeUInt32LE(offset, 42);
-    centrals.push(central, nameBuf);
-    offset += local.length + nameBuf.length + payload.length;
-  }
-  const centralSize = centrals.reduce((n, b) => n + b.length, 0);
-  const eocd = Buffer.alloc(22);
-  eocd.writeUInt32LE(0x06054b50, 0);
-  eocd.writeUInt16LE(entries.length, 8);
-  eocd.writeUInt16LE(entries.length, 10);
-  eocd.writeUInt32LE(centralSize, 12);
-  eocd.writeUInt32LE(offset, 16);
-  return Buffer.concat([...locals, ...centrals, eocd]);
-}
-
-// ---------------------------------------------------------------------------
-// Image handling: sniff dimensions so pictures keep their aspect ratio.
-
-const IMAGE_TYPES: Record<string, string> = { ".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".gif": "gif" };
-
-function imageSize(buf: Buffer, kind: string): { w: number; h: number } | null {
-  try {
-    if (kind === "png" && buf.readUInt32BE(12) === 0x49484452) return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
-    if (kind === "gif") return { w: buf.readUInt16LE(6), h: buf.readUInt16LE(8) };
-    if (kind === "jpeg") {
-      let i = 2;
-      while (i + 9 < buf.length) {
-        if (buf[i] !== 0xff) break;
-        const marker = buf[i + 1]!;
-        if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) return { w: buf.readUInt16BE(i + 7), h: buf.readUInt16BE(i + 5) };
-        i += 2 + buf.readUInt16BE(i + 2);
-      }
-    }
-  } catch {
-    /* fall through — caller uses the full bounding box */
-  }
-  return null;
-}
 
 // ---------------------------------------------------------------------------
 // OOXML part builders. All geometry in EMU (914400/inch); slide is 16:9.
 
-const EMU = 914400;
 const SLIDE_W = 12192000; // 13.333in
 const SLIDE_H = 6858000; // 7.5in
 const NS = `xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"`;
-const XML_DECL = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`;
-const REL_NS = `xmlns="http://schemas.openxmlformats.org/package/2006/relationships"`;
-const RT = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
 const COLOR = { title: "202124", body: "3C4043", accent: "4472C4", muted: "5F6368" };
-
-function esc(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
-}
 
 const inch = (n: number): number => Math.round(n * EMU);
 
@@ -297,10 +201,6 @@ function themeXml(name: string): string {
     `<a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst>` +
     `<a:bgFillStyleLst>${fills}</a:bgFillStyleLst></a:fmtScheme></a:themeElements></a:theme>`
   );
-}
-
-function relsXml(rels: { id: string; type: string; target: string }[]): string {
-  return `${XML_DECL}<Relationships ${REL_NS}>${rels.map((r) => `<Relationship Id="${r.id}" Type="${RT}/${r.type}" Target="${r.target}"/>`).join("")}</Relationships>`;
 }
 
 // ---------------------------------------------------------------------------
