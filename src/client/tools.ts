@@ -807,9 +807,13 @@ export const tools: Tool[] = [
           mkdirSync(dirname(abs), { recursive: true });
           writeFileSync(abs, buf);
           const n = (args.slides as unknown[]).length;
+          // End with the ABSOLUTE path so the user can open the deck straight from the reply.
           return {
-            output: `Wrote ${rel}: ${n} slide${n === 1 ? "" : "s"}, ${buf.length} bytes.`,
-            display: green(`+ ${rel} (${n} slide${n === 1 ? "" : "s"}, ${buf.length} bytes)`),
+            output:
+              `Wrote ${rel}: ${n} slide${n === 1 ? "" : "s"}, ${buf.length} bytes.\n` +
+              `Open it here: ${abs}\n` +
+              "Tell the user the deck is ready and end your reply with this full path on its own line.",
+            display: green(`+ ${rel} (${n} slide${n === 1 ? "" : "s"}, ${buf.length} bytes)\n  ${abs}`),
           };
         } catch (e) {
           return { output: e instanceof Error ? e.message : String(e), isError: true };
