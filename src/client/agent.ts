@@ -91,23 +91,44 @@ function systemPrompt(includeProject: boolean): string {
   );
 }
 
-// Tools marked `lazy` carry big schemas that most turns never need (document/image generation).
-// Since every schema is resent on every request, we only advertise them once the conversation
-// actually asks for that kind of output — a plain "hi" shouldn't pay ~1k tokens for deck-building
-// instructions. Matched against the recent conversation so the tools stay available for the whole
-// task, not just the message that triggered them.
-const LAZY_INTENT =
-  /\b(deck|slides?|presentation|powerpoint|ppts?x?|keynote|docx|word (?:doc\w*|file)|document|report|write-?up|whitepaper|proposal|image|picture|png|jpe?g|illustration|artwork|diagram|mockup|thumbnail|cover art|infographic)\b/i;
+// Tools marked `lazy` carry big schemas that most turns never need. Since every schema is resent on
+// every request, they're only advertised once the conversation asks for that kind of work — a plain
+// "hi" shouldn't pay ~1k tokens for deck-building instructions. Each group has its OWN trigger:
+// asking for a slide deck must not also drag in the notebook and browser schemas.
+export const LAZY_GATES: { tools: string[]; intent: RegExp }[] = [
+  {
+    tools: ["generate_pptx", "generate_docx", "generate_image"],
+    intent:
+      /\b(deck|slides?|presentation|powerpoint|ppts?x?|keynote|docx|word (?:doc\w*|file)|document|report|write-?up|whitepaper|proposal|image|picture|png|jpe?g|illustration|artwork|diagram|mockup|thumbnail|cover art|infographic)\b/i,
+  },
+  { tools: ["notebook_edit"], intent: /\b(notebooks?|jupyter|ipynb|colab|(?:code|markdown) cells?)\b/i },
+  {
+    tools: ["browser"],
+    intent: /\b(browser|screenshots?|devtools|localhost|dev ?server|the (?:page|site|app) (?:looks?|renders?)|console\b|in chrome|open the (?:page|site|app)|preview)\b/i,
+  },
+];
+// Gating is driven by the tool's own `lazy` flag; LAZY_GATES only says what unlocks each one. A
+// lazy tool missing from the gates would go permanently invisible — test/lazy-tools.mjs asserts the
+// two lists agree so that can't ship.
 
-function wantsLazyTools(messages: Msg[]): boolean {
-  const recent = messages.slice(-8);
-  for (const m of recent) {
+/** Recent conversation text — matched over a window so a tool stays available for the whole task,
+ *  not just the message that triggered it. */
+function recentText(messages: Msg[]): string {
+  const out: string[] = [];
+  for (const m of messages.slice(-8)) {
     if (m.role !== "user" && m.role !== "assistant") continue;
     const c = m.content;
-    const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (typeof p === "object" && p && "text" in p ? String(p.text) : "")).join(" ") : "";
-    if (LAZY_INTENT.test(text)) return true;
+    out.push(typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (typeof p === "object" && p && "text" in p ? String(p.text) : "")).join(" ") : "");
   }
-  return false;
+  return out.join("\n");
+}
+
+/** Which lazy tools this conversation has earned. */
+function allowedLazyTools(messages: Msg[]): Set<string> {
+  const text = recentText(messages);
+  const allowed = new Set<string>();
+  for (const g of LAZY_GATES) if (g.intent.test(text)) for (const n of g.tools) allowed.add(n);
+  return allowed;
 }
 
 function buildApiTools(): ToolDef[] {
@@ -677,12 +698,11 @@ export class Agent {
     // Send only what this turn can actually use. Answering "hi" needs no repo map and no tools, so
     // it costs the base prompt alone; the next message is assembled fresh and gets the full kit.
     const smallTalk = isSmallTalk(this.messages);
+    const allowed = smallTalk ? new Set<string>() : allowedLazyTools(this.messages);
     const lazyNames = new Set(tools.filter((t) => t.lazy).map((t) => t.name));
     const apiTools = smallTalk
       ? [] // no file edits, shell or search needed to say hello back
-      : wantsLazyTools(this.messages)
-        ? this.apiTools
-        : this.apiTools.filter((t) => !("function" in t) || !lazyNames.has(t.function.name));
+      : this.apiTools.filter((t) => !("function" in t) || !lazyNames.has(t.function.name) || allowed.has(t.function.name));
 
     const extras: string[] = [];
     if (this.project && !smallTalk) {

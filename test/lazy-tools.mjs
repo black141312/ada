@@ -11,18 +11,81 @@ const { tools } = await import(
   pathToFileURL(resolve("src/client/tools.ts")).href
 );
 
-// Read the regex out of the implementation so this test can never drift from it.
+// Import the gates rather than re-deriving them, so this test can never drift from what ships.
+// SMALL_TALK is still scraped from source below.
 const src = readFileSync("src/client/agent.ts", "utf8");
-const m = src.match(/const LAZY_INTENT =\s*\n?\s*\/(.+)\/i;/);
-assert.ok(m, "LAZY_INTENT regex not found in agent.ts");
-const intent = new RegExp(m[1], "i");
+const { LAZY_GATES: GATES } = await import(
+  pathToFileURL(resolve("src/client/agent.ts")).href
+);
+assert.equal(GATES.length, 3, `expected 3 gate groups, got ${GATES.length}`);
+const gateFor = (name) => GATES.find((g) => g.tools.includes(name));
 
 const lazy = tools.filter((t) => t.lazy).map((t) => t.name);
 assert.deepEqual(
   lazy.sort(),
-  ["generate_docx", "generate_image", "generate_pptx"],
+  [
+    "browser",
+    "generate_docx",
+    "generate_image",
+    "generate_pptx",
+    "notebook_edit",
+  ],
   "unexpected set of lazy tools",
 );
+// A lazy tool with no gate could never be advertised — fail here rather than in production.
+for (const name of lazy) {
+  assert.ok(
+    gateFor(name),
+    `lazy tool "${name}" has no entry in LAZY_GATES — it would be invisible`,
+  );
+}
+
+// The doc gate is the one that fires most; it must not drag the others in with it.
+const docIntent = gateFor("generate_pptx").intent;
+const nbIntent = gateFor("notebook_edit").intent;
+const browserIntent = gateFor("browser").intent;
+assert.equal(
+  nbIntent.test("make me a deck about this project"),
+  false,
+  "a deck request must not enable the notebook tool",
+);
+assert.equal(
+  browserIntent.test("make me a deck about this project"),
+  false,
+  "a deck request must not enable the browser tool",
+);
+assert.equal(
+  docIntent.test("fix the failing cell in analysis.ipynb"),
+  false,
+  "a notebook request must not enable the document tools",
+);
+
+for (const s of [
+  "edit the second cell of analysis.ipynb",
+  "this jupyter notebook is broken",
+  "add a markdown cell explaining the model",
+]) {
+  assert.equal(nbIntent.test(s), true, `should enable notebook_edit: "${s}"`);
+}
+for (const s of [
+  "screenshot the settings page",
+  "check the console for errors",
+  "open http://localhost:5173 and look",
+  "does the page render?",
+]) {
+  assert.equal(browserIntent.test(s), true, `should enable browser: "${s}"`);
+}
+for (const s of [
+  "fix the failing test",
+  "refactor the auth module",
+  "rename this variable",
+]) {
+  assert.equal(
+    nbIntent.test(s) || browserIntent.test(s),
+    false,
+    `plain coding must enable neither: "${s}"`,
+  );
+}
 
 // Gating must actually save a meaningful number of tokens, or it isn't worth the complexity.
 const est = (x) => Math.ceil(JSON.stringify(x).length / 4);
@@ -50,7 +113,11 @@ for (const s of [
   "deploy to prod",
   "ship the release",
 ]) {
-  assert.equal(intent.test(s), false, `should not trigger lazy tools: "${s}"`);
+  assert.equal(
+    docIntent.test(s),
+    false,
+    `should not trigger the document tools: "${s}"`,
+  );
 }
 
 // Anything that asks for a deck, document or picture must enable them.
@@ -66,7 +133,11 @@ for (const s of [
   "draw a diagram of the flow",
   "design a thumbnail",
 ]) {
-  assert.equal(intent.test(s), true, `should trigger lazy tools: "${s}"`);
+  assert.equal(
+    docIntent.test(s),
+    true,
+    `should trigger the document tools: "${s}"`,
+  );
 }
 
 // --- the repo map is skipped for small talk, but must ride along for anything real ---

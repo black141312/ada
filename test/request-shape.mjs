@@ -93,5 +93,21 @@ assert.ok(
 );
 assert.equal(deck.hasMap, true, "a deck request should carry the repo map");
 
+// Each lazy group has its own trigger: one kind of request must not drag in the others' schemas.
+const nb = await shapeOf("fix the broken cell in analysis.ipynb");
+assert.ok(nb.names.includes("notebook_edit"), "a notebook request must advertise notebook_edit");
+assert.ok(!nb.names.includes("generate_pptx"), "a notebook request must not advertise generate_pptx");
+assert.ok(!nb.names.includes("browser"), "a notebook request must not advertise browser");
+
+const ui = await shapeOf("screenshot localhost:5173 and check the console");
+assert.ok(ui.names.includes("browser"), "a UI request must advertise browser");
+assert.ok(!ui.names.includes("notebook_edit"), "a UI request must not advertise notebook_edit");
+assert.ok(!ui.names.includes("generate_docx"), "a UI request must not advertise generate_docx");
+
+assert.ok(!deck.names.includes("browser") && !deck.names.includes("notebook_edit"), "a deck request must not advertise the browser/notebook tools");
+
+// git is core, not lazy — it rides along with any real request but never with small talk.
+assert.ok(code.names.includes("git"), "a code request should carry the git tool");
+
 srv.close();
 console.log("ok");

@@ -30,7 +30,7 @@ import { catalogText, prefetch } from "./models-dev.ts";
 import { ensureBackend, isLocalBackend } from "./autostart.ts";
 import { popularModels } from "./models.ts";
 import { route } from "../server/router.ts"; // pure model-id → provider mapping (static table, safe client-side)
-import { renderJobs, startJob } from "./background.ts";
+import { registerSubagentTools, renderJobs } from "./background.ts";
 import { renderTodos } from "./todos.ts";
 import { track } from "./telemetry.ts";
 
@@ -1059,6 +1059,10 @@ async function main(): Promise<void> {
         /* offline */
       }
     }
+    // Delegation, same as the REPL gets. A sub-agent auto-approves its own tools: it has no stream
+    // to raise an approval on, and the parent's call was already approved through the editor's UI.
+    registerSubagentTools({ client, model, onApprove: async () => "yes", autoApprove: true, project: trusted, compactAt: settings.compactAt });
+
     const port = Number(process.env.ADA_HTTP_PORT) || 8788;
 
     // Interactive sessions — for driving ada like an IDE agent panel (live text/tool-call events,
@@ -1567,57 +1571,8 @@ async function main(): Promise<void> {
     }
   });
 
-  // Subagent: delegate an isolated subtask to a fresh ada agent (registered before the agent
-  // snapshots its tool list, so it appears in the registry).
-  registerTool({
-    name: "spawn_agent",
-    description: "Delegate a self-contained subtask to a fresh ada sub-agent; returns its final summary. Use for isolated research or a chunk of work handled independently.",
-    parameters: {
-      type: "object",
-      properties: { task: { type: "string", description: "The subtask, with all the context the sub-agent needs." } },
-      required: ["task"],
-      additionalProperties: false,
-    },
-    needsApproval: false,
-    async run(args) {
-      const sub = new Agent({
-        client,
-        model,
-        session: Session.create(),
-        onApprove,
-        autoApprove,
-        reasoning: flags.reasoning ?? settings.reasoning,
-        project: includeProject,
-        compactAt: settings.compactAt,
-      });
-      try {
-        const text = await sub.send(String(args.task ?? ""), { quiet: true });
-        return { output: text || "(sub-agent returned no text)" };
-      } catch (e) {
-        return { output: String(e instanceof Error ? e.message : e), isError: true };
-      }
-    },
-  });
-
-  registerTool({
-    name: "background_task",
-    description: "Start a self-contained subtask in the background and return its job id immediately — don't wait for it. Use for long, independent work. The user checks results with /jobs.",
-    parameters: {
-      type: "object",
-      properties: { task: { type: "string", description: "The subtask, with all the context the sub-agent needs." } },
-      required: ["task"],
-      additionalProperties: false,
-    },
-    needsApproval: false,
-    async run(args) {
-      const task = String(args.task ?? "");
-      const id = startJob(task, async () => {
-        const sub = new Agent({ client, model, session: Session.create(), onApprove, autoApprove: true, project: includeProject, compactAt: settings.compactAt });
-        return sub.send(task, { quiet: true });
-      });
-      return { output: `Started background job ${id}. Check results with /jobs (don't wait on it).` };
-    },
-  });
+  // Registered before the agent snapshots its tool list, so they appear in the registry.
+  registerSubagentTools({ client, model, onApprove, autoApprove, reasoning: flags.reasoning ?? settings.reasoning, project: includeProject, compactAt: settings.compactAt });
 
   const agent = new Agent({
     client,

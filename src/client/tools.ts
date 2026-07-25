@@ -14,6 +14,7 @@ import { isTrusted, loadSettings } from "./settings.ts";
 import { getDiagnostics } from "./lsp.ts";
 import { buildPptx, type PptxSlideSpec } from "./pptx.ts";
 import { buildDocx, type DocxBlock } from "./docx.ts";
+import { browserAction } from "./browser.ts";
 
 // Every tool result is appended to the transcript and resent on each subsequent step, so an
 // oversized result is paid for again and again. 12k chars (~3k tokens) is ample for a file slice or
@@ -385,6 +386,151 @@ export const tools: Tool[] = [
       const res = spawnSync(command, { shell: true, encoding: "utf8", timeout: 120_000, maxBuffer: 10 * 1024 * 1024, cwd: process.cwd(), env: scrubbedEnv() });
       const out = [res.stdout, res.stderr].filter(Boolean).join("\n").trim() || "(no output)";
       return { output: `exit ${res.status ?? "null"}\n${spillIfHuge(out)}`, isError: res.status !== 0 };
+    },
+  },
+  {
+    // Lets the agent check its own UI work instead of asking the user "does it look right?".
+    // Lazy — most turns never touch a browser, and the schema shouldn't ride along for them.
+    name: "browser",
+    lazy: true,
+    description:
+      "Look at a page in a real browser: `open` navigates and reports the title + console, `screenshot` saves a png, `text` returns the rendered text, `console` returns logs and errors. Use after changing UI to verify it renders and the console is clean.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["open", "screenshot", "text", "console"] },
+        url: { type: "string", description: "Page to load first, e.g. http://localhost:5173. Omit to act on the page already open." },
+        path: { type: "string", description: "screenshot only: output file ending in .png." },
+        width: { type: "number", description: "Viewport width (default 1280)." },
+        height: { type: "number", description: "Viewport height (default 800)." },
+      },
+      required: ["action"],
+      additionalProperties: false,
+    },
+    needsApproval: true,
+    async run(args) {
+      const action = String(args.action) as "open" | "screenshot" | "text" | "console";
+      const url = args.url ? String(args.url) : undefined;
+      if (url && !/^https?:\/\//i.test(url)) return { output: `browser: url must start with http:// or https:// (got ${url})`, isError: true };
+      try {
+        const r = await browserAction(action, url, Number(args.width) || 1280, Number(args.height) || 800);
+        if (!r.screenshot) return { output: truncate(r.text) };
+        const rel = String(args.path ?? "screenshot.png");
+        const abs = resolve(process.cwd(), rel.toLowerCase().endsWith(".png") ? rel : `${rel}.png`);
+        if (isProtected(abs)) return { output: `Refused: ${rel} is a protected path.`, isError: true };
+        mkdirSync(dirname(abs), { recursive: true });
+        writeFileSync(abs, r.screenshot);
+        return { output: `Screenshot of ${r.text} → ${abs}` };
+      } catch (e) {
+        return { output: `browser: ${e instanceof Error ? e.message : String(e)}`, isError: true };
+      }
+    },
+  },
+  {
+    // A .ipynb is JSON whose `source` is an array of lines — models edit it badly as raw text
+    // (they reflow it into one string, or drop the trailing newlines, and Jupyter stops rendering).
+    // Lazy: only worth its schema in a conversation that's actually about notebooks.
+    name: "notebook_edit",
+    lazy: true,
+    description:
+      "Edit one cell of a Jupyter notebook (.ipynb) by index: replace its source, insert a new cell before it, or delete it. Editing a code cell clears its stale outputs. Read the notebook first with read_file to find the cell.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to the .ipynb file." },
+        cell: { type: "number", description: "0-based cell index. For insert, the new cell lands at this position." },
+        mode: { type: "string", enum: ["replace", "insert", "delete"], description: "Default replace." },
+        source: { type: "string", description: "New cell contents (required for replace/insert)." },
+        cell_type: { type: "string", enum: ["code", "markdown"], description: "insert only; default code." },
+      },
+      required: ["path", "cell"],
+      additionalProperties: false,
+    },
+    needsApproval: true,
+    async run(args) {
+      const rel = String(args.path);
+      const abs = resolve(process.cwd(), rel);
+      if (extname(abs).toLowerCase() !== ".ipynb") return { output: `notebook_edit: not a notebook: ${rel}`, isError: true };
+      if (isProtected(abs)) return { output: `Refused: ${rel} is a protected path.`, isError: true };
+      const mode = String(args.mode ?? "replace");
+      const idx = Number(args.cell);
+      let nb: { cells?: unknown[]; nbformat?: number };
+      try {
+        nb = JSON.parse(readFileSync(abs, "utf8")) as typeof nb;
+      } catch (e) {
+        return { output: `notebook_edit: ${abs} is not readable JSON — ${e instanceof Error ? e.message : String(e)}`, isError: true };
+      }
+      const cells = nb.cells;
+      if (!Array.isArray(cells)) return { output: `notebook_edit: ${rel} has no cells array — is it a notebook?`, isError: true };
+      const upper = mode === "insert" ? cells.length : cells.length - 1;
+      if (!Number.isInteger(idx) || idx < 0 || idx > upper) {
+        return { output: `notebook_edit: cell ${args.cell} is out of range (notebook has ${cells.length} cells).`, isError: true };
+      }
+      // nbformat stores source as a list of lines, each keeping its trailing newline except the last.
+      const lines = (s: string): string[] => s.split("\n").map((l, i, a) => (i === a.length - 1 ? l : `${l}\n`)).filter((l, i, a) => l !== "" || i < a.length - 1);
+
+      if (mode === "delete") {
+        cells.splice(idx, 1);
+      } else if (mode === "insert") {
+        if (args.source == null) return { output: "notebook_edit: insert needs `source`.", isError: true };
+        const type = String(args.cell_type ?? "code");
+        cells.splice(idx, 0, type === "markdown" ? { cell_type: "markdown", metadata: {}, source: lines(String(args.source)) } : { cell_type: "code", execution_count: null, metadata: {}, outputs: [], source: lines(String(args.source)) });
+      } else {
+        if (args.source == null) return { output: "notebook_edit: replace needs `source`.", isError: true };
+        const cell = cells[idx] as { cell_type?: string; source?: unknown; outputs?: unknown[]; execution_count?: number | null };
+        cell.source = lines(String(args.source));
+        if (cell.cell_type === "code") {
+          cell.outputs = []; // the old output described the old code
+          cell.execution_count = null;
+        }
+      }
+      checkpoint.record(abs); // so /undo covers notebook edits like any other write
+      writeFileSync(abs, `${JSON.stringify(nb, null, 1)}\n`); // indent 1 — what Jupyter itself writes
+      return { output: `${mode === "delete" ? "Deleted" : mode === "insert" ? "Inserted" : "Replaced"} cell ${idx} in ${rel} (${cells.length} cells now).` };
+    },
+  },
+  {
+    // Read-only on purpose: reading history is safe and constantly needed, while commit/push/reset
+    // rewrite the user's repo — those stay in `bash`, where they show up in the approval prompt as
+    // the actual command being run.
+    name: "git",
+    description:
+      "Inspect the repository: status, diff (staged with `staged`), log, show, blame, branch. Read-only — to commit, push, checkout or reset, use `bash` so the user sees the exact command.",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string", enum: ["status", "diff", "log", "show", "blame", "branch"] },
+        path: { type: "string", description: "Limit to a file or directory (blame requires it)." },
+        rev: { type: "string", description: "Commit, branch or range — e.g. HEAD~3, main..HEAD. `show` defaults to HEAD." },
+        staged: { type: "boolean", description: "diff only: show the staged changes instead of the working tree." },
+        limit: { type: "number", description: "log only: how many commits (default 20)." },
+      },
+      required: ["command"],
+      additionalProperties: false,
+    },
+    needsApproval: false,
+    async run(args) {
+      const cmd = String(args.command);
+      const path = args.path ? String(args.path) : "";
+      const rev = args.rev ? String(args.rev) : "";
+      // Everything goes through argv — never a shell string — so a path or rev can't inject.
+      const argv: Record<string, string[]> = {
+        status: ["status", "--short", "--branch"],
+        diff: ["diff", ...(args.staged ? ["--staged"] : []), ...(rev ? [rev] : [])],
+        log: ["log", `-n${Math.min(Math.max(Number(args.limit) || 20, 1), 200)}`, "--date=short", "--pretty=format:%h %ad %an — %s", ...(rev ? [rev] : [])],
+        show: ["show", "--stat", "--patch", rev || "HEAD"],
+        blame: ["blame", "--date=short", "-w", ...(rev ? [rev] : [])],
+        branch: ["branch", "--all", "-vv"],
+      };
+      const rest = argv[cmd];
+      if (!rest) return { output: `git: unknown command "${cmd}"`, isError: true };
+      if (cmd === "blame" && !path) return { output: "git blame needs a `path`.", isError: true };
+      if (path && cmd !== "branch" && cmd !== "status") rest.push("--", path);
+      else if (path && cmd === "status") rest.push("--", path);
+      const res = spawnSync("git", rest, { encoding: "utf8", timeout: 30_000, maxBuffer: 10 * 1024 * 1024, cwd: process.cwd(), env: scrubbedEnv() });
+      if (res.error) return { output: `git: ${res.error.message}`, isError: true };
+      const out = [res.stdout, res.stderr].filter(Boolean).join("\n").trim();
+      return { output: spillIfHuge(out || "(no output)"), isError: res.status !== 0 };
     },
   },
   {
