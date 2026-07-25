@@ -101,6 +101,11 @@ export const LAZY_GATES: { tools: string[]; intent: RegExp }[] = [
     intent:
       /\b(deck|slides?|presentation|powerpoint|ppts?x?|keynote|docx|word (?:doc\w*|file)|document|report|write-?up|whitepaper|proposal|image|picture|png|jpe?g|illustration|artwork|diagram|mockup|thumbnail|cover art|infographic)\b/i,
   },
+  {
+    tools: ["create_page"],
+    intent:
+      /\b(html page|web ?page|landing page|one-?pager|dashboard|report|write-?up|comparison|summary page|visuali[sz]ation|infographic|share(?:able)? page)\b/i,
+  },
   { tools: ["notebook_edit"], intent: /\b(notebooks?|jupyter|ipynb|colab|(?:code|markdown) cells?)\b/i },
   {
     tools: ["browser"],

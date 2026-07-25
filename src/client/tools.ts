@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { scrubbedEnv } from "./secret-env.ts";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { glob as fsGlob } from "node:fs/promises";
-import { dirname, extname, join, relative, resolve } from "node:path";
+import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import type * as PtyType from "node-pty";
 import { green, renderEditDiff } from "./render.ts";
 import * as checkpoint from "./checkpoint.ts";
@@ -226,7 +226,85 @@ export function isDestructive(command: string): boolean {
   return DESTRUCTIVE.test(command);
 }
 
+/** Anything the page would have to fetch from the network to render correctly. A page that needs a
+ *  CDN isn't a file you can send someone — it's a file that breaks offline, behind a proxy, or the
+ *  day the CDN moves. Images degrade (alt text shows); scripts and stylesheets do not, so those are
+ *  the ones worth refusing over. */
+function externalRefs(html: string): { fatal: string[]; soft: string[] } {
+  const fatal: string[] = [];
+  const soft: string[] = [];
+  const push = (list: string[], what: string): void => {
+    if (!list.includes(what) && list.length < 6) list.push(what);
+  };
+  for (const m of html.matchAll(/<script\b[^>]*\bsrc\s*=\s*["'](https?:)?\/\/([^"']+)/gi)) push(fatal, `<script src="${m[2]?.slice(0, 60)}">`);
+  for (const m of html.matchAll(/<link\b[^>]*\bhref\s*=\s*["'](https?:)?\/\/([^"']+)/gi)) push(fatal, `<link href="${m[2]?.slice(0, 60)}">`);
+  for (const m of html.matchAll(/@import\s+(?:url\()?["']?(https?:)?\/\/([^"')]+)/gi)) push(fatal, `@import ${m[2]?.slice(0, 60)}`);
+  for (const m of html.matchAll(/<img\b[^>]*\bsrc\s*=\s*["'](https?:)?\/\/([^"']+)/gi)) push(soft, `<img src="${m[2]?.slice(0, 60)}">`);
+  return { fatal, soft };
+}
+
 export const tools: Tool[] = [
+  {
+    // Ada could always write HTML with write_file. What this adds is the contract: the page has to
+    // stand alone, it lands somewhere predictable, and the user gets a path plus an open window
+    // instead of a filename buried in prose.
+    name: "create_page",
+    lazy: true,
+    description:
+      "Write a self-contained HTML page (report, dashboard, comparison, one-pager) and open it in the browser. Everything must be inline — no CDN scripts, stylesheets or webfonts — so the file works offline and when sent to someone. Embed images as data: URIs. A bare filename lands in docs/. Load the `web-page` skill first for the design rules.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Output file, ending in .html. A bare filename goes to docs/." },
+        html: { type: "string", description: "The complete document, starting with <!doctype html>." },
+        open: { type: "boolean", description: "Open it in the default browser (default true)." },
+      },
+      required: ["path", "html"],
+      additionalProperties: false,
+    },
+    needsApproval: true,
+    async run(args) {
+      const rel = String(args.path);
+      const html = String(args.html ?? "");
+      if (!/\.html?$/i.test(rel)) return { output: `create_page: path must end in .html (got ${rel})`, isError: true };
+      if (html.trim().length < 200) return { output: "create_page: that's not a page — write the real document, not a stub.", isError: true };
+
+      const { fatal, soft } = externalRefs(html);
+      if (fatal.length) {
+        return {
+          output:
+            `create_page: the page pulls ${fatal.length} resource(s) off the network, so it won't render offline or for anyone you send it to:\n` +
+            fatal.map((f) => `  - ${f}`).join("\n") +
+            "\nInline the CSS/JS, and use a system font stack instead of a webfont.",
+          isError: true,
+        };
+      }
+
+      // A bare filename belongs somewhere findable, not scattered in the repo root.
+      const abs = rel.includes("/") || rel.includes("\\") || isAbsolute(rel) ? resolve(process.cwd(), rel) : resolve(process.cwd(), "docs", rel);
+      if (isProtected(abs)) return { output: `Refused: ${rel} is a protected path.`, isError: true };
+      try {
+        mkdirSync(dirname(abs), { recursive: true });
+        checkpoint.record(abs);
+        writeFileSync(abs, html);
+      } catch (e) {
+        return { output: `create_page: ${e instanceof Error ? e.message : String(e)}`, isError: true };
+      }
+
+      let opened = "";
+      if (args.open !== false) {
+        const cmd = process.platform === "win32" ? ["cmd", ["/c", "start", "", abs]] : process.platform === "darwin" ? ["open", [abs]] : ["xdg-open", [abs]];
+        try {
+          spawnSync(cmd[0] as string, cmd[1] as string[], { timeout: 10_000, stdio: "ignore" });
+          opened = " and opened it in your browser";
+        } catch {
+          /* headless or no handler — the path below is still the answer */
+        }
+      }
+      const warn = soft.length ? `\nHeads up: ${soft.length} image(s) load from the network and will be blank offline — ${soft.join(", ")}` : "";
+      return { output: `Wrote ${(html.length / 1024).toFixed(1)} kB${opened}.\n\nOpen it here: ${abs}${warn}` };
+    },
+  },
   {
     name: "read_file",
     description: "Read a UTF-8 text file. Optional offset/limit (1-based line range) for large files.",

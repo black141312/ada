@@ -17,7 +17,7 @@ const src = readFileSync("src/client/agent.ts", "utf8");
 const { LAZY_GATES: GATES } = await import(
   pathToFileURL(resolve("src/client/agent.ts")).href
 );
-assert.equal(GATES.length, 3, `expected 3 gate groups, got ${GATES.length}`);
+assert.equal(GATES.length, 4, `expected 4 gate groups, got ${GATES.length}`);
 const gateFor = (name) => GATES.find((g) => g.tools.includes(name));
 
 const lazy = tools.filter((t) => t.lazy).map((t) => t.name);
@@ -25,6 +25,7 @@ assert.deepEqual(
   lazy.sort(),
   [
     "browser",
+    "create_page",
     "generate_docx",
     "generate_image",
     "generate_pptx",
@@ -180,5 +181,14 @@ for (const s of [
     `real request must keep the repo map: "${s}"`,
   );
 }
+
+const pageIntent = gateFor("create_page").intent;
+for (const t of ["build me an html page for this", "make a dashboard", "write this up as a one-pager", "a shareable page please"]) {
+  assert.equal(pageIntent.test(t), true, `should enable create_page: "${t}"`);
+}
+for (const t of ["fix the failing test", "refactor the auth module", "run the tests"]) {
+  assert.equal(pageIntent.test(t), false, `plain coding must not enable create_page: "${t}"`);
+}
+assert.equal(nbIntent.test("make a dashboard"), false, "a page request must not enable the notebook tool");
 
 console.log("ok");
