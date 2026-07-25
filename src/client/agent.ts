@@ -111,6 +111,26 @@ export const LAZY_GATES: { tools: string[]; intent: RegExp }[] = [
 // lazy tool missing from the gates would go permanently invisible — test/lazy-tools.mjs asserts the
 // two lists agree so that can't ship.
 
+/** Routers wrap an upstream failure in their own envelope: OpenRouter's `message` is the useless
+ *  "Provider returned error", while the reason the provider actually gave sits in
+ *  `error.metadata.raw` and the provider's name in `error.metadata.provider_name`. Surfacing only
+ *  the wrapper leaves a 400 undiagnosable, so pull the inner message up into the thrown error. */
+export function explainApiError(e: unknown): unknown {
+  const err = e as { message?: string; error?: { metadata?: { raw?: unknown; provider_name?: string } } };
+  const meta = err?.error?.metadata;
+  if (!meta?.raw && !meta?.provider_name) return e;
+  let detail = typeof meta.raw === "string" ? meta.raw : JSON.stringify(meta.raw ?? "");
+  try {
+    const inner = JSON.parse(detail) as { error?: { message?: string }; message?: string };
+    detail = inner?.error?.message ?? inner?.message ?? detail;
+  } catch {
+    /* raw wasn't JSON — show it as-is */
+  }
+  const who = meta.provider_name ? ` (provider: ${meta.provider_name})` : "";
+  if (e instanceof Error) e.message = `${e.message}${who}: ${detail.slice(0, 400)}`;
+  return e;
+}
+
 /** Recent conversation text — matched over a window so a tool stays available for the whole task,
  *  not just the message that triggered it. */
 function recentText(messages: Msg[]): string {
@@ -741,7 +761,7 @@ export class Agent {
           await this.autoCompact("context overflow");
           continue;
         }
-        throw e;
+        throw explainApiError(e);
       }
 
       let content = "";
@@ -784,7 +804,7 @@ export class Agent {
           interrupted();
           return null;
         }
-        throw e;
+        throw explainApiError(e);
       }
       if (!bufferMode) say(md.end());
 
