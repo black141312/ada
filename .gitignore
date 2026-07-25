@@ -10,4 +10,3 @@ node_modules/
 .wrangler/
 
 ada-auth.db
-__pycache__/
