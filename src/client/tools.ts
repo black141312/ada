@@ -15,7 +15,10 @@ import { getDiagnostics } from "./lsp.ts";
 import { buildPptx, type PptxSlideSpec } from "./pptx.ts";
 import { buildDocx, type DocxBlock } from "./docx.ts";
 
-const MAX_OUTPUT = 30_000;
+// Every tool result is appended to the transcript and resent on each subsequent step, so an
+// oversized result is paid for again and again. 12k chars (~3k tokens) is ample for a file slice or
+// a listing; the model can re-read with offset/limit when it genuinely needs more.
+const MAX_OUTPUT = Number(process.env.ADA_MAX_TOOL_OUTPUT) || 12_000;
 
 export interface ToolResult {
   output: string; // text returned to the model
@@ -760,46 +763,41 @@ export const tools: Tool[] = [
   {
     name: "generate_pptx",
     description:
-      "Create a real, editable PowerPoint .pptx file from structured slide content — no Python, npm, or external tools needed. " +
-      "This tool RENDERS; it does not write copy — you must supply the finished content. Every content slide needs 3-6 substantive " +
-      "bullets carrying real specifics (facts, numbers, file/component names, decisions) — never bare titles or placeholders; a " +
-      "title-only deck is rejected. Bullets accept plain strings or {text, level} for nesting. A slide with a subtitle and no " +
-      "bullets is a centered title/section slide (use sparingly). `notes` adds speaker notes — include them. " +
-      "For VISUALS, prefer the built-ins — they need no files and stay editable: `chart` draws a horizontal bar chart from " +
-      "{label, value} data (comparisons, breakdowns, counts) and `metrics` renders up to 4 headline KPI tiles. Use `image` " +
-      "(local png/jpg/gif) for screenshots, architecture diagrams, or anything you generate with generate_image. " +
-      "A deck of pure text is weak — most decks want at least one chart or metrics row. Close with a summary/next-steps slide.",
+      "Render a real, editable .pptx. You supply finished content — 3-6 specific bullets per content slide (facts, numbers, names); " +
+      "title-only decks are rejected. Subtitle without bullets = section slide. Add `notes` (speaker notes). For visuals prefer " +
+      "`chart` (bar data) or `metrics` (up to 4 KPI tiles) — no file needed; use `image` for screenshots/diagrams (see generate_image). " +
+      "End with a summary slide.",
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Output file path ending in .pptx. A bare filename goes into docs/ (preferred) — pass a path only to override." },
-        title: { type: "string", description: "Deck title for document properties." },
+        path: { type: "string", description: "Path ending in .pptx; a bare filename goes to docs/." },
+        title: { type: "string", description: "Deck title." },
         slides: {
           type: "array",
-          description: "One entry per slide, in order.",
+          description: "Slides, in order.",
           items: {
             type: "object",
             properties: {
               title: { type: "string" },
               subtitle: { type: "string" },
-              bullets: { type: "array", items: {}, description: 'Strings, or {"text": "...", "level": 1} for indented sub-bullets.' },
-              image: { type: "string", description: "Path to a local png/jpg/gif to embed." },
+              bullets: { type: "array", items: {}, description: 'Strings or {text, level} for sub-bullets.' },
+              image: { type: "string", description: "Local png/jpg/gif to embed." },
               chart: {
                 type: "object",
-                description: "Horizontal bar chart drawn as native, editable shapes — no image file needed. Use for comparisons, breakdowns, or anything countable.",
+                description: "Bar chart drawn as native shapes.",
                 properties: {
                   data: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "number" } }, required: ["label", "value"], additionalProperties: false } },
-                  unit: { type: "string", description: 'Suffix appended to each value, e.g. "%" or "ms".' },
+                  unit: { type: "string", description: 'Value suffix, e.g. "%".' },
                 },
                 required: ["data"],
                 additionalProperties: false,
               },
               metrics: {
                 type: "array",
-                description: "Up to 4 headline KPI tiles (big figure + caption) rendered across the slide.",
+                description: "Up to 4 KPI tiles (figure + caption).",
                 items: { type: "object", properties: { value: { type: "string" }, label: { type: "string" } }, required: ["value"], additionalProperties: false },
               },
-              notes: { type: "string", description: "Speaker notes for this slide." },
+              notes: { type: "string", description: "Speaker notes." },
             },
             additionalProperties: false,
           },
@@ -868,35 +866,33 @@ export const tools: Tool[] = [
   {
     name: "generate_docx",
     description:
-      "Create a real, editable Word .docx from structured blocks — no Python, npm, or external tools needed. " +
-      "This tool RENDERS; you supply the finished prose. Blocks are typed: heading (level 1-3), paragraph, bullets " +
-      "(nestable via {text, level}), numbered, table ({headers, rows}), chart ({data:[{label,value}], unit}), metrics ({items:[{value,label}]}), image (local png/jpg/gif), pageBreak. " +
-      "Write real content, not an outline: a document of bare headings is rejected. Prefer tables for comparisons and " +
-      "structured data, and embed screenshots or diagrams with image. A bare filename lands in docs/.",
+      "Render a real, editable .docx. You supply finished prose. Block types: heading (1-3), paragraph, bullets (nestable), " +
+      "numbered, table, chart, metrics, image, pageBreak. Headings-only documents are rejected — write real content. " +
+      "Use tables for structured data, chart/metrics for visuals. A bare filename lands in docs/.",
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Output file path ending in .docx. A bare filename goes into docs/ (preferred)." },
-        title: { type: "string", description: "Document title, rendered at the top and set in document properties." },
-        subtitle: { type: "string", description: "Optional subtitle under the title." },
+        path: { type: "string", description: "Path ending in .docx; a bare filename goes to docs/." },
+        title: { type: "string", description: "Document title." },
+        subtitle: { type: "string", description: "Subtitle." },
         blocks: {
           type: "array",
-          description: "The document body, in order.",
+          description: "Blocks, in order.",
           items: {
             type: "object",
             properties: {
               type: { type: "string", enum: ["heading", "paragraph", "bullets", "numbered", "table", "chart", "metrics", "image", "pageBreak"] },
-              text: { type: "string", description: "For heading and paragraph." },
+              text: { type: "string", description: "heading/paragraph text." },
               level: { type: "number", description: "Heading level 1-3." },
               bold: { type: "boolean" },
               italic: { type: "boolean" },
-              items: { type: "array", items: {}, description: 'For bullets/numbered: strings, or {"text": "...", "level": 1} to nest.' },
-              headers: { type: "array", items: { type: "string" }, description: "For table: the header row." },
-              rows: { type: "array", items: { type: "array", items: { type: "string" } }, description: "For table: the body rows." },
-              data: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "number" } }, required: ["label", "value"], additionalProperties: false }, description: "For chart: the bars." },
-              unit: { type: "string", description: 'For chart: suffix on each value, e.g. "%".' },
-              path: { type: "string", description: "For image: path to a local png/jpg/gif." },
-              width: { type: "number", description: "For image: width in inches (default 6)." },
+              items: { type: "array", items: {}, description: "bullets/numbered items." },
+              headers: { type: "array", items: { type: "string" }, description: "table header row." },
+              rows: { type: "array", items: { type: "array", items: { type: "string" } }, description: "table body rows." },
+              data: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "number" } }, required: ["label", "value"], additionalProperties: false }, description: "chart bars." },
+              unit: { type: "string", description: 'chart value suffix.' },
+              path: { type: "string", description: "image file path." },
+              width: { type: "number", description: "image width in inches." },
             },
             required: ["type"],
             additionalProperties: false,

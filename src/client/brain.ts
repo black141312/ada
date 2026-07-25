@@ -11,7 +11,9 @@ import { join, relative, resolve } from "node:path";
 
 const SKIP = new Set(["node_modules", ".git", "dist", ".ada", ".next", "build", "coverage", "out", "vendor", "target", ".venv", "__pycache__"]);
 const CODE_EXT = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|cs|c|h|cpp|hpp|swift|scala|svelte|vue)$/i;
-const MAX_CHARS = Number(process.env.ADA_BRAIN_MAX) || 12_000; // ~3k tokens
+// The map rides in the system prompt on EVERY request, so its size is a per-call tax. 6k chars
+// (~1.5k tokens) still names hundreds of files; the agent greps/searches for anything deeper.
+const MAX_CHARS = Number(process.env.ADA_BRAIN_MAX) || 6_000;
 const MAX_FILES = 4000; // walk cap — don't crawl a monorepo forever
 const MAX_FILE_BYTES = 300_000;
 
@@ -100,7 +102,8 @@ function fingerprint(files: FileEntry[]): string {
     if (f.mtime > newest) newest = f.mtime;
     total += f.size;
   }
-  return `${files.length}:${newest}:${total}`;
+  // MAX_CHARS is part of the key: changing the budget must rebuild, not reuse an oversized map.
+  return `${files.length}:${newest}:${total}:${MAX_CHARS}`;
 }
 
 function render(files: FileEntry[]): string {
