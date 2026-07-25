@@ -956,9 +956,7 @@ export const tools: Tool[] = [
   {
     name: "generate_image",
     description:
-      "Generate an image from a text prompt (gpt-image-1) and save it as a PNG. Use for illustrations, concept art, cover art, and diagram-style visuals. Write a rich, specific prompt — subject, style, mood, lighting, composition. " +
-      "Pair it with generate_pptx/generate_docx: create the PNG first, then pass its path as a slide's `image` (or an image block) to illustrate a deck or document. " +
-      "Runs through the ada backend, so no local API key is needed.",
+      "Generate a PNG from a text prompt. Write a specific prompt (subject, style, composition). To illustrate a deck or document, create the PNG first, then pass its path as a slide `image` / image block.",
     parameters: {
       type: "object",
       properties: {
