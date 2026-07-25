@@ -61,13 +61,17 @@ function brainNote(): string {
 // clearly small talk still gets the map, so a real request is never left unoriented.
 const SMALL_TALK = /^(hi|hey|hello|yo|sup|hola|namaste|thanks?|thank you|ty|ok|okay|k|cool|nice|great|awesome|got it|sounds good|good (?:morning|afternoon|evening|night)|bye|gn|lol|haha|ping|test|testing)[\s!.,?)*~-]*$/i;
 
-function needsProjectMap(messages: Msg[]): boolean {
+/** True when the latest user turn is nothing but a greeting/acknowledgement. Such a turn needs no
+ *  repo map and no tools at all — answering "hi" doesn't require the ability to edit files. Each
+ *  request is assembled independently, so the very next message gets the full kit back. */
+function isSmallTalk(messages: Msg[]): boolean {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]!;
     if (m.role !== "user") continue;
     const c = m.content;
+    if (Array.isArray(c) && c.some((p) => typeof p === "object" && p && "type" in p && p.type === "image_url")) return false; // pasted an image
     const text = (typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (typeof p === "object" && p && "text" in p ? String(p.text) : "")).join(" ") : "").trim();
-    return !(text.length <= 40 && SMALL_TALK.test(text));
+    return text.length <= 40 && SMALL_TALK.test(text);
   }
   return false; // no user turn yet
 }
@@ -670,15 +674,18 @@ export class Agent {
     this.pendingNote = null; // consume once — the routing hint applies to this turn only
     this.pendingMemory = null; // recall is per-turn + transient — never pushed to messages/session
     const note = [opts?.note ?? (this.planMode ? PLAN_NOTE : null), memory, suggest].filter(Boolean).join("\n\n") || null;
-    // Advertise the heavyweight document/image tools only when this conversation calls for them.
+    // Send only what this turn can actually use. Answering "hi" needs no repo map and no tools, so
+    // it costs the base prompt alone; the next message is assembled fresh and gets the full kit.
+    const smallTalk = isSmallTalk(this.messages);
     const lazyNames = new Set(tools.filter((t) => t.lazy).map((t) => t.name));
-    const apiTools = wantsLazyTools(this.messages)
-      ? this.apiTools
-      : this.apiTools.filter((t) => !("function" in t) || !lazyNames.has(t.function.name));
+    const apiTools = smallTalk
+      ? [] // no file edits, shell or search needed to say hello back
+      : wantsLazyTools(this.messages)
+        ? this.apiTools
+        : this.apiTools.filter((t) => !("function" in t) || !lazyNames.has(t.function.name));
 
-    // The repo map rides along only when the turn is actually about the code (see needsProjectMap).
     const extras: string[] = [];
-    if (this.project && needsProjectMap(this.messages)) {
+    if (this.project && !smallTalk) {
       this.brain ??= brainNote(); // built once per session, reused every request
       if (this.brain) extras.push(this.brain);
     }
@@ -692,8 +699,9 @@ export class Agent {
           {
             model: this.model,
             messages: sendMessages,
-            tools: apiTools,
-            tool_choice: opts?.allowTools === false ? "none" : "auto",
+            // Omit the field entirely when there's nothing to advertise — several providers reject
+            // an empty `tools` array outright.
+            ...(apiTools.length ? { tools: apiTools, tool_choice: opts?.allowTools === false ? ("none" as const) : ("auto" as const) } : {}),
             stream: true,
             stream_options: { include_usage: true },
             ...(this.reasoning ? { reasoning_effort: this.reasoning } : {}),
