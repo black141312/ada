@@ -31,6 +31,10 @@ export interface Tool {
   description: string;
   parameters: Record<string, unknown>; // JSON Schema
   needsApproval: boolean;
+  /** Big schema, rarely wanted: advertised only when the conversation asks for it (see
+   *  wantsLazyTools in agent.ts). Every tool schema is resent on every request, so keeping the
+   *  document/image generators out of a "hi" saves ~1k tokens a call. */
+  lazy?: boolean;
   run(args: Record<string, unknown>): Promise<ToolResult>;
 }
 
@@ -762,6 +766,7 @@ export const tools: Tool[] = [
   },
   {
     name: "generate_pptx",
+    lazy: true,
     description:
       "Render a real, editable .pptx. You supply finished content — 3-6 specific bullets per content slide (facts, numbers, names); " +
       "title-only decks are rejected. Subtitle without bullets = section slide. Add `notes` (speaker notes). For visuals prefer " +
@@ -865,6 +870,7 @@ export const tools: Tool[] = [
   },
   {
     name: "generate_docx",
+    lazy: true,
     description:
       "Render a real, editable .docx. You supply finished prose. Block types: heading (1-3), paragraph, bullets (nestable), " +
       "numbered, table, chart, metrics, image, pageBreak. Headings-only documents are rejected — write real content. " +
@@ -955,6 +961,7 @@ export const tools: Tool[] = [
   },
   {
     name: "generate_image",
+    lazy: true,
     description:
       "Generate a PNG from a text prompt. Write a specific prompt (subject, style, composition). To illustrate a deck or document, create the PNG first, then pass its path as a slide `image` / image block.",
     parameters: {

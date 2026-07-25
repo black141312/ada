@@ -70,6 +70,25 @@ function systemPrompt(includeProject: boolean): string {
   );
 }
 
+// Tools marked `lazy` carry big schemas that most turns never need (document/image generation).
+// Since every schema is resent on every request, we only advertise them once the conversation
+// actually asks for that kind of output — a plain "hi" shouldn't pay ~1k tokens for deck-building
+// instructions. Matched against the recent conversation so the tools stay available for the whole
+// task, not just the message that triggered them.
+const LAZY_INTENT =
+  /\b(deck|slides?|presentation|powerpoint|ppts?x?|keynote|docx|word (?:doc\w*|file)|document|report|write-?up|whitepaper|proposal|image|picture|png|jpe?g|illustration|artwork|diagram|mockup|thumbnail|cover art|infographic)\b/i;
+
+function wantsLazyTools(messages: Msg[]): boolean {
+  const recent = messages.slice(-8);
+  for (const m of recent) {
+    if (m.role !== "user" && m.role !== "assistant") continue;
+    const c = m.content;
+    const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (typeof p === "object" && p && "text" in p ? String(p.text) : "")).join(" ") : "";
+    if (LAZY_INTENT.test(text)) return true;
+  }
+  return false;
+}
+
 function buildApiTools(): ToolDef[] {
   return tools.map((t) => ({
     type: "function",
@@ -633,6 +652,12 @@ export class Agent {
     this.pendingNote = null; // consume once — the routing hint applies to this turn only
     this.pendingMemory = null; // recall is per-turn + transient — never pushed to messages/session
     const note = [opts?.note ?? (this.planMode ? PLAN_NOTE : null), memory, suggest].filter(Boolean).join("\n\n") || null;
+    // Advertise the heavyweight document/image tools only when this conversation calls for them.
+    const lazyNames = new Set(tools.filter((t) => t.lazy).map((t) => t.name));
+    const apiTools = wantsLazyTools(this.messages)
+      ? this.apiTools
+      : this.apiTools.filter((t) => !("function" in t) || !lazyNames.has(t.function.name));
+
     let overflowRetried = false;
     for (;;) {
       const create = () =>
@@ -640,7 +665,7 @@ export class Agent {
           {
             model: this.model,
             messages: note ? [...this.messages, { role: "system", content: note }] : this.messages,
-            tools: this.apiTools,
+            tools: apiTools,
             tool_choice: opts?.allowTools === false ? "none" : "auto",
             stream: true,
             stream_options: { include_usage: true },
