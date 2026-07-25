@@ -136,6 +136,27 @@ export function explainApiError(e: unknown): unknown {
   return e;
 }
 
+/** A streamed tool call arrives in fragments that have to be stitched back together. Providers do
+ *  not agree on how: most number them with `index`, some omit it on continuation deltas, and some
+ *  restart it at 0 for each call. Keying on `index` alone therefore concatenates two calls'
+ *  arguments into `{...}{...}`, which is not JSON — and the NEXT request is rejected by strict
+ *  providers ("Invalid tool arguments received … key must be a string"), long after the corruption
+ *  happened. So: an `id` that differs from the slot's is a new call, whatever the index says. */
+export function applyToolCallDelta(calls: ({ id: string; name: string; args: string } | undefined)[], tc: { index?: number; id?: string; function?: { name?: string; arguments?: string } }): void {
+  let i = typeof tc.index === "number" ? tc.index : Math.max(0, calls.length - 1);
+  const slot = calls[i];
+  if (tc.id && slot?.id && slot.id !== tc.id) i = calls.length; // same index, different call
+  let entry = calls[i];
+  if (!entry) {
+    entry = { id: "", name: "", args: "" };
+    calls[i] = entry;
+  }
+  if (tc.id) entry.id = tc.id;
+  else if (!entry.id) entry.id = `call_${i}`; // some backends omit streamed ids — consumers key events on callId
+  if (tc.function?.name) entry.name += tc.function.name;
+  if (tc.function?.arguments) entry.args += tc.function.arguments;
+}
+
 /** Recent conversation text — matched over a window so a tool stays available for the whole task,
  *  not just the message that triggered it. */
 function recentText(messages: Msg[]): string {
@@ -791,17 +812,7 @@ export class Agent {
             }
             if (!bufferMode) say(md.push(delta.content));
           }
-          for (const tc of delta?.tool_calls ?? []) {
-            let entry = calls[tc.index];
-            if (!entry) {
-              entry = { id: "", name: "", args: "" };
-              calls[tc.index] = entry;
-            }
-            if (tc.id) entry.id = tc.id;
-            else if (!entry.id) entry.id = `call_${tc.index}`; // some backends omit streamed ids — consumers key events on callId
-            if (tc.function?.name) entry.name += tc.function.name;
-            if (tc.function?.arguments) entry.args += tc.function.arguments;
-          }
+          for (const tc of delta?.tool_calls ?? []) applyToolCallDelta(calls, tc);
         }
       } catch (e) {
         say(md.end());
