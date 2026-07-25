@@ -69,4 +69,45 @@ for (const s of [
   assert.equal(intent.test(s), true, `should trigger lazy tools: "${s}"`);
 }
 
+// --- the repo map is skipped for small talk, but must ride along for anything real ---
+const sm = src.match(/const SMALL_TALK =\s*\n?\s*\/(.+)\/i;/);
+assert.ok(sm, "SMALL_TALK regex not found in agent.ts");
+const smallTalk = new RegExp(sm[1], "i");
+const skipsMap = (t) => t.trim().length <= 40 && smallTalk.test(t.trim());
+
+for (const s of [
+  "hi",
+  "hey",
+  "hello!",
+  "thanks",
+  "thank you",
+  "ok",
+  "cool",
+  "got it",
+  "good morning",
+  "bye",
+]) {
+  assert.equal(
+    skipsMap(s),
+    true,
+    `small talk should skip the repo map: "${s}"`,
+  );
+}
+// Anything with actual intent keeps the map — including messages that merely START with a greeting.
+for (const s of [
+  "hey can you fix the auth bug?",
+  "hi, what does this project do?",
+  "fix the failing test",
+  "what is this repo?",
+  "add a settings toggle",
+  "thanks — now refactor the parser",
+  "ok now deploy it",
+]) {
+  assert.equal(
+    skipsMap(s),
+    false,
+    `real request must keep the repo map: "${s}"`,
+  );
+}
+
 console.log("ok");

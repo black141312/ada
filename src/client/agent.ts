@@ -33,27 +33,43 @@ export type ApprovalDecision = "yes" | "all" | "no";
 export type OnApprove = (toolName: string, summary: string) => Promise<ApprovalDecision>;
 
 function projectContext(): string {
-  let guide = "";
   for (const f of ["AGENTS.md", "CLAUDE.md"]) {
     const p = resolve(process.cwd(), f);
     if (existsSync(p)) {
       try {
-        guide = `\n\nProject guide (${f}):\n${readFileSync(p, "utf8").slice(0, 8000)}`;
-        break;
+        return `\n\nProject guide (${f}):\n${readFileSync(p, "utf8").slice(0, 8000)}`;
       } catch {
         /* ignore unreadable */
       }
     }
   }
-  // Repo map ("brain") — cached folder structure + symbols so the agent starts oriented.
-  let brain = "";
+  return "";
+}
+
+/** The repo map, as a system note. Kept OUT of the base prompt so it can be skipped on turns that
+ *  have nothing to do with the code — it's ~1.5k tokens and would otherwise ride on every request. */
+function brainNote(): string {
   try {
     const map = loadBrain();
-    if (map) brain = `\n\nProject map (auto-generated — file paths and their top-level symbols; use grep/codebase_search to go deeper):\n${map}`;
+    return map ? `Project map (file paths and their top-level symbols; use grep/codebase_search to go deeper):\n${map}` : "";
   } catch {
-    /* brain is best-effort — never block a session on it */
+    return ""; // best-effort — never block a turn on it
   }
-  return guide + brain;
+}
+
+// Greetings and acknowledgements need no repo context. Deliberately narrow: anything that isn't
+// clearly small talk still gets the map, so a real request is never left unoriented.
+const SMALL_TALK = /^(hi|hey|hello|yo|sup|hola|namaste|thanks?|thank you|ty|ok|okay|k|cool|nice|great|awesome|got it|sounds good|good (?:morning|afternoon|evening|night)|bye|gn|lol|haha|ping|test|testing)[\s!.,?)*~-]*$/i;
+
+function needsProjectMap(messages: Msg[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.role !== "user") continue;
+    const c = m.content;
+    const text = (typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (typeof p === "object" && p && "text" in p ? String(p.text) : "")).join(" ") : "").trim();
+    return !(text.length <= 40 && SMALL_TALK.test(text));
+  }
+  return false; // no user turn yet
 }
 
 function systemPrompt(includeProject: boolean): string {
@@ -62,9 +78,10 @@ function systemPrompt(includeProject: boolean): string {
       "You are ada, a minimal coding agent running in a terminal, in the spirit of pi, Codex, and Cursor.",
       `Working directory: ${process.cwd()}`,
       `Platform: ${process.platform}`,
-      "Tools: read_file, write_file, edit_file, bash, ls, grep, glob, codebase_search, web_fetch, web_search, lsp_diagnostics. Use grep/glob/ls to explore the codebase — or codebase_search when you're looking for code by MEANING rather than an exact string; read a file before editing it; prefer edit_file for changes to existing files; web_fetch to read a URL, web_search to find one; lsp_diagnostics to check a file for errors after editing; apply_patch for multi-file changes; ask_user only when genuinely blocked.",
-      "Specialized skills are available: call list_skills to browse them (by category or filter), then use_skill to load one before a specialized task.",
-      "When the user states a durable preference, project convention, decision, correction, or constraint worth recalling in later sessions ('always use X', 'we deploy via Y', 'my name is Z', 'never touch W'), call remember_fact. Do NOT remember transient task state, anything already in AGENTS.md/CLAUDE.md, or secrets/keys/tokens (those are refused). Relevant memories are auto-recalled at the start of a turn.",
+      // The tool schemas already describe each tool — this only covers what they can't: when to pick one.
+      "Explore with grep/glob/ls; use codebase_search when searching by meaning, not exact text. Read a file before editing; prefer edit_file over rewriting, apply_patch for multi-file changes; lsp_diagnostics after edits; ask_user only when blocked. Documents, decks and images can be generated on request.",
+      "Call list_skills then use_skill before a specialized task.",
+      "Call remember_fact when the user states a durable preference, convention or constraint ('always use X', 'we deploy via Y'). Not transient state, not secrets. Relevant memories are recalled automatically.",
       "Be concise. Don't narrate routine actions or pad with preamble. When you have enough information to act, act. Ask only when genuinely blocked or before destructive, irreversible actions.",
     ].join("\n") + (includeProject ? projectContext() : "")
   );
@@ -469,6 +486,7 @@ export class Agent {
   private autoApprove: boolean;
   private compactAt: number;
   private apiTools: ToolDef[];
+  private brain: string | null = null; // repo map, built lazily on the first turn that needs it
   private promptTokens = 0;
   private completionTokens = 0;
   private lastAssistant = "";
@@ -658,13 +676,22 @@ export class Agent {
       ? this.apiTools
       : this.apiTools.filter((t) => !("function" in t) || !lazyNames.has(t.function.name));
 
+    // The repo map rides along only when the turn is actually about the code (see needsProjectMap).
+    const extras: string[] = [];
+    if (this.project && needsProjectMap(this.messages)) {
+      this.brain ??= brainNote(); // built once per session, reused every request
+      if (this.brain) extras.push(this.brain);
+    }
+    if (note) extras.push(note);
+    const sendMessages: Msg[] = extras.length ? [...this.messages, { role: "system", content: extras.join("\n\n") }] : this.messages;
+
     let overflowRetried = false;
     for (;;) {
       const create = () =>
         this.client.chat.completions.create(
           {
             model: this.model,
-            messages: note ? [...this.messages, { role: "system", content: note }] : this.messages,
+            messages: sendMessages,
             tools: apiTools,
             tool_choice: opts?.allowTools === false ? "none" : "auto",
             stream: true,
