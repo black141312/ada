@@ -200,7 +200,16 @@ export function registerSkillTool(skills: Skill[]): void {
       const s = byName.get(String(args.name));
       if (!s) return { output: `Unknown skill: ${String(args.name)}. Call list_skills to see available skills.`, isError: true };
       try {
-        return { output: readFileSync(s.path, "utf8") };
+        const md = readFileSync(s.path, "utf8");
+        // Some skills ship docs/scripts/references beside their SKILL.md and cite them by relative
+        // path. The agent's cwd is the project, not the skill, so hand over the skill's own
+        // directory — without it every one of those references resolves to nothing.
+        const home = dirname(s.path);
+        const extras = ["docs", "scripts", "references", "prompts", "templates", "assets"].filter((d) => existsSync(join(home, d)));
+        if (!extras.length) return { output: md };
+        return {
+          output: `${md}\n\n---\nSkill directory: ${home}\nThis skill bundles ${extras.join(", ")}. Paths it mentions (e.g. \`docs/foo.md\`, \`scripts/bar.py\`) are relative to that directory — prefix them with it to read or run them.`,
+        };
       } catch (e) {
         return { output: String(e), isError: true };
       }
