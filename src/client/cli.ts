@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { stdin, stdout } from "node:process";
 import OpenAI from "openai";
 import { Agent, type AgentEvent, type ApprovalDecision, type OnApprove } from "./agent.ts";
-import { ApprovalRegistry, newId, sseFrame } from "./agent-server.ts";
+import { ApprovalRegistry, QuestionRegistry, newId, sseFrame } from "./agent-server.ts";
 import { expandPrompt, loadPrompts } from "./prompts.ts";
 import { Session, list, type SessionMeta } from "./session.ts";
 import { deleteCredential, getCredential, listCredentials, setCredential } from "../server/credentials.ts";
@@ -1070,6 +1070,7 @@ async function main(): Promise<void> {
     interface AgentSession {
       agent: Agent;
       registry: ApprovalRegistry;
+      questions: QuestionRegistry;
       emit: ((frame: string) => void) | null; // set only while a /prompt request's SSE stream is open
       file: string; // the on-disk transcript — survives an `ada serve` restart; resume with it
       ctrl: AbortController | null; // set while a turn runs — doubles as the busy flag
@@ -1082,7 +1083,7 @@ async function main(): Promise<void> {
     const makeSession = (m: string, resumeFile?: string): { id: string; rec: AgentSession } => {
       const session = resumeFile ? Session.open(resumeFile) : Session.create();
       const history = resumeFile ? (session.load() as unknown as Msg[]) : undefined;
-      const rec: AgentSession = { agent: undefined as unknown as Agent, registry: new ApprovalRegistry(), emit: null, file: session.file, ctrl: null, steer: [], mode: "ask" };
+      const rec: AgentSession = { agent: undefined as unknown as Agent, registry: new ApprovalRegistry(), questions: new QuestionRegistry(), emit: null, file: session.file, ctrl: null, steer: [], mode: "ask" };
       rec.agent = new Agent({
         client,
         model: m,
@@ -1242,14 +1243,25 @@ async function main(): Promise<void> {
             if (!res.writableEnded) {
               rec.ctrl?.abort();
               rec.registry.abortAll();
+              rec.questions.abortAll();
             }
           });
           rec.emit = (frame) => res.write(frame);
+          // ask_user needs somewhere to ask. The asker is global, so it belongs to whichever session
+          // is streaming — installed here and cleared in the finally, exactly like rec.emit.
+          setAsker(async (question, options) => {
+            if (!rec.emit) return "";
+            const { id, promise } = rec.questions.wait();
+            rec.emit(sseFrame({ type: "question", id, question, options: options ?? [] }));
+            return promise;
+          });
           try {
             await rec.agent.send(text, { signal: rec.ctrl!.signal, steer: rec.steer, images, onEvent: (e: AgentEvent) => res.write(sseFrame(e)) });
           } catch (e) {
             res.write(sseFrame({ type: "error", message: e instanceof Error ? e.message : String(e) }));
           } finally {
+            setAsker(null);
+            rec.questions.abortAll();
             rec.emit = null;
             rec.ctrl = null;
             rec.steer.length = 0;
@@ -1332,6 +1344,27 @@ async function main(): Promise<void> {
           // Models are stateless — the context lives in the transcript, so switching mid-session is safe.
           if (model !== undefined && model.trim()) rec.agent.setModel(model.trim());
           res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, mode: rec.mode, model: rec.agent.model }));
+        });
+        return;
+      }
+      const answerMatch = req.method === "POST" && url.pathname.match(/^\/v1\/sessions\/([^/]+)\/answer$/);
+      if (answerMatch) {
+        const rec = sessions.get(answerMatch[1]!);
+        if (!rec) {
+          res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: "unknown session" }));
+          return;
+        }
+        let body = "";
+        req.on("data", (c) => (body += c));
+        req.on("end", () => {
+          let ok = false;
+          try {
+            const { id, answer } = JSON.parse(body || "{}") as { id?: string; answer?: string };
+            if (id) ok = rec.questions.settle(id, String(answer ?? ""));
+          } catch {
+            /* ok stays false */
+          }
+          res.writeHead(ok ? 200 : 404, { "content-type": "application/json" }).end(JSON.stringify({ ok }));
         });
         return;
       }
