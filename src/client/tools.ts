@@ -243,6 +243,23 @@ function externalRefs(html: string): { fatal: string[]; soft: string[] } {
   return { fatal, soft };
 }
 
+/** A note appended to write_file when a standalone page reaches for the network. `create_page`
+ *  refuses outright, but write_file is general-purpose — editing a file in an existing project that
+ *  already uses a CDN is legitimate — so this warns instead. Webfonts get called out specially:
+ *  they fail *silently*, falling back to a stack the design was never drawn against, so the page
+ *  looks fine to whoever made it and wrong to everyone offline. */
+function netWarning(abs: string, html: string): string {
+  if (!/\.html?$/i.test(abs)) return "";
+  const { fatal, soft } = externalRefs(html);
+  const fonts = fatal.filter((f) => /fonts\.(googleapis|gstatic)\.com|use\.typekit|fonts\.bunny/i.test(f));
+  const rest = fatal.filter((f) => !fonts.includes(f));
+  const bits: string[] = [];
+  if (fonts.length) bits.push(`${fonts.length} webfont link(s) — these fail silently offline and the design falls back to a stack it wasn't drawn for. Use a system font stack, or inline the face as a data: URI`);
+  if (rest.length) bits.push(`${rest.length} external script/stylesheet — inline it`);
+  if (soft.length) bits.push(`${soft.length} remote image — embed as a data: URI or the page renders blank offline`);
+  return bits.length ? `\n\nHeads up — this page won't stand alone: ${bits.join("; ")}.` : "";
+}
+
 export const tools: Tool[] = [
   {
     // Ada could always write HTML with write_file. What this adds is the contract: the page has to
@@ -366,7 +383,7 @@ export const tools: Tool[] = [
           writeFileSync(abs, content, "utf8");
           const formatted = formatFile(abs);
           return {
-            output: `Wrote ${content.length} bytes to ${String(args.path)}${formatted ? " (auto-formatted)" : ""}`,
+            output: `Wrote ${content.length} bytes to ${String(args.path)}${formatted ? " (auto-formatted)" : ""}${netWarning(abs, content)}`,
             display: green(`+ ${String(args.path)} (${content.length} bytes written)${formatted ? " · formatted" : ""}`),
           };
         } catch (e) {

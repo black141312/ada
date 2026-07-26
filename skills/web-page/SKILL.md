@@ -36,7 +36,7 @@ those instead. The project's system beats your taste.
 - **Self-contained.** No CDN scripts, stylesheets or webfonts; images as `data:` URIs. `create_page`
   rejects external scripts and stylesheets outright, because a page that needs the network isn't a
   file you can hand to someone. A webfont link that silently falls back is worse than a system stack
-  chosen on purpose.
+  chosen on purpose. In particular: **never link `fonts.googleapis.com`** - it is the single most common way a page stops working offline, and the failure is invisible to whoever wrote it.
 - **Both themes.** Define the palette as custom properties on `:root`, redefine them under
   `@media (prefers-color-scheme: dark)`, and style components only through the tokens. Give the
   second theme the same care — don't invert and hope. A page that deliberately commits to one look
