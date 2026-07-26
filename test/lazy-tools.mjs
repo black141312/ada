@@ -17,7 +17,7 @@ const src = readFileSync("src/client/agent.ts", "utf8");
 const { LAZY_GATES: GATES } = await import(
   pathToFileURL(resolve("src/client/agent.ts")).href
 );
-assert.equal(GATES.length, 4, `expected 4 gate groups, got ${GATES.length}`);
+assert.equal(GATES.length, 5, `expected 5 gate groups, got ${GATES.length}`);
 const gateFor = (name) => GATES.find((g) => g.tools.includes(name));
 
 const lazy = tools.filter((t) => t.lazy).map((t) => t.name);
@@ -30,9 +30,20 @@ assert.deepEqual(
     "generate_image",
     "generate_pptx",
     "notebook_edit",
+    "ui_ux_search",
   ],
   "unexpected set of lazy tools",
 );
+
+// Every gate must carry real word boundaries. A literal backspace byte (0x08) reads as "\b" in a
+// stringified regex but matches nothing — it has slipped in more than once when a gate was written
+// through a shell, and the symptom is a tool that is simply never offered.
+for (const g of GATES) {
+  assert.ok(
+    !g.intent.source.includes(String.fromCharCode(8)),
+    `gate for ${g.tools.join("/")} contains a raw backspace byte instead of a word boundary`,
+  );
+}
 // A lazy tool with no gate could never be advertised — fail here rather than in production.
 for (const name of lazy) {
   assert.ok(
@@ -183,19 +194,43 @@ for (const s of [
 }
 
 const pageIntent = gateFor("create_page").intent;
-for (const t of ["build me an html page for this", "make a dashboard", "write this up as a one-pager", "a shareable page please"]) {
+for (const t of [
+  "build me an html page for this",
+  "make a dashboard",
+  "write this up as a one-pager",
+  "a shareable page please",
+]) {
   assert.equal(pageIntent.test(t), true, `should enable create_page: "${t}"`);
 }
-for (const t of ["fix the failing test", "refactor the auth module", "run the tests"]) {
-  assert.equal(pageIntent.test(t), false, `plain coding must not enable create_page: "${t}"`);
+for (const t of [
+  "fix the failing test",
+  "refactor the auth module",
+  "run the tests",
+]) {
+  assert.equal(
+    pageIntent.test(t),
+    false,
+    `plain coding must not enable create_page: "${t}"`,
+  );
 }
-assert.equal(nbIntent.test("make a dashboard"), false, "a page request must not enable the notebook tool");
+assert.equal(
+  nbIntent.test("make a dashboard"),
+  false,
+  "a page request must not enable the notebook tool",
+);
 
 // Format-ambiguous wording must unlock BOTH generators, or the agent cannot offer the choice it is
 // told to offer. Unambiguous wording must stay narrow so a "deck" request doesn't drag the page tool in.
 const pageIntent2 = gateFor("create_page").intent;
-for (const t of ["create a presentation for the project", "write it up as a report"]) {
-  assert.equal(docIntent.test(t) && pageIntent2.test(t), true, `ambiguous wording should offer both: "${t}"`);
+for (const t of [
+  "create a presentation for the project",
+  "write it up as a report",
+]) {
+  assert.equal(
+    docIntent.test(t) && pageIntent2.test(t),
+    true,
+    `ambiguous wording should offer both: "${t}"`,
+  );
 }
 for (const [t, deck, page] of [
   ["make me a deck", true, false],
@@ -209,7 +244,11 @@ for (const [t, deck, page] of [
 // and both tools must actually carry the instruction to ask
 for (const n of ["generate_pptx", "create_page"]) {
   const d = tools.find((x) => x.name === n).description;
-  assert.match(d, /ask_user first which they want/, `${n} should tell the agent to ask when the format is ambiguous`);
+  assert.match(
+    d,
+    /ask_user first which they want/,
+    `${n} should tell the agent to ask when the format is ambiguous`,
+  );
 }
 
 console.log("ok");

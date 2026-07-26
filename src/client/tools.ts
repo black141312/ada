@@ -15,6 +15,7 @@ import { getDiagnostics } from "./lsp.ts";
 import { buildPptx, type PptxSlideSpec } from "./pptx.ts";
 import { buildDocx, type DocxBlock } from "./docx.ts";
 import { browserAction } from "./browser.ts";
+import { availableStacks, renderUiux, uiuxSearch } from "./uiux.ts";
 
 // Every tool result is appended to the transcript and resent on each subsequent step, so an
 // oversized result is paid for again and again. 12k chars (~3k tokens) is ample for a file slice or
@@ -261,6 +262,40 @@ function netWarning(abs: string, html: string): string {
 }
 
 export const tools: Tool[] = [
+  {
+    // A searchable corpus rather than more prose about good design: concrete styles with hex values,
+    // font pairings, WCAG-graded UX rules, motion presets and per-stack guidance.
+    name: "ui_ux_search",
+    lazy: true,
+    description:
+      "Look up concrete UI/UX design guidance: visual styles with real colour values, colour palettes, font pairings, UX and accessibility rules, motion presets, chart choices, and per-stack conventions. Use BEFORE writing UI, and again to review it. Domain is detected from the question; pass `domain` to force one, or `stack` for framework-specific rules.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "What you are designing or checking, in plain words, e.g. 'dashboard for a fintech saas'." },
+        domain: { type: "string", enum: ["style", "color", "chart", "landing", "product", "ux", "typography", "icons", "gsap", "react", "web", "google-fonts"], description: "Force a corpus instead of detecting one." },
+        stack: { type: "string", description: "Framework-specific rules, e.g. react, nextjs, flutter, swiftui, tailwind. Overrides domain." },
+        max_results: { type: "number", description: "Default 3." },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+    needsApproval: false,
+    async run(args) {
+      const query = String(args.query ?? "").trim();
+      if (!query) return { output: "ui_ux_search: say what you are designing.", isError: true };
+      try {
+        const r = uiuxSearch(query, {
+          domain: args.domain ? String(args.domain) : undefined,
+          stack: args.stack ? String(args.stack) : undefined,
+          maxResults: Math.min(Math.max(Number(args.max_results) || 3, 1), 10),
+        });
+        return { output: truncate(renderUiux(r)), isError: !!r.error };
+      } catch (e) {
+        return { output: `ui_ux_search: ${e instanceof Error ? e.message : String(e)}`, isError: true };
+      }
+    },
+  },
   {
     // Ada could always write HTML with write_file. What this adds is the contract: the page has to
     // stand alone, it lands somewhere predictable, and the user gets a path plus an open window

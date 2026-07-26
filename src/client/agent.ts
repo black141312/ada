@@ -106,6 +106,11 @@ export const LAZY_GATES: { tools: string[]; intent: RegExp }[] = [
     intent:
       /\b(html page|web ?page|landing page|one-?pager|dashboard|report|write-?up|presentation|comparison|summary page|visuali[sz]ation|infographic|share(?:able)? page)\b/i,
   },
+  {
+    tools: ["ui_ux_search"],
+    intent:
+      /\b(ui|ux|design|redesign|styling|style|look and feel|visual|layout|palette|colou?rs?|typography|fonts?|accessibility|a11y|wcag|animation|motion|component|dashboard|landing page|make it (?:look )?(?:better|beautiful|nicer))\b/i,
+  },
   { tools: ["notebook_edit"], intent: /\b(notebooks?|jupyter|ipynb|colab|(?:code|markdown) cells?)\b/i },
   {
     tools: ["browser"],
