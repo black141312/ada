@@ -33,27 +33,47 @@ export type ApprovalDecision = "yes" | "all" | "no";
 export type OnApprove = (toolName: string, summary: string) => Promise<ApprovalDecision>;
 
 function projectContext(): string {
-  let guide = "";
   for (const f of ["AGENTS.md", "CLAUDE.md"]) {
     const p = resolve(process.cwd(), f);
     if (existsSync(p)) {
       try {
-        guide = `\n\nProject guide (${f}):\n${readFileSync(p, "utf8").slice(0, 8000)}`;
-        break;
+        return `\n\nProject guide (${f}):\n${readFileSync(p, "utf8").slice(0, 8000)}`;
       } catch {
         /* ignore unreadable */
       }
     }
   }
-  // Repo map ("brain") — cached folder structure + symbols so the agent starts oriented.
-  let brain = "";
+  return "";
+}
+
+/** The repo map, as a system note. Kept OUT of the base prompt so it can be skipped on turns that
+ *  have nothing to do with the code — it's ~1.5k tokens and would otherwise ride on every request. */
+function brainNote(): string {
   try {
     const map = loadBrain();
-    if (map) brain = `\n\nProject map (auto-generated — file paths and their top-level symbols; use grep/codebase_search to go deeper):\n${map}`;
+    return map ? `Project map (file paths and their top-level symbols; use grep/codebase_search to go deeper):\n${map}` : "";
   } catch {
-    /* brain is best-effort — never block a session on it */
+    return ""; // best-effort — never block a turn on it
   }
-  return guide + brain;
+}
+
+// Greetings and acknowledgements need no repo context. Deliberately narrow: anything that isn't
+// clearly small talk still gets the map, so a real request is never left unoriented.
+const SMALL_TALK = /^(hi|hey|hello|yo|sup|hola|namaste|thanks?|thank you|ty|ok|okay|k|cool|nice|great|awesome|got it|sounds good|good (?:morning|afternoon|evening|night)|bye|gn|lol|haha|ping|test|testing)[\s!.,?)*~-]*$/i;
+
+/** True when the latest user turn is nothing but a greeting/acknowledgement. Such a turn needs no
+ *  repo map and no tools at all — answering "hi" doesn't require the ability to edit files. Each
+ *  request is assembled independently, so the very next message gets the full kit back. */
+function isSmallTalk(messages: Msg[]): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.role !== "user") continue;
+    const c = m.content;
+    if (Array.isArray(c) && c.some((p) => typeof p === "object" && p && "type" in p && p.type === "image_url")) return false; // pasted an image
+    const text = (typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (typeof p === "object" && p && "text" in p ? String(p.text) : "")).join(" ") : "").trim();
+    return text.length <= 40 && SMALL_TALK.test(text);
+  }
+  return false; // no user turn yet
 }
 
 function systemPrompt(includeProject: boolean): string {
@@ -62,12 +82,104 @@ function systemPrompt(includeProject: boolean): string {
       "You are ada, a minimal coding agent running in a terminal, in the spirit of pi, Codex, and Cursor.",
       `Working directory: ${process.cwd()}`,
       `Platform: ${process.platform}`,
-      "Tools: read_file, write_file, edit_file, bash, ls, grep, glob, codebase_search, web_fetch, web_search, lsp_diagnostics. Use grep/glob/ls to explore the codebase — or codebase_search when you're looking for code by MEANING rather than an exact string; read a file before editing it; prefer edit_file for changes to existing files; web_fetch to read a URL, web_search to find one; lsp_diagnostics to check a file for errors after editing; apply_patch for multi-file changes; ask_user only when genuinely blocked.",
-      "Specialized skills are available: call list_skills to browse them (by category or filter), then use_skill to load one before a specialized task.",
-      "When the user states a durable preference, project convention, decision, correction, or constraint worth recalling in later sessions ('always use X', 'we deploy via Y', 'my name is Z', 'never touch W'), call remember_fact. Do NOT remember transient task state, anything already in AGENTS.md/CLAUDE.md, or secrets/keys/tokens (those are refused). Relevant memories are auto-recalled at the start of a turn.",
+      // The tool schemas already describe each tool — this only covers what they can't: when to pick one.
+      "Explore with grep/glob/ls; use codebase_search when searching by meaning, not exact text. Read a file before editing; prefer edit_file over rewriting, apply_patch for multi-file changes; lsp_diagnostics after edits; ask_user only when blocked. Documents, decks and images can be generated on request.",
+      "Call list_skills then use_skill before a specialized task.",
+      "Call remember_fact when the user states a durable preference, convention or constraint ('always use X', 'we deploy via Y'). Not transient state, not secrets. Relevant memories are recalled automatically.",
       "Be concise. Don't narrate routine actions or pad with preamble. When you have enough information to act, act. Ask only when genuinely blocked or before destructive, irreversible actions.",
     ].join("\n") + (includeProject ? projectContext() : "")
   );
+}
+
+// Tools marked `lazy` carry big schemas that most turns never need. Since every schema is resent on
+// every request, they're only advertised once the conversation asks for that kind of work — a plain
+// "hi" shouldn't pay ~1k tokens for deck-building instructions. Each group has its OWN trigger:
+// asking for a slide deck must not also drag in the notebook and browser schemas.
+export const LAZY_GATES: { tools: string[]; intent: RegExp }[] = [
+  {
+    tools: ["generate_pptx", "generate_docx", "generate_image"],
+    intent:
+      /\b(deck|slides?|presentation|powerpoint|ppts?x?|keynote|docx|word (?:doc\w*|file)|document|report|write-?up|whitepaper|proposal|image|picture|png|jpe?g|illustration|artwork|diagram|mockup|thumbnail|cover art|infographic)\b/i,
+  },
+  {
+    tools: ["create_page"],
+    intent:
+      /\b(html page|web ?page|landing page|one-?pager|dashboard|report|write-?up|presentation|comparison|summary page|visuali[sz]ation|infographic|share(?:able)? page)\b/i,
+  },
+  {
+    tools: ["ui_ux_search"],
+    intent:
+      /\b(ui|ux|design|redesign|styling|style|look and feel|visual|layout|palette|colou?rs?|typography|fonts?|accessibility|a11y|wcag|animation|motion|component|dashboard|landing page|make it (?:look )?(?:better|beautiful|nicer))\b/i,
+  },
+  { tools: ["notebook_edit"], intent: /\b(notebooks?|jupyter|ipynb|colab|(?:code|markdown) cells?)\b/i },
+  {
+    tools: ["browser"],
+    intent: /\b(browser|screenshots?|devtools|localhost|dev ?server|the (?:page|site|app) (?:looks?|renders?)|console\b|in chrome|open the (?:page|site|app)|preview)\b/i,
+  },
+];
+// Gating is driven by the tool's own `lazy` flag; LAZY_GATES only says what unlocks each one. A
+// lazy tool missing from the gates would go permanently invisible — test/lazy-tools.mjs asserts the
+// two lists agree so that can't ship.
+
+/** Routers wrap an upstream failure in their own envelope: OpenRouter's `message` is the useless
+ *  "Provider returned error", while the reason the provider actually gave sits in
+ *  `error.metadata.raw` and the provider's name in `error.metadata.provider_name`. Surfacing only
+ *  the wrapper leaves a 400 undiagnosable, so pull the inner message up into the thrown error. */
+export function explainApiError(e: unknown): unknown {
+  const err = e as { message?: string; error?: { metadata?: { raw?: unknown; provider_name?: string } } };
+  const meta = err?.error?.metadata;
+  if (!meta?.raw && !meta?.provider_name) return e;
+  let detail = typeof meta.raw === "string" ? meta.raw : JSON.stringify(meta.raw ?? "");
+  try {
+    const inner = JSON.parse(detail) as { error?: { message?: string }; message?: string };
+    detail = inner?.error?.message ?? inner?.message ?? detail;
+  } catch {
+    /* raw wasn't JSON — show it as-is */
+  }
+  const who = meta.provider_name ? ` (provider: ${meta.provider_name})` : "";
+  if (e instanceof Error) e.message = `${e.message}${who}: ${detail.slice(0, 400)}`;
+  return e;
+}
+
+/** A streamed tool call arrives in fragments that have to be stitched back together. Providers do
+ *  not agree on how: most number them with `index`, some omit it on continuation deltas, and some
+ *  restart it at 0 for each call. Keying on `index` alone therefore concatenates two calls'
+ *  arguments into `{...}{...}`, which is not JSON — and the NEXT request is rejected by strict
+ *  providers ("Invalid tool arguments received … key must be a string"), long after the corruption
+ *  happened. So: an `id` that differs from the slot's is a new call, whatever the index says. */
+export function applyToolCallDelta(calls: ({ id: string; name: string; args: string } | undefined)[], tc: { index?: number; id?: string; function?: { name?: string; arguments?: string } }): void {
+  let i = typeof tc.index === "number" ? tc.index : Math.max(0, calls.length - 1);
+  const slot = calls[i];
+  if (tc.id && slot?.id && slot.id !== tc.id) i = calls.length; // same index, different call
+  let entry = calls[i];
+  if (!entry) {
+    entry = { id: "", name: "", args: "" };
+    calls[i] = entry;
+  }
+  if (tc.id) entry.id = tc.id;
+  else if (!entry.id) entry.id = `call_${i}`; // some backends omit streamed ids — consumers key events on callId
+  if (tc.function?.name) entry.name += tc.function.name;
+  if (tc.function?.arguments) entry.args += tc.function.arguments;
+}
+
+/** Recent conversation text — matched over a window so a tool stays available for the whole task,
+ *  not just the message that triggered it. */
+function recentText(messages: Msg[]): string {
+  const out: string[] = [];
+  for (const m of messages.slice(-8)) {
+    if (m.role !== "user" && m.role !== "assistant") continue;
+    const c = m.content;
+    out.push(typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => (typeof p === "object" && p && "text" in p ? String(p.text) : "")).join(" ") : "");
+  }
+  return out.join("\n");
+}
+
+/** Which lazy tools this conversation has earned. */
+function allowedLazyTools(messages: Msg[]): Set<string> {
+  const text = recentText(messages);
+  const allowed = new Set<string>();
+  for (const g of LAZY_GATES) if (g.intent.test(text)) for (const n of g.tools) allowed.add(n);
+  return allowed;
 }
 
 function buildApiTools(): ToolDef[] {
@@ -450,6 +562,7 @@ export class Agent {
   private autoApprove: boolean;
   private compactAt: number;
   private apiTools: ToolDef[];
+  private brain: string | null = null; // repo map, built lazily on the first turn that needs it
   private promptTokens = 0;
   private completionTokens = 0;
   private lastAssistant = "";
@@ -633,15 +746,33 @@ export class Agent {
     this.pendingNote = null; // consume once — the routing hint applies to this turn only
     this.pendingMemory = null; // recall is per-turn + transient — never pushed to messages/session
     const note = [opts?.note ?? (this.planMode ? PLAN_NOTE : null), memory, suggest].filter(Boolean).join("\n\n") || null;
+    // Send only what this turn can actually use. Answering "hi" needs no repo map and no tools, so
+    // it costs the base prompt alone; the next message is assembled fresh and gets the full kit.
+    const smallTalk = isSmallTalk(this.messages);
+    const allowed = smallTalk ? new Set<string>() : allowedLazyTools(this.messages);
+    const lazyNames = new Set(tools.filter((t) => t.lazy).map((t) => t.name));
+    const apiTools = smallTalk
+      ? [] // no file edits, shell or search needed to say hello back
+      : this.apiTools.filter((t) => !("function" in t) || !lazyNames.has(t.function.name) || allowed.has(t.function.name));
+
+    const extras: string[] = [];
+    if (this.project && !smallTalk) {
+      this.brain ??= brainNote(); // built once per session, reused every request
+      if (this.brain) extras.push(this.brain);
+    }
+    if (note) extras.push(note);
+    const sendMessages: Msg[] = extras.length ? [...this.messages, { role: "system", content: extras.join("\n\n") }] : this.messages;
+
     let overflowRetried = false;
     for (;;) {
       const create = () =>
         this.client.chat.completions.create(
           {
             model: this.model,
-            messages: note ? [...this.messages, { role: "system", content: note }] : this.messages,
-            tools: this.apiTools,
-            tool_choice: opts?.allowTools === false ? "none" : "auto",
+            messages: sendMessages,
+            // Omit the field entirely when there's nothing to advertise — several providers reject
+            // an empty `tools` array outright.
+            ...(apiTools.length ? { tools: apiTools, tool_choice: opts?.allowTools === false ? ("none" as const) : ("auto" as const) } : {}),
             stream: true,
             stream_options: { include_usage: true },
             ...(this.reasoning ? { reasoning_effort: this.reasoning } : {}),
@@ -661,7 +792,7 @@ export class Agent {
           await this.autoCompact("context overflow");
           continue;
         }
-        throw e;
+        throw explainApiError(e);
       }
 
       let content = "";
@@ -686,17 +817,7 @@ export class Agent {
             }
             if (!bufferMode) say(md.push(delta.content));
           }
-          for (const tc of delta?.tool_calls ?? []) {
-            let entry = calls[tc.index];
-            if (!entry) {
-              entry = { id: "", name: "", args: "" };
-              calls[tc.index] = entry;
-            }
-            if (tc.id) entry.id = tc.id;
-            else if (!entry.id) entry.id = `call_${tc.index}`; // some backends omit streamed ids — consumers key events on callId
-            if (tc.function?.name) entry.name += tc.function.name;
-            if (tc.function?.arguments) entry.args += tc.function.arguments;
-          }
+          for (const tc of delta?.tool_calls ?? []) applyToolCallDelta(calls, tc);
         }
       } catch (e) {
         say(md.end());
@@ -704,7 +825,7 @@ export class Agent {
           interrupted();
           return null;
         }
-        throw e;
+        throw explainApiError(e);
       }
       if (!bufferMode) say(md.end());
 

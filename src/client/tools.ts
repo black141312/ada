@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { scrubbedEnv } from "./secret-env.ts";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { glob as fsGlob } from "node:fs/promises";
-import { dirname, extname, join, relative, resolve } from "node:path";
+import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import type * as PtyType from "node-pty";
 import { green, renderEditDiff } from "./render.ts";
 import * as checkpoint from "./checkpoint.ts";
@@ -14,8 +14,13 @@ import { isTrusted, loadSettings } from "./settings.ts";
 import { getDiagnostics } from "./lsp.ts";
 import { buildPptx, type PptxSlideSpec } from "./pptx.ts";
 import { buildDocx, type DocxBlock } from "./docx.ts";
+import { browserAction } from "./browser.ts";
+import { availableStacks, renderUiux, uiuxSearch } from "./uiux.ts";
 
-const MAX_OUTPUT = 30_000;
+// Every tool result is appended to the transcript and resent on each subsequent step, so an
+// oversized result is paid for again and again. 12k chars (~3k tokens) is ample for a file slice or
+// a listing; the model can re-read with offset/limit when it genuinely needs more.
+const MAX_OUTPUT = Number(process.env.ADA_MAX_TOOL_OUTPUT) || 12_000;
 
 export interface ToolResult {
   output: string; // text returned to the model
@@ -28,6 +33,10 @@ export interface Tool {
   description: string;
   parameters: Record<string, unknown>; // JSON Schema
   needsApproval: boolean;
+  /** Big schema, rarely wanted: advertised only when the conversation asks for it (see
+   *  wantsLazyTools in agent.ts). Every tool schema is resent on every request, so keeping the
+   *  document/image generators out of a "hi" saves ~1k tokens a call. */
+  lazy?: boolean;
   run(args: Record<string, unknown>): Promise<ToolResult>;
 }
 
@@ -218,7 +227,168 @@ export function isDestructive(command: string): boolean {
   return DESTRUCTIVE.test(command);
 }
 
+/** Anything the page would have to fetch from the network to render correctly. A page that needs a
+ *  CDN isn't a file you can send someone — it's a file that breaks offline, behind a proxy, or the
+ *  day the CDN moves. Images degrade (alt text shows); scripts and stylesheets do not, so those are
+ *  the ones worth refusing over. */
+function externalRefs(html: string): { fatal: string[]; soft: string[] } {
+  const fatal: string[] = [];
+  const soft: string[] = [];
+  const push = (list: string[], what: string): void => {
+    if (!list.includes(what) && list.length < 6) list.push(what);
+  };
+  for (const m of html.matchAll(/<script\b[^>]*\bsrc\s*=\s*["'](https?:)?\/\/([^"']+)/gi)) push(fatal, `<script src="${m[2]?.slice(0, 60)}">`);
+  for (const m of html.matchAll(/<link\b[^>]*\bhref\s*=\s*["'](https?:)?\/\/([^"']+)/gi)) push(fatal, `<link href="${m[2]?.slice(0, 60)}">`);
+  for (const m of html.matchAll(/@import\s+(?:url\()?["']?(https?:)?\/\/([^"')]+)/gi)) push(fatal, `@import ${m[2]?.slice(0, 60)}`);
+  for (const m of html.matchAll(/<img\b[^>]*\bsrc\s*=\s*["'](https?:)?\/\/([^"']+)/gi)) push(soft, `<img src="${m[2]?.slice(0, 60)}">`);
+  return { fatal, soft };
+}
+
+/** Does the JavaScript we just wrote actually parse? `node --check` answers in ~35ms without
+ *  executing anything, and it catches the class of mistake that is invisible until runtime: a
+ *  Grok-written storefront shipped with one missing `)` inside a nested template literal, which took
+ *  the whole front end down while the model reported success. Anything a bundler or a browser would
+ *  reject before running a single line is worth catching at write time.
+ *
+ *  Only .js/.mjs/.cjs — .ts/.tsx have lsp_diagnostics, and node can't parse them. Node 24 handles
+ *  ESM and top-level await in a plain .js, so those aren't false positives; JSX in a .js IS, so an
+ *  `Unexpected token '<'` is reported as a maybe rather than a failure. */
+function syntaxCheck(abs: string): { message: string; broken: boolean } {
+  if (process.env.ADA_NO_SYNTAX_CHECK) return { message: "", broken: false };
+  if (!/\.(js|mjs|cjs)$/i.test(abs)) return { message: "", broken: false };
+  let res;
+  try {
+    res = spawnSync(process.execPath, ["--check", abs], { encoding: "utf8", timeout: 10_000 });
+  } catch {
+    return { message: "", broken: false }; // never let the check itself break a write
+  }
+  if (res.status === 0) return { message: "", broken: false };
+  const err = `${res.stderr ?? ""}`;
+  const line = err.match(/^\s*(?:SyntaxError|.*Error): .*$/m)?.[0].trim() ?? "does not parse";
+  const at = err.match(/^(.*?):(\d+)$/m)?.[2];
+  // JSX and other non-standard dialects legitimately fail `node --check`
+  if (/Unexpected token '<'/.test(err)) {
+    return { message: `\n\nNote: node couldn't parse this — likely JSX, which is fine. If it isn't JSX, check it: ${line}`, broken: false };
+  }
+  return {
+    message: `\n\nWRITTEN, BUT IT DOES NOT PARSE${at ? ` (line ${at})` : ""}: ${line}\nFix it before moving on — a file that fails to parse never runs at all.`,
+    broken: true,
+  };
+}
+
+/** A note appended to write_file when a standalone page reaches for the network. `create_page`
+ *  refuses outright, but write_file is general-purpose — editing a file in an existing project that
+ *  already uses a CDN is legitimate — so this warns instead. Webfonts get called out specially:
+ *  they fail *silently*, falling back to a stack the design was never drawn against, so the page
+ *  looks fine to whoever made it and wrong to everyone offline. */
+function netWarning(abs: string, html: string): string {
+  if (!/\.html?$/i.test(abs)) return "";
+  const { fatal, soft } = externalRefs(html);
+  const fonts = fatal.filter((f) => /fonts\.(googleapis|gstatic)\.com|use\.typekit|fonts\.bunny/i.test(f));
+  const rest = fatal.filter((f) => !fonts.includes(f));
+  const bits: string[] = [];
+  if (fonts.length) bits.push(`${fonts.length} webfont link(s) — these fail silently offline and the design falls back to a stack it wasn't drawn for. Use a system font stack, or inline the face as a data: URI`);
+  if (rest.length) bits.push(`${rest.length} external script/stylesheet — inline it`);
+  if (soft.length) bits.push(`${soft.length} remote image — embed as a data: URI or the page renders blank offline`);
+  return bits.length ? `\n\nHeads up — this page won't stand alone: ${bits.join("; ")}.` : "";
+}
+
 export const tools: Tool[] = [
+  {
+    // A searchable corpus rather than more prose about good design: concrete styles with hex values,
+    // font pairings, WCAG-graded UX rules, motion presets and per-stack guidance.
+    name: "ui_ux_search",
+    lazy: true,
+    description:
+      "Look up concrete UI/UX design guidance: visual styles with real colour values, colour palettes, font pairings, UX and accessibility rules, motion presets, chart choices, and per-stack conventions. Use BEFORE writing UI, and again to review it. Domain is detected from the question; pass `domain` to force one, or `stack` for framework-specific rules.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "What you are designing or checking, in plain words, e.g. 'dashboard for a fintech saas'." },
+        domain: { type: "string", enum: ["style", "color", "chart", "landing", "product", "ux", "typography", "icons", "gsap", "react", "web", "google-fonts"], description: "Force a corpus instead of detecting one." },
+        stack: { type: "string", description: "Framework-specific rules, e.g. react, nextjs, flutter, swiftui, tailwind. Overrides domain." },
+        max_results: { type: "number", description: "Default 3." },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+    needsApproval: false,
+    async run(args) {
+      const query = String(args.query ?? "").trim();
+      if (!query) return { output: "ui_ux_search: say what you are designing.", isError: true };
+      try {
+        const r = uiuxSearch(query, {
+          domain: args.domain ? String(args.domain) : undefined,
+          stack: args.stack ? String(args.stack) : undefined,
+          maxResults: Math.min(Math.max(Number(args.max_results) || 3, 1), 10),
+        });
+        return { output: truncate(renderUiux(r)), isError: !!r.error };
+      } catch (e) {
+        return { output: `ui_ux_search: ${e instanceof Error ? e.message : String(e)}`, isError: true };
+      }
+    },
+  },
+  {
+    // Ada could always write HTML with write_file. What this adds is the contract: the page has to
+    // stand alone, it lands somewhere predictable, and the user gets a path plus an open window
+    // instead of a filename buried in prose.
+    name: "create_page",
+    lazy: true,
+    description:
+      "Write a self-contained HTML page (report, dashboard, comparison, one-pager) and open it in the browser. Everything must be inline — no CDN scripts, stylesheets or webfonts — so the file works offline and when sent to someone. Embed images as data: URIs. A bare filename lands in docs/. Load the `web-page` skill first for the design rules - or `web-deck` when it's a presentation, which must be slidable (arrow keys, one slide per screen), not one long scrolling page. When the user's wording doesn't pin the format - 'a presentation', 'a report', 'an overview' - ask_user first which they want: a .pptx (editable in PowerPoint, sends as a file) or an HTML page (opens in a browser, one file to share). Don't ask when they said deck/slides/pptx or page/one-pager.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Output file, ending in .html. A bare filename goes to docs/." },
+        html: { type: "string", description: "The complete document, starting with <!doctype html>." },
+        open: { type: "boolean", description: "Open it in the default browser (default true)." },
+      },
+      required: ["path", "html"],
+      additionalProperties: false,
+    },
+    needsApproval: true,
+    async run(args) {
+      const rel = String(args.path);
+      const html = String(args.html ?? "");
+      if (!/\.html?$/i.test(rel)) return { output: `create_page: path must end in .html (got ${rel})`, isError: true };
+      if (html.trim().length < 200) return { output: "create_page: that's not a page — write the real document, not a stub.", isError: true };
+
+      const { fatal, soft } = externalRefs(html);
+      if (fatal.length) {
+        return {
+          output:
+            `create_page: the page pulls ${fatal.length} resource(s) off the network, so it won't render offline or for anyone you send it to:\n` +
+            fatal.map((f) => `  - ${f}`).join("\n") +
+            "\nInline the CSS/JS, and use a system font stack instead of a webfont.",
+          isError: true,
+        };
+      }
+
+      // A bare filename belongs somewhere findable, not scattered in the repo root.
+      const abs = rel.includes("/") || rel.includes("\\") || isAbsolute(rel) ? resolve(process.cwd(), rel) : resolve(process.cwd(), "docs", rel);
+      if (isProtected(abs)) return { output: `Refused: ${rel} is a protected path.`, isError: true };
+      try {
+        mkdirSync(dirname(abs), { recursive: true });
+        checkpoint.record(abs);
+        writeFileSync(abs, html);
+      } catch (e) {
+        return { output: `create_page: ${e instanceof Error ? e.message : String(e)}`, isError: true };
+      }
+
+      let opened = "";
+      if (args.open !== false) {
+        const cmd = process.platform === "win32" ? ["cmd", ["/c", "start", "", abs]] : process.platform === "darwin" ? ["open", [abs]] : ["xdg-open", [abs]];
+        try {
+          spawnSync(cmd[0] as string, cmd[1] as string[], { timeout: 10_000, stdio: "ignore" });
+          opened = " and opened it in your browser";
+        } catch {
+          /* headless or no handler — the path below is still the answer */
+        }
+      }
+      const warn = soft.length ? `\nHeads up: ${soft.length} image(s) load from the network and will be blank offline — ${soft.join(", ")}` : "";
+      return { output: `Wrote ${(html.length / 1024).toFixed(1)} kB${opened}.\n\nOpen it here: ${abs}${warn}` };
+    },
+  },
   {
     name: "read_file",
     description: "Read a UTF-8 text file. Optional offset/limit (1-based line range) for large files.",
@@ -279,8 +449,10 @@ export const tools: Tool[] = [
           mkdirSync(dirname(abs), { recursive: true });
           writeFileSync(abs, content, "utf8");
           const formatted = formatFile(abs);
+          const sx = syntaxCheck(abs);
           return {
-            output: `Wrote ${content.length} bytes to ${String(args.path)}${formatted ? " (auto-formatted)" : ""}`,
+            output: `Wrote ${content.length} bytes to ${String(args.path)}${formatted ? " (auto-formatted)" : ""}${netWarning(abs, content)}${sx.message}`,
+            isError: sx.broken || undefined,
             display: green(`+ ${String(args.path)} (${content.length} bytes written)${formatted ? " · formatted" : ""}`),
           };
         } catch (e) {
@@ -353,8 +525,9 @@ export const tools: Tool[] = [
           return { output: String(e), isError: true };
         }
         const formatted = formatFile(abs);
+        const sx = syntaxCheck(abs);
         const label = list.length > 1 ? `${list.length} changes` : "1 change";
-        return { output: `Edited ${String(args.path)} (${label})${formatted ? " · auto-formatted" : ""}`, display: renderEditDiff(String(args.path), list[0]!.old, list[0]!.neu) };
+        return { output: `Edited ${String(args.path)} (${label})${formatted ? " · auto-formatted" : ""}${sx.message}`, isError: sx.broken || undefined, display: renderEditDiff(String(args.path), list[0]!.old, list[0]!.neu) };
       });
     },
   },
@@ -378,6 +551,151 @@ export const tools: Tool[] = [
       const res = spawnSync(command, { shell: true, encoding: "utf8", timeout: 120_000, maxBuffer: 10 * 1024 * 1024, cwd: process.cwd(), env: scrubbedEnv() });
       const out = [res.stdout, res.stderr].filter(Boolean).join("\n").trim() || "(no output)";
       return { output: `exit ${res.status ?? "null"}\n${spillIfHuge(out)}`, isError: res.status !== 0 };
+    },
+  },
+  {
+    // Lets the agent check its own UI work instead of asking the user "does it look right?".
+    // Lazy — most turns never touch a browser, and the schema shouldn't ride along for them.
+    name: "browser",
+    lazy: true,
+    description:
+      "Look at a page in a real browser: `open` navigates and reports the title + console, `screenshot` saves a png, `text` returns the rendered text, `console` returns logs and errors. Use after changing UI to verify it renders and the console is clean.",
+    parameters: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["open", "screenshot", "text", "console"] },
+        url: { type: "string", description: "Page to load first, e.g. http://localhost:5173. Omit to act on the page already open." },
+        path: { type: "string", description: "screenshot only: output file ending in .png." },
+        width: { type: "number", description: "Viewport width (default 1280)." },
+        height: { type: "number", description: "Viewport height (default 800)." },
+      },
+      required: ["action"],
+      additionalProperties: false,
+    },
+    needsApproval: true,
+    async run(args) {
+      const action = String(args.action) as "open" | "screenshot" | "text" | "console";
+      const url = args.url ? String(args.url) : undefined;
+      if (url && !/^https?:\/\//i.test(url)) return { output: `browser: url must start with http:// or https:// (got ${url})`, isError: true };
+      try {
+        const r = await browserAction(action, url, Number(args.width) || 1280, Number(args.height) || 800);
+        if (!r.screenshot) return { output: truncate(r.text) };
+        const rel = String(args.path ?? "screenshot.png");
+        const abs = resolve(process.cwd(), rel.toLowerCase().endsWith(".png") ? rel : `${rel}.png`);
+        if (isProtected(abs)) return { output: `Refused: ${rel} is a protected path.`, isError: true };
+        mkdirSync(dirname(abs), { recursive: true });
+        writeFileSync(abs, r.screenshot);
+        return { output: `Screenshot of ${r.text} → ${abs}` };
+      } catch (e) {
+        return { output: `browser: ${e instanceof Error ? e.message : String(e)}`, isError: true };
+      }
+    },
+  },
+  {
+    // A .ipynb is JSON whose `source` is an array of lines — models edit it badly as raw text
+    // (they reflow it into one string, or drop the trailing newlines, and Jupyter stops rendering).
+    // Lazy: only worth its schema in a conversation that's actually about notebooks.
+    name: "notebook_edit",
+    lazy: true,
+    description:
+      "Edit one cell of a Jupyter notebook (.ipynb) by index: replace its source, insert a new cell before it, or delete it. Editing a code cell clears its stale outputs. Read the notebook first with read_file to find the cell.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Path to the .ipynb file." },
+        cell: { type: "number", description: "0-based cell index. For insert, the new cell lands at this position." },
+        mode: { type: "string", enum: ["replace", "insert", "delete"], description: "Default replace." },
+        source: { type: "string", description: "New cell contents (required for replace/insert)." },
+        cell_type: { type: "string", enum: ["code", "markdown"], description: "insert only; default code." },
+      },
+      required: ["path", "cell"],
+      additionalProperties: false,
+    },
+    needsApproval: true,
+    async run(args) {
+      const rel = String(args.path);
+      const abs = resolve(process.cwd(), rel);
+      if (extname(abs).toLowerCase() !== ".ipynb") return { output: `notebook_edit: not a notebook: ${rel}`, isError: true };
+      if (isProtected(abs)) return { output: `Refused: ${rel} is a protected path.`, isError: true };
+      const mode = String(args.mode ?? "replace");
+      const idx = Number(args.cell);
+      let nb: { cells?: unknown[]; nbformat?: number };
+      try {
+        nb = JSON.parse(readFileSync(abs, "utf8")) as typeof nb;
+      } catch (e) {
+        return { output: `notebook_edit: ${abs} is not readable JSON — ${e instanceof Error ? e.message : String(e)}`, isError: true };
+      }
+      const cells = nb.cells;
+      if (!Array.isArray(cells)) return { output: `notebook_edit: ${rel} has no cells array — is it a notebook?`, isError: true };
+      const upper = mode === "insert" ? cells.length : cells.length - 1;
+      if (!Number.isInteger(idx) || idx < 0 || idx > upper) {
+        return { output: `notebook_edit: cell ${args.cell} is out of range (notebook has ${cells.length} cells).`, isError: true };
+      }
+      // nbformat stores source as a list of lines, each keeping its trailing newline except the last.
+      const lines = (s: string): string[] => s.split("\n").map((l, i, a) => (i === a.length - 1 ? l : `${l}\n`)).filter((l, i, a) => l !== "" || i < a.length - 1);
+
+      if (mode === "delete") {
+        cells.splice(idx, 1);
+      } else if (mode === "insert") {
+        if (args.source == null) return { output: "notebook_edit: insert needs `source`.", isError: true };
+        const type = String(args.cell_type ?? "code");
+        cells.splice(idx, 0, type === "markdown" ? { cell_type: "markdown", metadata: {}, source: lines(String(args.source)) } : { cell_type: "code", execution_count: null, metadata: {}, outputs: [], source: lines(String(args.source)) });
+      } else {
+        if (args.source == null) return { output: "notebook_edit: replace needs `source`.", isError: true };
+        const cell = cells[idx] as { cell_type?: string; source?: unknown; outputs?: unknown[]; execution_count?: number | null };
+        cell.source = lines(String(args.source));
+        if (cell.cell_type === "code") {
+          cell.outputs = []; // the old output described the old code
+          cell.execution_count = null;
+        }
+      }
+      checkpoint.record(abs); // so /undo covers notebook edits like any other write
+      writeFileSync(abs, `${JSON.stringify(nb, null, 1)}\n`); // indent 1 — what Jupyter itself writes
+      return { output: `${mode === "delete" ? "Deleted" : mode === "insert" ? "Inserted" : "Replaced"} cell ${idx} in ${rel} (${cells.length} cells now).` };
+    },
+  },
+  {
+    // Read-only on purpose: reading history is safe and constantly needed, while commit/push/reset
+    // rewrite the user's repo — those stay in `bash`, where they show up in the approval prompt as
+    // the actual command being run.
+    name: "git",
+    description:
+      "Inspect the repository: status, diff (staged with `staged`), log, show, blame, branch. Read-only — to commit, push, checkout or reset, use `bash` so the user sees the exact command.",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string", enum: ["status", "diff", "log", "show", "blame", "branch"] },
+        path: { type: "string", description: "Limit to a file or directory (blame requires it)." },
+        rev: { type: "string", description: "Commit, branch or range — e.g. HEAD~3, main..HEAD. `show` defaults to HEAD." },
+        staged: { type: "boolean", description: "diff only: show the staged changes instead of the working tree." },
+        limit: { type: "number", description: "log only: how many commits (default 20)." },
+      },
+      required: ["command"],
+      additionalProperties: false,
+    },
+    needsApproval: false,
+    async run(args) {
+      const cmd = String(args.command);
+      const path = args.path ? String(args.path) : "";
+      const rev = args.rev ? String(args.rev) : "";
+      // Everything goes through argv — never a shell string — so a path or rev can't inject.
+      const argv: Record<string, string[]> = {
+        status: ["status", "--short", "--branch"],
+        diff: ["diff", ...(args.staged ? ["--staged"] : []), ...(rev ? [rev] : [])],
+        log: ["log", `-n${Math.min(Math.max(Number(args.limit) || 20, 1), 200)}`, "--date=short", "--pretty=format:%h %ad %an — %s", ...(rev ? [rev] : [])],
+        show: ["show", "--stat", "--patch", rev || "HEAD"],
+        blame: ["blame", "--date=short", "-w", ...(rev ? [rev] : [])],
+        branch: ["branch", "--all", "-vv"],
+      };
+      const rest = argv[cmd];
+      if (!rest) return { output: `git: unknown command "${cmd}"`, isError: true };
+      if (cmd === "blame" && !path) return { output: "git blame needs a `path`.", isError: true };
+      if (path && cmd !== "branch" && cmd !== "status") rest.push("--", path);
+      else if (path && cmd === "status") rest.push("--", path);
+      const res = spawnSync("git", rest, { encoding: "utf8", timeout: 30_000, maxBuffer: 10 * 1024 * 1024, cwd: process.cwd(), env: scrubbedEnv() });
+      if (res.error) return { output: `git: ${res.error.message}`, isError: true };
+      const out = [res.stdout, res.stderr].filter(Boolean).join("\n").trim();
+      return { output: spillIfHuge(out || "(no output)"), isError: res.status !== 0 };
     },
   },
   {
@@ -712,7 +1030,9 @@ export const tools: Tool[] = [
             const content = String(f.content ?? "");
             writeFileSync(abs, content, "utf8");
             const fmt = formatFile(abs);
-            lines.push(`+ ${p} (${content.length} bytes${fmt ? ", formatted" : ""})`);
+            const sx = syntaxCheck(abs);
+            if (sx.broken) anyErr = true;
+            lines.push(`+ ${p} (${content.length} bytes${fmt ? ", formatted" : ""})${sx.message}`);
           } else if (action === "update") {
             if (!existsSync(abs)) {
               lines.push(`✗ ${p}: not found`);
@@ -744,7 +1064,9 @@ export const tools: Tool[] = [
             if (bom) out = String.fromCharCode(0xfeff) + out;
             writeFileSync(abs, out, "utf8");
             const fmt = formatFile(abs);
-            lines.push(`~ ${p} (${edits.length} edit${edits.length === 1 ? "" : "s"}${fmt ? ", formatted" : ""})`);
+            const sx = syntaxCheck(abs);
+            if (sx.broken) anyErr = true;
+            lines.push(`~ ${p} (${edits.length} edit${edits.length === 1 ? "" : "s"}${fmt ? ", formatted" : ""})${sx.message}`);
           } else {
             lines.push(`✗ ${p}: unknown action "${action}"`);
             anyErr = true;
@@ -759,47 +1081,44 @@ export const tools: Tool[] = [
   },
   {
     name: "generate_pptx",
+    lazy: true,
     description:
-      "Create a real, editable PowerPoint .pptx file from structured slide content — no Python, npm, or external tools needed. " +
-      "This tool RENDERS; it does not write copy — you must supply the finished content. Every content slide needs 3-6 substantive " +
-      "bullets carrying real specifics (facts, numbers, file/component names, decisions) — never bare titles or placeholders; a " +
-      "title-only deck is rejected. Bullets accept plain strings or {text, level} for nesting. A slide with a subtitle and no " +
-      "bullets is a centered title/section slide (use sparingly). `notes` adds speaker notes — include them. " +
-      "For VISUALS, prefer the built-ins — they need no files and stay editable: `chart` draws a horizontal bar chart from " +
-      "{label, value} data (comparisons, breakdowns, counts) and `metrics` renders up to 4 headline KPI tiles. Use `image` " +
-      "(local png/jpg/gif) for screenshots, architecture diagrams, or anything you generate with generate_image. " +
-      "A deck of pure text is weak — most decks want at least one chart or metrics row. Close with a summary/next-steps slide.",
+      "Render a real, editable .pptx. You supply finished content — 3-6 specific bullets per content slide (facts, numbers, names); " +
+      "title-only decks are rejected. Subtitle without bullets = section slide. Add `notes` (speaker notes). For visuals prefer " +
+      "`chart` (bar data) or `metrics` (up to 4 KPI tiles) — no file needed; use `image` for screenshots/diagrams (see generate_image). "+
+      "When the user's wording doesn't pin the format - 'a presentation', 'a report', 'an overview' - ask_user first which they want: a .pptx (editable in PowerPoint, sends as a file) or an HTML page (opens in a browser, one file to share). Don't ask when they said deck/slides/pptx or page/one-pager. " +
+      "End with a summary slide.",
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Output file path ending in .pptx. A bare filename goes into docs/ (preferred) — pass a path only to override." },
-        title: { type: "string", description: "Deck title for document properties." },
+        path: { type: "string", description: "Path ending in .pptx; a bare filename goes to docs/." },
+        title: { type: "string", description: "Deck title." },
         slides: {
           type: "array",
-          description: "One entry per slide, in order.",
+          description: "Slides, in order.",
           items: {
             type: "object",
             properties: {
               title: { type: "string" },
               subtitle: { type: "string" },
-              bullets: { type: "array", items: {}, description: 'Strings, or {"text": "...", "level": 1} for indented sub-bullets.' },
-              image: { type: "string", description: "Path to a local png/jpg/gif to embed." },
+              bullets: { type: "array", items: {}, description: 'Strings or {text, level} for sub-bullets.' },
+              image: { type: "string", description: "Local png/jpg/gif to embed." },
               chart: {
                 type: "object",
-                description: "Horizontal bar chart drawn as native, editable shapes — no image file needed. Use for comparisons, breakdowns, or anything countable.",
+                description: "Bar chart drawn as native shapes.",
                 properties: {
                   data: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "number" } }, required: ["label", "value"], additionalProperties: false } },
-                  unit: { type: "string", description: 'Suffix appended to each value, e.g. "%" or "ms".' },
+                  unit: { type: "string", description: 'Value suffix, e.g. "%".' },
                 },
                 required: ["data"],
                 additionalProperties: false,
               },
               metrics: {
                 type: "array",
-                description: "Up to 4 headline KPI tiles (big figure + caption) rendered across the slide.",
+                description: "Up to 4 KPI tiles (figure + caption).",
                 items: { type: "object", properties: { value: { type: "string" }, label: { type: "string" } }, required: ["value"], additionalProperties: false },
               },
-              notes: { type: "string", description: "Speaker notes for this slide." },
+              notes: { type: "string", description: "Speaker notes." },
             },
             additionalProperties: false,
           },
@@ -867,36 +1186,35 @@ export const tools: Tool[] = [
   },
   {
     name: "generate_docx",
+    lazy: true,
     description:
-      "Create a real, editable Word .docx from structured blocks — no Python, npm, or external tools needed. " +
-      "This tool RENDERS; you supply the finished prose. Blocks are typed: heading (level 1-3), paragraph, bullets " +
-      "(nestable via {text, level}), numbered, table ({headers, rows}), chart ({data:[{label,value}], unit}), metrics ({items:[{value,label}]}), image (local png/jpg/gif), pageBreak. " +
-      "Write real content, not an outline: a document of bare headings is rejected. Prefer tables for comparisons and " +
-      "structured data, and embed screenshots or diagrams with image. A bare filename lands in docs/.",
+      "Render a real, editable .docx. You supply finished prose. Block types: heading (1-3), paragraph, bullets (nestable), " +
+      "numbered, table, chart, metrics, image, pageBreak. Headings-only documents are rejected — write real content. " +
+      "Use tables for structured data, chart/metrics for visuals. A bare filename lands in docs/.",
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Output file path ending in .docx. A bare filename goes into docs/ (preferred)." },
-        title: { type: "string", description: "Document title, rendered at the top and set in document properties." },
-        subtitle: { type: "string", description: "Optional subtitle under the title." },
+        path: { type: "string", description: "Path ending in .docx; a bare filename goes to docs/." },
+        title: { type: "string", description: "Document title." },
+        subtitle: { type: "string", description: "Subtitle." },
         blocks: {
           type: "array",
-          description: "The document body, in order.",
+          description: "Blocks, in order.",
           items: {
             type: "object",
             properties: {
               type: { type: "string", enum: ["heading", "paragraph", "bullets", "numbered", "table", "chart", "metrics", "image", "pageBreak"] },
-              text: { type: "string", description: "For heading and paragraph." },
+              text: { type: "string", description: "heading/paragraph text." },
               level: { type: "number", description: "Heading level 1-3." },
               bold: { type: "boolean" },
               italic: { type: "boolean" },
-              items: { type: "array", items: {}, description: 'For bullets/numbered: strings, or {"text": "...", "level": 1} to nest.' },
-              headers: { type: "array", items: { type: "string" }, description: "For table: the header row." },
-              rows: { type: "array", items: { type: "array", items: { type: "string" } }, description: "For table: the body rows." },
-              data: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "number" } }, required: ["label", "value"], additionalProperties: false }, description: "For chart: the bars." },
-              unit: { type: "string", description: 'For chart: suffix on each value, e.g. "%".' },
-              path: { type: "string", description: "For image: path to a local png/jpg/gif." },
-              width: { type: "number", description: "For image: width in inches (default 6)." },
+              items: { type: "array", items: {}, description: "bullets/numbered items." },
+              headers: { type: "array", items: { type: "string" }, description: "table header row." },
+              rows: { type: "array", items: { type: "array", items: { type: "string" } }, description: "table body rows." },
+              data: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "number" } }, required: ["label", "value"], additionalProperties: false }, description: "chart bars." },
+              unit: { type: "string", description: 'chart value suffix.' },
+              path: { type: "string", description: "image file path." },
+              width: { type: "number", description: "image width in inches." },
             },
             required: ["type"],
             additionalProperties: false,
@@ -959,10 +1277,9 @@ export const tools: Tool[] = [
   },
   {
     name: "generate_image",
+    lazy: true,
     description:
-      "Generate an image from a text prompt (gpt-image-1) and save it as a PNG. Use for illustrations, concept art, cover art, and diagram-style visuals. Write a rich, specific prompt — subject, style, mood, lighting, composition. " +
-      "Pair it with generate_pptx/generate_docx: create the PNG first, then pass its path as a slide's `image` (or an image block) to illustrate a deck or document. " +
-      "Runs through the ada backend, so no local API key is needed.",
+      "Generate a PNG from a text prompt. Write a specific prompt (subject, style, composition). To illustrate a deck or document, create the PNG first, then pass its path as a slide `image` / image block.",
     parameters: {
       type: "object",
       properties: {

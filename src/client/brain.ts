@@ -6,12 +6,15 @@
 // ponytail: regex symbol extraction, not a real parser — good enough for a map; upgrade to tree-sitter
 // only if the map quality measurably matters.
 
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 
 const SKIP = new Set(["node_modules", ".git", "dist", ".ada", ".next", "build", "coverage", "out", "vendor", "target", ".venv", "__pycache__"]);
 const CODE_EXT = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|cs|c|h|cpp|hpp|swift|scala|svelte|vue)$/i;
-const MAX_CHARS = Number(process.env.ADA_BRAIN_MAX) || 12_000; // ~3k tokens
+// The map rides in the system prompt on EVERY request, so its size is a per-call tax. 6k chars
+// (~1.5k tokens) still names hundreds of files; the agent greps/searches for anything deeper.
+const MAX_CHARS = Number(process.env.ADA_BRAIN_MAX) || 6_000;
 const MAX_FILES = 4000; // walk cap — don't crawl a monorepo forever
 const MAX_FILE_BYTES = 300_000;
 
@@ -46,11 +49,12 @@ function symbolsOf(src: string): string[] {
 interface FileEntry {
   path: string;
   size: number;
-  mtime: number;
   symbols: string[];
 }
 
-/** Walk the tree collecting code files + their top-level symbols. Bounded by MAX_FILES. */
+/** Walk the tree collecting code files (path + size only — no file contents read). Bounded by
+ *  MAX_FILES. Reading every file to extract symbols is the expensive half, so it's deferred until
+ *  we know the cache actually missed. */
 function walk(root: string): FileEntry[] {
   const out: FileEntry[] = [];
   const stack = [root];
@@ -63,44 +67,48 @@ function walk(root: string): FileEntry[] {
       continue;
     }
     for (const e of entries) {
-      if (e.name.startsWith(".") && e.name !== ".ada") {
-        if (SKIP.has(e.name)) continue;
-      }
       if (SKIP.has(e.name)) continue;
       const full = join(dir, e.name);
       if (e.isDirectory()) {
         stack.push(full);
       } else if (CODE_EXT.test(e.name)) {
-        let st: import("node:fs").Stats;
+        let size: number;
         try {
-          st = statSync(full);
+          size = statSync(full).size;
         } catch {
           continue;
         }
-        if (st.size > MAX_FILE_BYTES) continue;
-        let symbols: string[] = [];
-        try {
-          symbols = symbolsOf(readFileSync(full, "utf8"));
-        } catch {
-          /* unreadable — list the path anyway */
-        }
-        out.push({ path: relative(root, full).replace(/\\/g, "/"), size: st.size, mtime: Math.round(st.mtime.getTime()), symbols });
+        if (size > MAX_FILE_BYTES) continue;
+        out.push({ path: relative(root, full).replace(/\\/g, "/"), size, symbols: [] });
       }
     }
   }
   return out;
 }
 
-/** A cheap fingerprint of the tree — count + newest mtime + total size. Changes when files are
- *  added, removed, or edited; stable otherwise so the map is only rebuilt when the folder does. */
-function fingerprint(files: FileEntry[]): string {
-  let newest = 0;
-  let total = 0;
+/** Fill in each file's top-level symbols. Only runs on a cache miss — this is the part that reads. */
+function addSymbols(root: string, files: FileEntry[]): FileEntry[] {
   for (const f of files) {
-    if (f.mtime > newest) newest = f.mtime;
-    total += f.size;
+    try {
+      f.symbols = symbolsOf(readFileSync(join(root, f.path), "utf8"));
+    } catch {
+      /* unreadable — the path alone still helps */
+    }
   }
-  return `${files.length}:${newest}:${total}`;
+  return files;
+}
+
+/** A fingerprint of the tree's CONTENT — every path and its size, hashed. Deliberately free of
+ *  mtimes: each new chat gets a fresh `git worktree add`, and checkout restamps every mtime, so an
+ *  mtime-based key missed on every chat and the worktrees kept overwriting each other's cache.
+ *  Two identical checkouts now share one cached map, and any add/remove/edit still changes the key. */
+function fingerprint(files: FileEntry[]): string {
+  const h = createHash("sha1");
+  h.update(`v2:${MAX_CHARS}\n`); // budget is part of the key — a smaller map must not reuse a bigger one
+  for (const f of [...files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))) {
+    h.update(`${f.path}:${f.size}\n`);
+  }
+  return h.digest("hex");
 }
 
 function render(files: FileEntry[]): string {
@@ -161,7 +169,7 @@ export function loadBrain(cwd: string = process.cwd()): string {
     /* stale/corrupt cache — rebuild */
   }
 
-  const map = render(files);
+  const map = render(addSymbols(cwd, files)); // cache missed — now pay to read the files
   try {
     mkdirSync(resolve(cacheRoot, ".ada"), { recursive: true });
     writeFileSync(cachePath, JSON.stringify({ fingerprint: fp, map } satisfies BrainCache));

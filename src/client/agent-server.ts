@@ -21,6 +21,36 @@ export function newId(prefix: string): string {
  * inside the Agent's onApprove callback (which is blocked on the returned promise); `settle()` is
  * called from the POST .../approve handler once the IDE's user has decided.
  */
+/** The same round-trip as ApprovalRegistry, but the answer is free text rather than a decision:
+ *  the agent asks, the frame goes out over SSE, the front-end posts the reply back by id. Without
+ *  this an editor session has no way to answer ask_user, so the agent is told there's nobody to ask
+ *  and proceeds on its own judgment. */
+export class QuestionRegistry {
+  private pending = new Map<string, (answer: string) => void>();
+
+  wait(): { id: string; promise: Promise<string> } {
+    const id = newId("q");
+    const promise = new Promise<string>((resolve) => this.pending.set(id, resolve));
+    return { id, promise };
+  }
+
+  settle(id: string, answer: string): boolean {
+    const resolve = this.pending.get(id);
+    if (!resolve) return false;
+    this.pending.delete(id);
+    resolve(answer);
+    return true;
+  }
+
+  /** An aborted turn must not stay parked on an unanswered question. */
+  abortAll(): number {
+    const n = this.pending.size;
+    for (const resolve of this.pending.values()) resolve("");
+    this.pending.clear();
+    return n;
+  }
+}
+
 export class ApprovalRegistry {
   private pending = new Map<string, (d: ApprovalDecision) => void>();
 
