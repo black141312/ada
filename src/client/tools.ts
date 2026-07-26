@@ -244,6 +244,38 @@ function externalRefs(html: string): { fatal: string[]; soft: string[] } {
   return { fatal, soft };
 }
 
+/** Does the JavaScript we just wrote actually parse? `node --check` answers in ~35ms without
+ *  executing anything, and it catches the class of mistake that is invisible until runtime: a
+ *  Grok-written storefront shipped with one missing `)` inside a nested template literal, which took
+ *  the whole front end down while the model reported success. Anything a bundler or a browser would
+ *  reject before running a single line is worth catching at write time.
+ *
+ *  Only .js/.mjs/.cjs — .ts/.tsx have lsp_diagnostics, and node can't parse them. Node 24 handles
+ *  ESM and top-level await in a plain .js, so those aren't false positives; JSX in a .js IS, so an
+ *  `Unexpected token '<'` is reported as a maybe rather than a failure. */
+function syntaxCheck(abs: string): { message: string; broken: boolean } {
+  if (process.env.ADA_NO_SYNTAX_CHECK) return { message: "", broken: false };
+  if (!/\.(js|mjs|cjs)$/i.test(abs)) return { message: "", broken: false };
+  let res;
+  try {
+    res = spawnSync(process.execPath, ["--check", abs], { encoding: "utf8", timeout: 10_000 });
+  } catch {
+    return { message: "", broken: false }; // never let the check itself break a write
+  }
+  if (res.status === 0) return { message: "", broken: false };
+  const err = `${res.stderr ?? ""}`;
+  const line = err.match(/^\s*(?:SyntaxError|.*Error): .*$/m)?.[0].trim() ?? "does not parse";
+  const at = err.match(/^(.*?):(\d+)$/m)?.[2];
+  // JSX and other non-standard dialects legitimately fail `node --check`
+  if (/Unexpected token '<'/.test(err)) {
+    return { message: `\n\nNote: node couldn't parse this — likely JSX, which is fine. If it isn't JSX, check it: ${line}`, broken: false };
+  }
+  return {
+    message: `\n\nWRITTEN, BUT IT DOES NOT PARSE${at ? ` (line ${at})` : ""}: ${line}\nFix it before moving on — a file that fails to parse never runs at all.`,
+    broken: true,
+  };
+}
+
 /** A note appended to write_file when a standalone page reaches for the network. `create_page`
  *  refuses outright, but write_file is general-purpose — editing a file in an existing project that
  *  already uses a CDN is legitimate — so this warns instead. Webfonts get called out specially:
@@ -417,8 +449,10 @@ export const tools: Tool[] = [
           mkdirSync(dirname(abs), { recursive: true });
           writeFileSync(abs, content, "utf8");
           const formatted = formatFile(abs);
+          const sx = syntaxCheck(abs);
           return {
-            output: `Wrote ${content.length} bytes to ${String(args.path)}${formatted ? " (auto-formatted)" : ""}${netWarning(abs, content)}`,
+            output: `Wrote ${content.length} bytes to ${String(args.path)}${formatted ? " (auto-formatted)" : ""}${netWarning(abs, content)}${sx.message}`,
+            isError: sx.broken || undefined,
             display: green(`+ ${String(args.path)} (${content.length} bytes written)${formatted ? " · formatted" : ""}`),
           };
         } catch (e) {
@@ -491,8 +525,9 @@ export const tools: Tool[] = [
           return { output: String(e), isError: true };
         }
         const formatted = formatFile(abs);
+        const sx = syntaxCheck(abs);
         const label = list.length > 1 ? `${list.length} changes` : "1 change";
-        return { output: `Edited ${String(args.path)} (${label})${formatted ? " · auto-formatted" : ""}`, display: renderEditDiff(String(args.path), list[0]!.old, list[0]!.neu) };
+        return { output: `Edited ${String(args.path)} (${label})${formatted ? " · auto-formatted" : ""}${sx.message}`, isError: sx.broken || undefined, display: renderEditDiff(String(args.path), list[0]!.old, list[0]!.neu) };
       });
     },
   },
@@ -995,7 +1030,9 @@ export const tools: Tool[] = [
             const content = String(f.content ?? "");
             writeFileSync(abs, content, "utf8");
             const fmt = formatFile(abs);
-            lines.push(`+ ${p} (${content.length} bytes${fmt ? ", formatted" : ""})`);
+            const sx = syntaxCheck(abs);
+            if (sx.broken) anyErr = true;
+            lines.push(`+ ${p} (${content.length} bytes${fmt ? ", formatted" : ""})${sx.message}`);
           } else if (action === "update") {
             if (!existsSync(abs)) {
               lines.push(`✗ ${p}: not found`);
@@ -1027,7 +1064,9 @@ export const tools: Tool[] = [
             if (bom) out = String.fromCharCode(0xfeff) + out;
             writeFileSync(abs, out, "utf8");
             const fmt = formatFile(abs);
-            lines.push(`~ ${p} (${edits.length} edit${edits.length === 1 ? "" : "s"}${fmt ? ", formatted" : ""})`);
+            const sx = syntaxCheck(abs);
+            if (sx.broken) anyErr = true;
+            lines.push(`~ ${p} (${edits.length} edit${edits.length === 1 ? "" : "s"}${fmt ? ", formatted" : ""})${sx.message}`);
           } else {
             lines.push(`✗ ${p}: unknown action "${action}"`);
             anyErr = true;
