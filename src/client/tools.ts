@@ -251,7 +251,7 @@ export const tools: Tool[] = [
     name: "create_page",
     lazy: true,
     description:
-      "Write a self-contained HTML page (report, dashboard, comparison, one-pager) and open it in the browser. Everything must be inline — no CDN scripts, stylesheets or webfonts — so the file works offline and when sent to someone. Embed images as data: URIs. A bare filename lands in docs/. Load the `web-page` skill first for the design rules. When the user's wording doesn't pin the format - 'a presentation', 'a report', 'an overview' - ask_user first which they want: a .pptx (editable in PowerPoint, sends as a file) or an HTML page (opens in a browser, one file to share). Don't ask when they said deck/slides/pptx or page/one-pager.",
+      "Write a self-contained HTML page (report, dashboard, comparison, one-pager) and open it in the browser. Everything must be inline — no CDN scripts, stylesheets or webfonts — so the file works offline and when sent to someone. Embed images as data: URIs. A bare filename lands in docs/. Load the `web-page` skill first for the design rules - or `web-deck` when it's a presentation, which must be slidable (arrow keys, one slide per screen), not one long scrolling page. When the user's wording doesn't pin the format - 'a presentation', 'a report', 'an overview' - ask_user first which they want: a .pptx (editable in PowerPoint, sends as a file) or an HTML page (opens in a browser, one file to share). Don't ask when they said deck/slides/pptx or page/one-pager.",
     parameters: {
       type: "object",
       properties: {
