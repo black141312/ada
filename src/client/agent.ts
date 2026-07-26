@@ -104,7 +104,7 @@ export const LAZY_GATES: { tools: string[]; intent: RegExp }[] = [
   {
     tools: ["create_page"],
     intent:
-      /\b(html page|web ?page|landing page|one-?pager|dashboard|report|write-?up|comparison|summary page|visuali[sz]ation|infographic|share(?:able)? page)\b/i,
+      /\b(html page|web ?page|landing page|one-?pager|dashboard|report|write-?up|presentation|comparison|summary page|visuali[sz]ation|infographic|share(?:able)? page)\b/i,
   },
   { tools: ["notebook_edit"], intent: /\b(notebooks?|jupyter|ipynb|colab|(?:code|markdown) cells?)\b/i },
   {

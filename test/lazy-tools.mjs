@@ -191,4 +191,25 @@ for (const t of ["fix the failing test", "refactor the auth module", "run the te
 }
 assert.equal(nbIntent.test("make a dashboard"), false, "a page request must not enable the notebook tool");
 
+// Format-ambiguous wording must unlock BOTH generators, or the agent cannot offer the choice it is
+// told to offer. Unambiguous wording must stay narrow so a "deck" request doesn't drag the page tool in.
+const pageIntent2 = gateFor("create_page").intent;
+for (const t of ["create a presentation for the project", "write it up as a report"]) {
+  assert.equal(docIntent.test(t) && pageIntent2.test(t), true, `ambiguous wording should offer both: "${t}"`);
+}
+for (const [t, deck, page] of [
+  ["make me a deck", true, false],
+  ["turn this into slides", true, false],
+  ["build an html page", false, true],
+  ["give me a one-pager", false, true],
+]) {
+  assert.equal(docIntent.test(t), deck, `deck gate wrong for "${t}"`);
+  assert.equal(pageIntent2.test(t), page, `page gate wrong for "${t}"`);
+}
+// and both tools must actually carry the instruction to ask
+for (const n of ["generate_pptx", "create_page"]) {
+  const d = tools.find((x) => x.name === n).description;
+  assert.match(d, /ask_user first which they want/, `${n} should tell the agent to ask when the format is ambiguous`);
+}
+
 console.log("ok");

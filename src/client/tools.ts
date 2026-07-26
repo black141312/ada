@@ -251,7 +251,7 @@ export const tools: Tool[] = [
     name: "create_page",
     lazy: true,
     description:
-      "Write a self-contained HTML page (report, dashboard, comparison, one-pager) and open it in the browser. Everything must be inline — no CDN scripts, stylesheets or webfonts — so the file works offline and when sent to someone. Embed images as data: URIs. A bare filename lands in docs/. Load the `web-page` skill first for the design rules.",
+      "Write a self-contained HTML page (report, dashboard, comparison, one-pager) and open it in the browser. Everything must be inline — no CDN scripts, stylesheets or webfonts — so the file works offline and when sent to someone. Embed images as data: URIs. A bare filename lands in docs/. Load the `web-page` skill first for the design rules. When the user's wording doesn't pin the format - 'a presentation', 'a report', 'an overview' - ask_user first which they want: a .pptx (editable in PowerPoint, sends as a file) or an HTML page (opens in a browser, one file to share). Don't ask when they said deck/slides/pptx or page/one-pager.",
     parameters: {
       type: "object",
       properties: {
@@ -994,7 +994,8 @@ export const tools: Tool[] = [
     description:
       "Render a real, editable .pptx. You supply finished content — 3-6 specific bullets per content slide (facts, numbers, names); " +
       "title-only decks are rejected. Subtitle without bullets = section slide. Add `notes` (speaker notes). For visuals prefer " +
-      "`chart` (bar data) or `metrics` (up to 4 KPI tiles) — no file needed; use `image` for screenshots/diagrams (see generate_image). " +
+      "`chart` (bar data) or `metrics` (up to 4 KPI tiles) — no file needed; use `image` for screenshots/diagrams (see generate_image). "+
+      "When the user's wording doesn't pin the format - 'a presentation', 'a report', 'an overview' - ask_user first which they want: a .pptx (editable in PowerPoint, sends as a file) or an HTML page (opens in a browser, one file to share). Don't ask when they said deck/slides/pptx or page/one-pager. " +
       "End with a summary slide.",
     parameters: {
       type: "object",
