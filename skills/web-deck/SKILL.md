@@ -166,11 +166,25 @@ go((parseInt(location.hash.slice(1), 10) || 1) - 1);
 5. A number that matters gets a slide to itself, set large.
 6. 8-14 slides for a project overview. More than ~20 means the deck is really a document.
 
+## The four that get forgotten
+
+Rewriting the scaffold in your own idiom is fine. These four are the ones that get quietly dropped
+when you do, so write them deliberately rather than checking for them afterwards:
+
+1. **`aria-hidden="true"` on every inactive slide.** Without it a screen reader reads all twelve
+   slides as one wall of text. Setting it in `go()` costs one line.
+2. **Deep links.** `location.hash = i + 1` when moving, and a `hashchange` listener. This is what
+   makes `#7` shareable and browser Back behave.
+3. **Clamp, don't wrap.** `Math.max(0, Math.min(last, n))` - a deck that loops from the last slide
+   to the first is disorienting mid-talk.
+4. **The `@media print` rule.** Without it every slide stacks onto page one and "print to PDF" is
+   useless.
+
 ## Rules
 
-- Every slide must fit its screen at 1280x720 without scrolling. If it doesn't, cut - don't shrink
-  the type.
-- Keep the mechanics above intact: clamping, `aria-hidden`, the print rule. They're the difference
-  between a deck and a page that happens to have big text.
+- Every slide must fit 1280x720 without scrolling. Overflow doesn't track word count - a short slide
+  with a big heading overflows where a long bulleted one doesn't - so judge it by the layout you
+  chose, and when in doubt split the slide rather than shrinking the type.
 - Still self-contained: no CDN, no webfonts (see the **web-page** skill).
-- After writing it, open it and press through every slide before saying it's done.
+- Opening it and pressing through every slide is the only way to be sure it renders. Worth doing
+  when the deck matters or the user asks; it costs an extra round-trip, so it isn't automatic.
