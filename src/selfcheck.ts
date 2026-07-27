@@ -716,6 +716,23 @@ async function main(): Promise<void> {
   assert.ok(!isAllowed("carol"), "off-allowlist user rejected");
   delete process.env.ADA_ALLOWED_USERS;
 
+  // --- db-backed allowlist (sqlite fallback here; postgres takes the same SQL shape) ---
+  {
+    process.env.ADA_AUTH_DB = join(tmpdir(), `ada-allow-${Date.now()}.db`);
+    const { addAllowed, isAllowedUser, listAllowed, removeAllowed } = await import("./server/allowlist.ts");
+    assert.ok(await isAllowedUser("anyone"), "empty env + empty table -> open");
+    await addAllowed("vikash@example.com", "selfcheck");
+    assert.ok(await isAllowedUser("vikash@example.com"), "db row admits");
+    assert.ok(!(await isAllowedUser("mallory@example.com")), "non-empty table -> gate active");
+    process.env.ADA_ALLOWED_USERS = "founder";
+    assert.ok(await isAllowedUser("founder"), "env and db union");
+    assert.ok(await isAllowedUser("vikash@example.com"), "db entry survives env being set");
+    delete process.env.ADA_ALLOWED_USERS;
+    assert.equal((await listAllowed()).length, 1, "one row listed");
+    assert.ok(await removeAllowed("vikash@example.com"), "remove reports true");
+    assert.ok(await isAllowedUser("anyone"), "empty again -> open");
+  }
+
   // --- popular-model picker: newest per family, deduped, valid ids only ---
   {
     const live = [
