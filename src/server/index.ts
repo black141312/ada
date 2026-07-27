@@ -7,7 +7,8 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ProviderName } from "../shared/types.ts";
 import { PORT, PROVIDERS, clientKeys, configuredProviders, isConfigured, providerKey, providerStatus } from "./config.ts";
 import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, createSeat, disableSeat, disableSeatByExternalId, enterpriseMode, extractLastUsage, identifySeat, listSeats, loadPolicy, modelAllowed, savePolicy, upsertSeatForSSO, usageSummary, validatePolicy } from "./enterprise.ts";
-import { allowedUsers, isAllowed, verifyIdentity } from "./identity.ts";
+import { allowedUsers, verifyIdentity } from "./identity.ts";
+import { addAllowed, isAllowedUser, listAllowed, removeAllowed } from "./allowlist.ts";
 import { auth, betterAuthEnabled, verifyBetterAuth } from "./auth.ts";
 import { toNodeHandler } from "better-auth/node";
 
@@ -81,7 +82,7 @@ async function identify(req: IncomingMessage): Promise<Identity | "corrupt" | nu
     // authenticate at /v1/auth/oidc/exchange and then carry a seat key, not an id_token, per request.)
     if (!oidcEnabled()) {
       const id = await verifyIdentity(token); // GitHub / Google login
-      if (id && isAllowed(id.user)) return { user: id.user, role: "dev" };
+      if (id && (await isAllowedUser(id.user))) return { user: id.user, role: "dev" };
     }
     // Better Auth session token (accounts served at /api/auth/*) — attributed to the real user.
     // GATED on betterAuthEnabled(): the /api/auth/* signup route is always mounted (pre-auth) with
@@ -90,7 +91,7 @@ async function identify(req: IncomingMessage): Promise<Identity | "corrupt" | nu
     // Accounts are a valid credential only when Better Auth is the intended gate. Allowlist applies too.
     if (betterAuthEnabled()) {
       const acct = await verifyBetterAuth(token);
-      if (acct && isAllowed(acct)) return { user: acct, role: "dev" };
+      if (acct && (await isAllowedUser(acct))) return { user: acct, role: "dev" };
     }
   }
   return locked() ? null : { user: "dev", role: "dev" }; // dev mode: open
@@ -458,6 +459,32 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
         savePolicy(v.policy);
         return json(res, 200, { ok: true });
       }
+    }
+    if (url.pathname === "/v1/allowed-users" || url.pathname.startsWith("/v1/allowed-users/")) {
+      // Managed by the env-seeded founders (or an enterprise admin). The env list is the
+      // key to this door on purpose: a bad DB write can never lock the founders out.
+      const admin = who.role === "admin" || (allowedUsers()?.includes(who.user) ?? false);
+      if (!admin) return json(res, 403, { error: { message: "admins only — users in env ADA_ALLOWED_USERS" } });
+      if (req.method === "GET" && url.pathname === "/v1/allowed-users") {
+        return json(res, 200, { env: allowedUsers() ?? [], db: await listAllowed() });
+      }
+      if (req.method === "POST" && url.pathname === "/v1/allowed-users") {
+        let user = "";
+        try {
+          user = String((JSON.parse(await readBody(req)) as { user?: string }).user ?? "").trim();
+        } catch {
+          /* falls through to the check below */
+        }
+        if (!user) return json(res, 400, { error: { message: "missing 'user' (an email or GitHub login)" } });
+        await addAllowed(user, who.user);
+        return json(res, 200, { ok: true, user });
+      }
+      if (req.method === "DELETE" && url.pathname.startsWith("/v1/allowed-users/")) {
+        const user = decodeURIComponent(url.pathname.slice("/v1/allowed-users/".length)).trim();
+        if (!user) return json(res, 400, { error: { message: "missing user in path" } });
+        return json(res, 200, { ok: true, removed: await removeAllowed(user) });
+      }
+      return json(res, 405, { error: { message: "GET, POST or DELETE" } });
     }
     if (url.pathname === "/v1/users") {
       if (who.role !== "admin") return json(res, 403, { error: { message: "admin only" } });

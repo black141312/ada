@@ -8,7 +8,9 @@ import { Pool } from "pg";
 
 // Storage: a hosted Postgres (Supabase) when DATABASE_URL is set — makes the backend STATELESS, so it
 // runs on any serverless/container host without a persistent disk. Falls back to local SQLite for dev.
-const authDatabase = process.env.DATABASE_URL
+// Exported so the allowlist can live in the same store (Postgres in prod, SQLite in dev).
+export const usingPostgres = !!process.env.DATABASE_URL;
+export const authDatabase = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
   : new Database(process.env.ADA_AUTH_DB ?? "ada-auth.db");
 
