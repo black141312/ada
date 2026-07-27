@@ -271,6 +271,12 @@ clone per task), emitting an official-format `predictions.jsonl` that the offici
 harness scores. `node bench/swebench.mjs --dataset … --model … --out runs/x`. See
 **[bench/README.md](bench/README.md)** for the full flow (dataset, prereqs, scoring command).
 
+**Measured against Claude Code** — same machine, same model (Opus 4.7), same prompts, matched
+git worktrees at the same commit, five tasks in this repository: **444k tokens against 893k,
+$3.05 against $4.68**, cheaper on four of five tasks. The full write-up — screenshots, per-task
+tables, a six-build storefront case study, method and known limits (including the task it lost) —
+is **[docs/product-report-v0.1.23.pdf](docs/product-report-v0.1.23.pdf)**.
+
 ## Contributing
 
 Issues and PRs welcome — it's a small, no-build codebase. Run `npm run typecheck && npm run selfcheck`
