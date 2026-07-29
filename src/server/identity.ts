@@ -47,11 +47,18 @@ export async function verifyIdentity(token: string): Promise<Identity | null> {
 }
 
 /** Allowed login users (GitHub logins / Google emails), or null = any authenticated user. */
-export function allowedUsers(): string[] | null {
-  const v = process.env.ADA_ALLOWED_USERS;
+/** Admin accounts, from env. This is NOT a gate on using the service — plans decide that. It exists
+ *  so the people who can change plans and read the control plane are identified outside the
+ *  database: a bad write to `user_plans` must never be able to lock the operator out of the server
+ *  that would let them fix it. ADA_ALLOWED_USERS is still read as the old name for the same list. */
+export function adminUsers(): string[] | null {
+  const v = process.env.ADA_ADMIN_USERS ?? process.env.ADA_ALLOWED_USERS;
   if (!v) return null;
   return v.split(",").map((s) => s.trim()).filter(Boolean);
 }
+
+/** @deprecated Old name — membership is no longer a gate. Kept so callers still resolve. */
+export const allowedUsers = adminUsers;
 
 export function isAllowed(user: string): boolean {
   const a = allowedUsers();

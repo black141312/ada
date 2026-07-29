@@ -7,8 +7,13 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ProviderName } from "../shared/types.ts";
 import { PORT, PROVIDERS, clientKeys, configuredProviders, isConfigured, providerKey, providerStatus } from "./config.ts";
 import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, createSeat, disableSeat, disableSeatByExternalId, enterpriseMode, extractLastUsage, identifySeat, listSeats, loadPolicy, modelAllowed, savePolicy, upsertSeatForSSO, usageSummary, validatePolicy } from "./enterprise.ts";
-import { allowedUsers, verifyIdentity } from "./identity.ts";
+import { adminUsers, verifyIdentity } from "./identity.ts";
 import { addAllowed, isAllowedUser, listAllowed, removeAllowed } from "./allowlist.ts";
+import { recordUsage, usageSince } from "./usage.ts";
+import { billingWebhookImplemented, checkEntitlement, PLANS, planFor, periodStart, setPlan, type PlanName } from "./plans.ts";
+
+/** The anonymous free-tier pseudo-identity — no account, so nothing to meter or bill. */
+const isAnonymous = (who: Identity): boolean => who.user === "anon" && String(who.role) === "free";
 import { auth, betterAuthEnabled, verifyBetterAuth } from "./auth.ts";
 import { toNodeHandler } from "better-auth/node";
 
@@ -49,7 +54,10 @@ function readBody(req: IncomingMessage): Promise<string> {
 function locked(): boolean {
   // OIDC must lock the backend the instant ADA_OIDC_ISSUER is set — BEFORE any seat exists — else a
   // fresh SSO deployment with zero seats would fall through identify() to dev-open.
-  return enterpriseMode() || clientKeys() !== null || allowedUsers() !== null || oidcEnabled() || betterAuthEnabled() || !!process.env.ADA_REQUIRE_LOGIN;
+  // adminUsers() still locks: setting it means the operator intends a gated server, and it kept that
+  // meaning under its old name (ADA_ALLOWED_USERS). Dropping it here would silently open a backend
+  // on upgrade for anyone who only ever set that one variable.
+  return enterpriseMode() || clientKeys() !== null || adminUsers() !== null || oidcEnabled() || betterAuthEnabled() || !!process.env.ADA_REQUIRE_LOGIN;
 }
 
 /** Resolve a request to WHO is making it. Order: seat key / ADA_ADMIN_KEY (enterprise), legacy
@@ -82,7 +90,10 @@ async function identify(req: IncomingMessage): Promise<Identity | "corrupt" | nu
     // authenticate at /v1/auth/oidc/exchange and then carry a seat key, not an id_token, per request.)
     if (!oidcEnabled()) {
       const id = await verifyIdentity(token); // GitHub / Google login
-      if (id && (await isAllowedUser(id.user))) return { user: id.user, role: "dev" };
+      // No allow-list here any more. Membership was the wrong gate for a product anyone can sign up
+      // for — everyone authenticated gets in, and plans.ts decides what they're entitled to. A new
+      // account lands on `free`, which permits `:free` models only and costs nothing upstream.
+      if (id) return { user: id.user, role: "dev" };
     }
     // Better Auth session token (accounts served at /api/auth/*) — attributed to the real user.
     // GATED on betterAuthEnabled(): the /api/auth/* signup route is always mounted (pre-auth) with
@@ -91,7 +102,7 @@ async function identify(req: IncomingMessage): Promise<Identity | "corrupt" | nu
     // Accounts are a valid credential only when Better Auth is the intended gate. Allowlist applies too.
     if (betterAuthEnabled()) {
       const acct = await verifyBetterAuth(token);
-      if (acct && (await isAllowedUser(acct))) return { user: acct, role: "dev" };
+      if (acct) return { user: acct, role: "dev" };
     }
   }
   return locked() ? null : { user: "dev", role: "dev" }; // dev mode: open
@@ -150,6 +161,18 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
     return json(res, 403, { error: { message: `model '${model}' is not allowed by org policy (allowed: ${policy.models!.join(", ")})` } });
   }
 
+  // Plan quota. Skipped for the anonymous free tier (already restricted to `:free` above, and there
+  // is no account to meter against) and for enterprise seats, which are governed by org policy and
+  // billed by contract rather than by plan.
+  if (!isAnonymous(who) && !enterpriseMode()) {
+    const ent = await checkEntitlement(who.user, model);
+    if (!ent.ok) {
+      appendAudit({ ts: Date.now(), user: who.user, event: ent.status === 402 ? "quota_exceeded" : "plan_denied_model", detail: model });
+      // The body carries plan/used/limit so a client can render "you're out" without a second call.
+      return json(res, ent.status!, { error: { message: ent.message, type: ent.status === 402 ? "insufficient_quota" : "plan_restricted" }, plan: ent.plan, used: ent.used, limit: ent.limit });
+    }
+  }
+
   // When an allowlist is active, IGNORE the client's `provider` hint — else a seat holder could
   // send an allowlisted model id with a different provider and leak the body to it before the
   // upstream rejects the id. Route by the model id only.
@@ -181,7 +204,13 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
     res.end = ((c?: never, ...a: never[]) => {
       scan(c);
       const u = extractLastUsage(tail);
-      if (u) appendUsage({ ts: Date.now(), user: who.user, model, provider, promptTokens: u.promptTokens, completionTokens: u.completionTokens });
+      if (u) {
+        // Same row to both sinks: the file is the self-hosted record, the table is the one that
+        // survives a container restart and can therefore be billed against.
+        const row = { ts: Date.now(), user: who.user, model, provider, promptTokens: u.promptTokens, completionTokens: u.completionTokens };
+        appendUsage(row);
+        void recordUsage(row); // fire-and-forget: this is response teardown, nothing can await here
+      }
       return end(c, ...a);
     }) as typeof res.end;
   }
@@ -244,7 +273,11 @@ async function handleEmbeddings(req: IncomingMessage, res: ServerResponse, who: 
   });
   const text = await upstream.text();
   const u = extractLastUsage(text); // embedding responses report prompt_tokens
-  if (u) appendUsage({ ts: Date.now(), user: who.user, model, provider, promptTokens: u.promptTokens, completionTokens: 0 });
+  if (u) {
+    const row = { ts: Date.now(), user: who.user, model, provider, promptTokens: u.promptTokens, completionTokens: 0 };
+    appendUsage(row);
+    void recordUsage(row);
+  }
   res.writeHead(upstream.status, { "content-type": "application/json" });
   res.end(text);
 }
@@ -303,7 +336,11 @@ async function handleImages(req: IncomingMessage, res: ServerResponse, who: Iden
     body: JSON.stringify({ ...body, model }),
   });
   const text = await upstream.text();
-  if (upstream.ok) appendUsage({ ts: Date.now(), user: who.user, model, provider: "openai", promptTokens: 0, completionTokens: 0 });
+  if (upstream.ok) {
+    const row = { ts: Date.now(), user: who.user, model, provider: "openai" as const, promptTokens: 0, completionTokens: 0 };
+    appendUsage(row);
+    void recordUsage(row);
+  }
   res.writeHead(upstream.status, { "content-type": "application/json" });
   res.end(text);
 }
@@ -409,6 +446,49 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     if (req.method === "GET" && url.pathname === "/v1/whoami") {
       return json(res, 200, { ok: true, user: who.user, role: who.role });
     }
+    // What am I on, and how much is left? Self-serve: a client shouldn't have to hit a 402 to learn
+    // it's near the limit. Anonymous callers get the free plan's shape with no usage attached.
+    if (req.method === "GET" && url.pathname === "/v1/plan") {
+      if (isAnonymous(who)) return json(res, 200, { plan: "free", status: "active", used: 0, limit: PLANS.free.monthlyTokens, models: PLANS.free.models });
+      const up = await planFor(who.user);
+      const since = periodStart(up);
+      const used = await usageSince(who.user, since).then((u) => u.promptTokens + u.completionTokens).catch(() => 0);
+      const def = PLANS[up.status === "active" ? up.plan : "free"];
+      return json(res, 200, {
+        plan: up.plan,
+        status: up.status,
+        models: def.models,
+        used,
+        limit: def.monthlyTokens,
+        remaining: Math.max(0, def.monthlyTokens - used),
+        periodStart: since,
+      });
+    }
+    // Payment provider callback. Closed until the signature check exists — see the note on
+    // billingWebhookImplemented(). Answering 501 (rather than 404) documents that the route is the
+    // intended one, so a provider misconfigured against it fails loudly instead of silently.
+    if (url.pathname === "/v1/billing/webhook") {
+      if (!billingWebhookImplemented()) {
+        return json(res, 501, { error: { message: "billing webhook not implemented — set plans via POST /v1/plans until a payment provider is wired" } });
+      }
+    }
+    // Admin: set a plan. Payment webhooks will call setPlan() directly; until then this is how a
+    // subscription becomes real. Admin identity comes from env, never from the table it edits.
+    if (req.method === "POST" && url.pathname === "/v1/plans") {
+      const admin = who.role === "admin" || (adminUsers()?.includes(who.user) ?? false);
+      if (!admin) return json(res, 403, { error: { message: "admin only" } });
+      let b: { user?: string; plan?: string; status?: string };
+      try {
+        b = JSON.parse(await readBody(req));
+      } catch {
+        return json(res, 400, { error: { message: "invalid JSON body" } });
+      }
+      if (!b.user || !b.plan) return json(res, 400, { error: { message: "need { user, plan }" } });
+      if (!(b.plan in PLANS)) return json(res, 400, { error: { message: `unknown plan '${b.plan}' (${Object.keys(PLANS).join(", ")})` } });
+      await setPlan(b.user, b.plan as PlanName, (b.status as "active" | "past_due" | "canceled") ?? "active");
+      appendAudit({ ts: Date.now(), user: who.user, event: "plan_set", detail: `${b.user} -> ${b.plan}` });
+      return json(res, 200, { ok: true, user: b.user, plan: b.plan });
+    }
     if (req.method === "GET" && url.pathname === "/v1/models") {
       return await handleModels(res, isAnon);
     }
@@ -463,10 +543,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     if (url.pathname === "/v1/allowed-users" || url.pathname.startsWith("/v1/allowed-users/")) {
       // Managed by the env-seeded founders (or an enterprise admin). The env list is the
       // key to this door on purpose: a bad DB write can never lock the founders out.
-      const admin = who.role === "admin" || (allowedUsers()?.includes(who.user) ?? false);
+      const admin = who.role === "admin" || (adminUsers()?.includes(who.user) ?? false);
       if (!admin) return json(res, 403, { error: { message: "admins only — users in env ADA_ALLOWED_USERS" } });
       if (req.method === "GET" && url.pathname === "/v1/allowed-users") {
-        return json(res, 200, { env: allowedUsers() ?? [], db: await listAllowed() });
+        return json(res, 200, { env: adminUsers() ?? [], db: await listAllowed() });
       }
       if (req.method === "POST" && url.pathname === "/v1/allowed-users") {
         let user = "";
@@ -578,7 +658,7 @@ export function startAdaServer(port: number = PORT): Server {
       : oidcEnabled()
         ? `OIDC SSO (0 seats — awaiting first login)`
         : locked()
-          ? `auth ON (client keys + GitHub/Google login${allowedUsers() ? `, allowlist: ${allowedUsers()!.length}` : ""})`
+          ? `auth ON (client keys + GitHub/Google login${adminUsers() ? `, admins: ${adminUsers()!.length}` : ""})`
           : "AUTH DISABLED (dev) — set ADA_CLIENT_KEYS or ADA_ADMIN_KEY to lock down";
     const provs = configuredProviders();
     console.log(`ada backend → http://localhost:${port}  [${auth}]`);
