@@ -11,6 +11,7 @@ import { adminUsers, verifyIdentity } from "./identity.ts";
 import { addAllowed, isAllowedUser, listAllowed, removeAllowed } from "./allowlist.ts";
 import { recordUsage, usageSince } from "./usage.ts";
 import { billingWebhookImplemented, checkEntitlement, PLANS, planFor, periodStart, setPlan, type PlanName } from "./plans.ts";
+import { checkoutUrl, createCheckout, getCheckout } from "./billing.ts";
 
 /** The anonymous free-tier pseudo-identity — no account, so nothing to meter or bill. */
 const isAnonymous = (who: Identity): boolean => who.user === "anon" && String(who.role) === "free";
@@ -425,6 +426,24 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     if (req.method === "POST" && url.pathname === "/v1/auth/oidc/exchange") return await handleOidcExchange(req, res);
     // Better Auth: accounts, sessions, social login, API keys, device flow.
     if (url.pathname.startsWith("/api/auth")) return betterAuthHandler(req, res);
+    // Read a checkout session. PRE-AUTH deliberately: the website that renders it is static and has
+    // no credential. Safe because the id is 256 bits of randomness and reading it reveals only the
+    // plan being bought — it grants no API access and can't be replayed once spent.
+    if (req.method === "GET" && url.pathname.startsWith("/v1/billing/checkout/")) {
+      const s = await getCheckout(decodeURIComponent(url.pathname.slice("/v1/billing/checkout/".length)));
+      if (!s) return json(res, 404, { error: { message: "unknown or invalid checkout session" } });
+      const def = PLANS[s.plan];
+      // The user id is NOT returned. The page doesn't need it, and not sending it means a leaked
+      // link can't be used to enumerate accounts.
+      return json(res, 200, {
+        plan: s.plan,
+        label: def.label,
+        models: def.models,
+        monthlyTokens: def.monthlyTokens,
+        status: s.status,
+        expiresAt: s.expiresAt,
+      });
+    }
     // Payment provider callback — PRE-AUTH by necessity. A webhook carries no bearer token; it
     // authenticates by signing the body, so behind identify() it would 401 forever and the provider
     // would only ever show delivery failures. Closed until that signature check exists (see the note
@@ -473,6 +492,24 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
         remaining: Math.max(0, def.monthlyTokens - used),
         periodStart: since,
       });
+    }
+    // Start a checkout. Authenticated: this is where the identity comes from, and it is the ONLY
+    // place it does — everything downstream carries the session id, never a credential.
+    if (req.method === "POST" && url.pathname === "/v1/billing/checkout") {
+      if (isAnonymous(who)) return json(res, 401, { error: { message: "sign in to upgrade" } });
+      let b: { plan?: string };
+      try {
+        b = JSON.parse(await readBody(req));
+      } catch {
+        return json(res, 400, { error: { message: "invalid JSON body" } });
+      }
+      const plan = String(b.plan ?? "");
+      if (!(plan in PLANS) || plan === "free") {
+        return json(res, 400, { error: { message: `pick a paid plan (${Object.keys(PLANS).filter((p) => p !== "free").join(", ")})` } });
+      }
+      const s = await createCheckout(who.user, plan as PlanName);
+      appendAudit({ ts: Date.now(), user: who.user, event: "checkout_started", detail: plan });
+      return json(res, 200, { url: checkoutUrl(s.id), expiresAt: s.expiresAt, plan });
     }
     // Admin: set a plan. Payment webhooks will call setPlan() directly; until then this is how a
     // subscription becomes real. Admin identity comes from env, never from the table it edits.
