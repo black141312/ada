@@ -90,6 +90,21 @@ function convert(messages: OAIMessage[]): { system?: string; messages: Block[] }
   return { system: system.length ? system.join("\n\n") : undefined, messages: out };
 }
 
+/** Mark the end of the transcript cacheable, so each turn cache-*reads* every prior turn instead of
+ *  re-paying full input price for it. Anthropic matches the longest cached prefix, so one moving
+ *  breakpoint on the final block is enough — the growing history stays a hit. Caching system+tools
+ *  alone (the previous behaviour) left the messages array, which is most of an agentic turn's input,
+ *  uncached. Cheap no-ops on a one-shot call; the win scales with tool-loop depth. */
+export function markLastBlockCacheable(messages: Block[], cacheControl: Record<string, string>): void {
+  const last = messages[messages.length - 1];
+  if (!last) return;
+  // Normalize string content to block form — cache_control lives on a block, not on the message.
+  if (typeof last.content === "string") last.content = [{ type: "text", text: last.content }];
+  const blocks = last.content as Block[] | undefined;
+  if (!Array.isArray(blocks) || !blocks.length) return;
+  blocks[blocks.length - 1]!.cache_control = cacheControl;
+}
+
 function mapStop(reason: string | null | undefined): string {
   switch (reason) {
     case "tool_use":
@@ -116,6 +131,10 @@ export const anthropicAdapter: Adapter = {
     let toolIndex = -1;
     let inTokens = 0; // Anthropic reports input on message_start, cumulative output on message_delta
     let outTokens = 0;
+    // Cached input is billed separately (reads ~0.1x, writes ~1.25x) and is NOT included in
+    // input_tokens — counting only input_tokens both hides the cache and misprices the turn.
+    let cacheRead = 0;
+    let cacheWrite = 0;
 
     try {
       const client = await getClient();
@@ -135,6 +154,7 @@ export const anthropicAdapter: Adapter = {
       if (ttl1h) cacheControl.ttl = "1h";
       if (tools.length) (tools[tools.length - 1] as Record<string, unknown>).cache_control = cacheControl;
       const systemParam = system ? [{ type: "text", text: system, cache_control: cacheControl }] : undefined;
+      markLastBlockCacheable(messages, cacheControl);
 
       const params = {
         model,
@@ -151,7 +171,10 @@ export const anthropicAdapter: Adapter = {
 
       for await (const event of stream) {
         if (event.type === "message_start") {
-          inTokens = (event.message as { usage?: { input_tokens?: number } }).usage?.input_tokens ?? 0;
+          const u = (event.message as { usage?: { input_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } }).usage;
+          inTokens = u?.input_tokens ?? 0;
+          cacheRead = u?.cache_read_input_tokens ?? 0;
+          cacheWrite = u?.cache_creation_input_tokens ?? 0;
         } else if (event.type === "content_block_start") {
           const cb = event.content_block as { type: string; id?: string; name?: string };
           if (cb.type === "tool_use") {
@@ -173,7 +196,23 @@ export const anthropicAdapter: Adapter = {
       chunk({}, stop);
       // Emit an OpenAI-shaped usage chunk so the backend's metering (and the client's own token
       // counters) work for Claude too — Anthropic doesn't send one in this wire format.
-      writeChunk(res, { id, object: "chat.completion.chunk", created, model, choices: [], usage: { prompt_tokens: inTokens, completion_tokens: outTokens, total_tokens: inTokens + outTokens } });
+      // prompt_tokens is the TRUE context size (fresh + cached), so the client's context meter and
+      // compaction threshold are right; the split rides along in prompt_tokens_details so cost can
+      // discount cache reads instead of billing them at full input price.
+      const promptTokens = inTokens + cacheRead + cacheWrite;
+      writeChunk(res, {
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [],
+        usage: {
+          prompt_tokens: promptTokens,
+          completion_tokens: outTokens,
+          total_tokens: promptTokens + outTokens,
+          prompt_tokens_details: { cached_tokens: cacheRead, cache_creation_tokens: cacheWrite },
+        },
+      });
       endStream(res);
     } catch (err) {
       chunk({ content: `\n[backend: anthropic error: ${err instanceof Error ? err.message : String(err)}]` }, "stop");

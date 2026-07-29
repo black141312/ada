@@ -1491,6 +1491,16 @@ async function main(): Promise<void> {
       console.error("No model available. Pass --model <id> or set ADA_MODEL.");
       process.exit(1);
     }
+    // Headless runs got none of this: no skills (so routeConfident could never fire and use_skill
+    // wasn't callable), no memory, and no spawn_agent — which is why headless runs showed zero
+    // delegation. It read as "the model chose not to", but the tool was never registered.
+    // Must precede `new Agent`: the Agent snapshots the tool registry at construction.
+    registerSkillTool(loadSkills(trusted));
+    registerMemoryTools(trusted);
+    // ADA_NO_SUBAGENTS is set for isolated workers — a worker must not fan out again.
+    if (process.env.ADA_NO_SUBAGENTS !== "1") {
+      registerSubagentTools({ client, model: pm, onApprove: async (): Promise<ApprovalDecision> => "yes", autoApprove: true, project: trusted, compactAt: settings.compactAt });
+    }
     const agent = new Agent({
       client,
       model: pm,
