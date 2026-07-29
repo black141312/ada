@@ -43,8 +43,16 @@ export function markCacheable(body: Record<string, unknown>): Record<string, unk
   const msgs = body.messages;
   if (!Array.isArray(msgs) || !msgs.length) return body;
 
-  let i = msgs.length - 1;
-  while (i >= 0 && (msgs[i] as Msg)?.role !== "user" && (msgs[i] as Msg)?.role !== "assistant") i--;
+  // Second-to-last user/assistant turn, not the last. The final turn may be per-turn guidance that
+  // differs every request; anchoring the breakpoint there would mint a fresh cache entry each time
+  // and never read one. One turn behind is always content both requests share, so the cache holds.
+  // The excluded turn joins the cached prefix on the next request — normal incremental caching.
+  const turns: number[] = [];
+  for (let j = msgs.length - 1; j >= 0 && turns.length < 2; j--) {
+    const role = (msgs[j] as Msg)?.role;
+    if (role === "user" || role === "assistant") turns.push(j);
+  }
+  const i = turns.length >= 2 ? turns[1]! : (turns[0] ?? -1);
   if (i < 0) return body;
 
   const m = msgs[i] as Msg;
