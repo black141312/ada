@@ -6,6 +6,26 @@ All notable changes to ada are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.14.1] — 2026-07-29
+
+### Fixed — caching now works *within* a session, not just across identical requests
+0.14.0 gave Claude prompt caching, but only repeated identical requests hit; turns inside a session
+still missed. Anthropic folds every system message into one parameter that sits ahead of the whole
+transcript, and the repo map (stable all session) shared that message with the per-turn hints
+(memory recall, skill routing, plan mode) — so one changed byte of guidance rewrote the prefix and
+invalidated everything behind it. The cache could not hit twice in a session by construction.
+
+They're now sent separately: the repo map stays in `system` where it's byte-identical every turn,
+and per-turn hints move to a trailing user message — after the cache breakpoint, so they cost their
+own tokens and nothing else's. The breakpoint also moves one turn back, to the second-to-last
+user/assistant message, since the newest turn can be transient; anchoring there would mint a fresh
+cache entry every request and never read one.
+
+| one session, three files read | tokens | cache | cost |
+|---|---|---|---|
+| before | 13,212 | none | $0.0786 |
+| after | 15,550 | **32% hit** | **$0.0715** |
+
 ## [0.14.0] — 2026-07-29
 
 ### Fixed — headless runs were missing half the agent
