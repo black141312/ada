@@ -425,6 +425,16 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     if (req.method === "POST" && url.pathname === "/v1/auth/oidc/exchange") return await handleOidcExchange(req, res);
     // Better Auth: accounts, sessions, social login, API keys, device flow.
     if (url.pathname.startsWith("/api/auth")) return betterAuthHandler(req, res);
+    // Payment provider callback — PRE-AUTH by necessity. A webhook carries no bearer token; it
+    // authenticates by signing the body, so behind identify() it would 401 forever and the provider
+    // would only ever show delivery failures. Closed until that signature check exists (see the note
+    // on billingWebhookImplemented). 501 rather than 404 so a misconfigured provider fails loudly
+    // instead of looking like a typo'd URL.
+    if (url.pathname === "/v1/billing/webhook") {
+      if (!billingWebhookImplemented()) {
+        return json(res, 501, { error: { message: "billing webhook not implemented — set plans via POST /v1/plans until a payment provider is wired" } });
+      }
+    }
     // Device-flow approval page (the verification_uri the CLI prints).
     if (req.method === "GET" && url.pathname === "/device") {
       res.writeHead(200, { "content-type": "text/html" });
@@ -463,14 +473,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
         remaining: Math.max(0, def.monthlyTokens - used),
         periodStart: since,
       });
-    }
-    // Payment provider callback. Closed until the signature check exists — see the note on
-    // billingWebhookImplemented(). Answering 501 (rather than 404) documents that the route is the
-    // intended one, so a provider misconfigured against it fails loudly instead of silently.
-    if (url.pathname === "/v1/billing/webhook") {
-      if (!billingWebhookImplemented()) {
-        return json(res, 501, { error: { message: "billing webhook not implemented — set plans via POST /v1/plans until a payment provider is wired" } });
-      }
     }
     // Admin: set a plan. Payment webhooks will call setPlan() directly; until then this is how a
     // subscription becomes real. Admin identity comes from env, never from the table it edits.
