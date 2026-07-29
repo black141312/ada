@@ -46,6 +46,8 @@ export async function runIsolatedWorker(opts: {
   prompt: string;
   model: string;
   binPath: string;
+  /** Prompt-token ceiling for this worker; 0 to leave it uncapped. */
+  budget?: number;
   claim: (paths: string[]) => { taken: string[]; collided: string[] };
   signal?: AbortSignal;
 }): Promise<WorkerRun | null> {
@@ -63,7 +65,7 @@ export async function runIsolatedWorker(opts: {
   }
 
   try {
-    const out = await run(opts.binPath, ["-p", opts.prompt, "--json", "--model", opts.model], dir, opts.signal);
+    const out = await run(opts.binPath, ["-p", opts.prompt, "--json", "--model", opts.model], dir, opts.signal, opts.budget);
     const line = out.split("\n").filter((l) => l.trim().startsWith("{")).pop();
     const parsed = line ? (JSON.parse(line) as { text?: string; usage?: string }) : {};
 
@@ -96,14 +98,16 @@ export async function runIsolatedWorker(opts: {
   }
 }
 
-function run(bin: string, args: string[], cwd: string, signal?: AbortSignal): Promise<string> {
+function run(bin: string, args: string[], cwd: string, signal?: AbortSignal, budget?: number): Promise<string> {
   return new Promise((res, rej) => {
     const child = spawn(process.execPath, [bin, ...args], {
       cwd,
       // ADA_TRUST_CWD: the worktree isn't in trustedDirs, and without it the worker loses the repo
       // map — the thing that stopped it groping around to orient itself.
       // ADA_NO_SUBAGENTS: a worker must not fan out again; nesting swarms is unbounded spend.
-      env: { ...process.env, ADA_TRUST_CWD: "1", ADA_NO_SUBAGENTS: "1" },
+      // ADA_TOKEN_BUDGET: the leash. The child enforces it itself, since only it can see its own
+      // token count — the parent learns the total only after the child has already spent it.
+      env: { ...process.env, ADA_TRUST_CWD: "1", ADA_NO_SUBAGENTS: "1", ...(budget ? { ADA_TOKEN_BUDGET: String(budget) } : {}) },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let out = "";
