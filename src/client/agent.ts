@@ -286,38 +286,14 @@ export function subagentModel(parentModel: string): string {
   return process.env.ADA_SUBAGENT_MODEL || loadSettings(isTrusted(process.cwd())).subagentModel || parentModel;
 }
 
-/** What a delegated run is for. The split is deliberate and asymmetric:
- *
- *  - `research` — exploring, reading, summarising, and planning. Cheap model. A weak answer here is
- *    visible to the parent, which can re-ask; the blast radius is one wasted subtask.
- *  - `build` — writing code. Stays on the model the user picked. Nobody proofreads generated code
- *    before it lands, so a weak model's mistakes survive until something breaks at runtime.
- *
- *  This is the opposite of the usual "frontier plans, cheap executes" advice. That advice optimises
- *  for token cost, and it's right about where the tokens are — but the tokens are in exploration,
- *  not in the code itself. Portfolio task, measured: 25,586 input tokens against 8,749 output. */
-export type SpawnRole = "research" | "build";
+/** Token ceiling for a delegated worker. A worker that understood its brief finishes well inside
+ *  this; one that didn't will read the repo until something stops it — measured 174k input tokens
+ *  on a single subtask. Harmless when workers are cheap, but `build` workers run on the user's
+ *  model, where that mistake costs real money. Parents are never capped; this is a worker leash. */
+const WORKER_TOKEN_BUDGET = Number(process.env.ADA_WORKER_BUDGET) || 50_000;
 
 const PLAN_NOTE =
   "PLAN MODE: do not write, edit, or run commands. Investigate with read-only tools if needed, then present a concise numbered plan and stop. The user will approve before you execute.";
-
-// Delegation only pays when the planner hands down explicit instructions — a cheap worker follows
-// literally, it doesn't infer. Bare one-line subtasks produced the two failures we measured: workers
-// exploring the repo to work out what was meant (~174k input tokens for one subtask), and each
-// deciding the shape independently ("create a portfolio website" came back as a deployment guide, a
-// projects JSON, and an unrelated samples/ dir). So the planner decides FIRST and assigns files.
-const DECOMPOSE_NOTE = [
-  "Plan this as the lead engineer. You will NOT implement any of it — workers will, and they are cheaper models that follow instructions literally, cannot see each other's work, and cannot ask you questions.",
-  "Make every design decision yourself now. Anything you leave unsaid will be decided differently by each worker.",
-  "Split the work so each worker owns files no other worker touches.",
-  "",
-  "Output exactly this shape and nothing else:",
-  "DESIGN: the decisions every worker must follow — stack, file layout, naming, shared interfaces, styling approach. A few lines.",
-  "TASK <files it owns>: one complete instruction — what to build, what it must contain, what to leave alone. Assume the worker has no context beyond DESIGN and this line.",
-  "TASK <files it owns>: ...",
-  "",
-  "2-5 TASK lines. Every file named in DESIGN must be owned by exactly one TASK.",
-].join("\n");
 
 // ---- orchestration: pluggable agent architectures over a shared Engine ----
 // The Engine holds the harness primitives (streaming, tool-call recovery, compaction, approval,
@@ -326,9 +302,7 @@ const DECOMPOSE_NOTE = [
 
 /** The harness primitives a strategy composes. */
 export interface Engine {
-  step(opts?: { allowTools?: boolean; note?: string; model?: string }): Promise<StepResult | null>; // null = aborted
-  /** The cheap model, for steps that think rather than write — pass it to step({ model }). */
-  researchModel: string;
+  step(opts?: { allowTools?: boolean; note?: string }): Promise<StepResult | null>; // null = aborted
   runTools(calls: ToolCall[]): Promise<void>;
   say(s: string): void;
   interrupted(): void;
@@ -339,10 +313,8 @@ export interface Engine {
   addUser(text: string): void;
   aborted(): boolean;
   drainSteer(): boolean;
-  /** Delegate a subtask. `research` (the default) goes to the cheap sub-agent model — looking things
-   *  up, reading, summarising, where a wrong answer is caught by the parent. `build` writes code and
-   *  stays on the user's selected model: bad code isn't caught by anyone until it runs. */
-  spawn(prompt: string, role?: SpawnRole): Promise<string>;
+  /** Delegate a self-contained subtask to a fresh sub-agent on the cheap model. */
+  spawn(prompt: string): Promise<string>;
   soleIntegration(): string | null;
   readDocs(name: string): Promise<string>;
   writeSkills(drafts: { name: string; content: string }[]): Promise<number>;
@@ -419,45 +391,6 @@ const splitLines = (s: string): string[] =>
     .map((l) => l.replace(/^[-*\d.)\s]+/, "").trim())
     .filter((l) => l.length > 1);
 
-const multiAgent: Orchestrator = {
-  name: "multi", // decompose → fan out to subagents → synthesize
-  async run(e) {
-    // Planning runs on the cheap model: it reads and decides, it doesn't write code.
-    const plan = await e.step({ allowTools: false, note: DECOMPOSE_NOTE, model: e.researchModel });
-    if (!plan) return;
-    const lines = plan.content.split("\n");
-    const isTask = (l: string) => /^\s*(?:[-*\d.)\s]*)TASK\b/i.test(l);
-    // Everything that isn't a TASK line is the shared design — the one thing every worker sees, so
-    // they can't each invent their own answer to the same question.
-    const design = lines
-      .filter((l) => !isTask(l))
-      .join("\n")
-      .replace(/^\s*DESIGN:\s*/im, "")
-      .trim();
-    const tasks = lines
-      .filter(isTask)
-      .map((l) => l.replace(/^\s*(?:[-*\d.)\s]*)TASK\s*/i, "").trim())
-      .filter((t) => t.length > 8);
-    // A planner that ignored the format still has to produce something — fall back to the old
-    // line-per-subtask read rather than silently doing nothing.
-    const finalTasks = tasks.length ? tasks : splitLines(plan.content).filter((t) => t.length > 8);
-    if (!finalTasks.length) {
-      e.say("\n");
-      return;
-    }
-    e.say(`\n\x1b[2m• delegating ${finalTasks.length} subtasks${design ? " (shared design)" : ""}\x1b[0m\n`);
-    const brief = (t: string) =>
-      design
-        ? `Shared design — follow it exactly, do not deviate or re-decide any of it:\n${design}\n\nYour assignment. You own ONLY the files named here; do not create or edit anything else, and do not duplicate another worker's work:\n${t}`
-        : t;
-    // Workers write code, so they run on the user's model, not the cheap one.
-    const results = await Promise.all(finalTasks.map((t) => e.spawn(brief(t), "build")));
-    e.addUser(`Subagent results:\n\n${results.map((r, i) => `### ${finalTasks[i]}\n${r}`).join("\n\n")}\n\nSynthesize the final answer for the user.`);
-    await e.step({ allowTools: false });
-    e.say("\n");
-  },
-};
-
 const toolsmith: Orchestrator = {
   name: "toolsmith", // read the lone integration's docs → subagents author skills for it
   async run(e) {
@@ -497,7 +430,12 @@ const toolsmith: Orchestrator = {
   },
 };
 
-const ORCHESTRATORS: Record<string, Orchestrator> = { react: reAct, single: singleShot, plan: planExecute, multi: multiAgent, toolsmith };
+// `multi` (decompose → fan out → synthesize) was removed. It never reduced cost: measured against
+// react on the same task it used 29x the input tokens, and only looked cheaper when the workers ran
+// on a model cheap enough to absorb the extra work. Put the workers on the user's model and it cost
+// 2x react for worse output — splitting one cohesive artifact along file lines leaves nobody
+// holding the whole design. Delegation survives as spawn_agent, for genuinely separable subtasks.
+const ORCHESTRATORS: Record<string, Orchestrator> = { react: reAct, single: singleShot, plan: planExecute, toolsmith };
 
 /** A short, transient hint naming the most relevant skills for a request (or null if none stand out). */
 function suggestSkillNote(query: string): string | null {
@@ -648,6 +586,7 @@ export class Agent {
   private onApprove: OnApprove;
   private autoApprove: boolean;
   private compactAt: number;
+  private tokenBudget: number; // 0 = uncapped
   private apiTools: ToolDef[];
   private brain: string | null = null; // repo map, built lazily on the first turn that needs it
   private promptTokens = 0;
@@ -680,6 +619,8 @@ export class Agent {
     project?: boolean;
     compactAt?: number;
     history?: Msg[];
+    /** Stop after this many prompt tokens. 0/undefined = no limit (the default for a real user). */
+    tokenBudget?: number;
   }) {
     this.client = opts.client;
     this.model = opts.model;
@@ -688,6 +629,7 @@ export class Agent {
     this.onApprove = opts.onApprove;
     this.autoApprove = !!opts.autoApprove;
     this.compactAt = opts.compactAt || COMPACT_AT;
+    this.tokenBudget = opts.tokenBudget ?? (Number(process.env.ADA_TOKEN_BUDGET) || 0);
     this.apiTools = buildApiTools(); // snapshot the registry (incl. extension/skill/MCP tools) at construction
     this.project = opts.project ?? true;
     this.messages = [{ role: "system", content: systemPrompt(this.project) }, ...(opts.history ?? [])];
@@ -820,7 +762,6 @@ export class Agent {
     const signal = ctrl?.signal;
     return {
       step: (opts) => this.modelTurn(ctrl, say, interrupted, opts),
-      researchModel: subagentModel(this.model),
       runTools: (calls) => this.execTools(calls, ctrl, say),
       say,
       interrupted,
@@ -831,7 +772,7 @@ export class Agent {
       },
       aborted: () => !!signal?.aborted,
       drainSteer,
-      spawn: (prompt, role) => this.spawnSub(prompt, role),
+      spawn: (prompt) => this.spawnSub(prompt),
       soleIntegration,
       readDocs: async (name) => readIntegrationDocs(name),
       writeSkills: async (drafts) => writeProjectSkills(drafts),
@@ -860,8 +801,8 @@ export class Agent {
    *  against the process-global cwd, so parallel in-process workers would all write into the parent's
    *  tree (observed: four stray files and a README edit from one swarm run). Falls back to in-process
    *  when the cwd isn't a git repo, so a subtask never fails purely for lack of isolation. */
-  private async spawnSub(prompt: string, role: SpawnRole = "research"): Promise<string> {
-    const model = role === "build" ? this.model : subagentModel(this.model);
+  private async spawnSub(prompt: string): Promise<string> {
+    const model = subagentModel(this.model);
     if (process.env.ADA_NO_SUBAGENTS !== "1") {
       try {
         const run = await runIsolatedWorker({
@@ -869,6 +810,7 @@ export class Agent {
           prompt,
           model,
           binPath: fileURLToPath(new URL("../../bin/ada.mjs", import.meta.url)),
+          budget: WORKER_TOKEN_BUDGET,
           claim: (paths) => this.claimPaths(paths),
         });
         if (run) {
@@ -889,7 +831,7 @@ export class Agent {
     // other way: blind workers spent ~174k input tokens groping around the repo to orient. The map
     // is ~1.5k and it replaces that search. Cheap models are exactly the ones that can't infer
     // layout from nothing — and they're now cheap enough that context is the affordable half.
-    const sub = new Agent({ client: this.client, model, session: Session.create(), onApprove: this.onApprove, autoApprove: true, project: this.project });
+    const sub = new Agent({ client: this.client, model, session: Session.create(), onApprove: this.onApprove, autoApprove: true, project: this.project, tokenBudget: WORKER_TOKEN_BUDGET });
     try {
       return await sub.send(prompt, { quiet: true, delegated: true });
     } finally {
@@ -903,11 +845,22 @@ export class Agent {
 
   /** One model turn: stream, collect content + tool calls (recovering leaked ones), push the
    *  assistant message. Returns null if interrupted. Retries once on context overflow. */
-  private async modelTurn(ctrl: SendCtrl | undefined, say: (s: string) => void, interrupted: () => void, opts?: { allowTools?: boolean; note?: string; model?: string }): Promise<StepResult | null> {
+  private async modelTurn(ctrl: SendCtrl | undefined, say: (s: string) => void, interrupted: () => void, opts?: { allowTools?: boolean; note?: string }): Promise<StepResult | null> {
     const signal = ctrl?.signal;
     if (signal?.aborted) {
       interrupted();
       return null;
+    }
+    // Checked BEFORE the request, not after: the next call is the one that would overshoot, and on
+    // a large transcript a single turn can be tens of thousands of tokens. Returning no tool calls
+    // ends the orchestrator's loop cleanly, so the caller still gets whatever was accomplished.
+    if (this.tokenBudget && this.promptTokens >= this.tokenBudget) {
+      const msg = `[stopped: token budget reached — ${this.promptTokens} of ${this.tokenBudget} prompt tokens used. The work so far stands; the brief was probably too vague to finish inside the budget.]`;
+      say(`\n\x1b[2m${msg}\x1b[0m\n`);
+      // Becomes the return value of send(), so a parent sees why the subtask stopped short instead
+      // of an empty string it would read as "done, nothing to report".
+      this.lastAssistant = this.lastAssistant ? `${this.lastAssistant}\n\n${msg}` : msg;
+      return { content: msg, toolCalls: [] };
     }
     const suggest = this.pendingNote;
     const memory = this.pendingMemory;
@@ -944,7 +897,7 @@ export class Agent {
             // A step can override the model: planning/decomposition runs on the cheap one while the
             // conversation itself stays on the user's pick. Same transcript either way — the wire
             // format is identical, so the messages array doesn't care which model reads it.
-            model: opts?.model ?? this.model,
+            model: this.model,
             messages: sendMessages,
             // Omit the field entirely when there's nothing to advertise — several providers reject
             // an empty `tools` array outright.
@@ -984,15 +937,18 @@ export class Agent {
             this.promptTokens += chunk.usage.prompt_tokens ?? 0;
             this.completionTokens += chunk.usage.completion_tokens ?? 0;
             this.lastPromptTokens = chunk.usage.prompt_tokens ?? this.lastPromptTokens;
-            const d = chunk.usage.prompt_tokens_details as { cached_tokens?: number; cache_creation_tokens?: number } | undefined;
+            // Two spellings in the wild: the native Anthropic adapter emits `cache_creation_tokens`,
+            // OpenRouter reports `cache_write_tokens`. Reading only one silently prices cache writes
+            // as fresh input.
+            const d = chunk.usage.prompt_tokens_details as { cached_tokens?: number; cache_creation_tokens?: number; cache_write_tokens?: number } | undefined;
             this.cachedTokens += d?.cached_tokens ?? 0;
-            this.cacheWriteTokens += d?.cache_creation_tokens ?? 0;
-            const key = opts?.model ?? this.model;
+            this.cacheWriteTokens += d?.cache_creation_tokens ?? d?.cache_write_tokens ?? 0;
+            const key = this.model;
             const b = this.byModel.get(key) ?? { prompt: 0, completion: 0, cached: 0, cacheWrite: 0 };
             b.prompt += chunk.usage.prompt_tokens ?? 0;
             b.completion += chunk.usage.completion_tokens ?? 0;
             b.cached += d?.cached_tokens ?? 0;
-            b.cacheWrite += d?.cache_creation_tokens ?? 0;
+            b.cacheWrite += d?.cache_creation_tokens ?? d?.cache_write_tokens ?? 0;
             this.byModel.set(key, b);
           }
           const delta = chunk.choices[0]?.delta;

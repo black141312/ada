@@ -47,4 +47,44 @@ assert.deepEqual(many[2].content[1].cache_control, cc, "breakpoint missing on th
 assert.doesNotThrow(() => markLastBlockCacheable([], cc));
 assert.doesNotThrow(() => markLastBlockCacheable([{ role: "user", content: [] }], cc));
 
+// --- markCacheable: the OpenAI-compatible path (OpenRouter etc.) -----------
+const { markCacheable } = await import(pathToFileURL(resolve("src/server/providers/openai-compat.ts")).href);
+const cached = (m) => JSON.stringify(m).includes("cache_control");
+
+// Non-Claude models must come back BYTE-IDENTICAL. They cache automatically or not at all, and an
+// unexpected field inside a content part is a 400 from several providers.
+for (const model of ["gpt-5.5", "moonshotai/kimi-k2.7-code", "deepseek/deepseek-v3.2", "gemini-3.5-flash"]) {
+  const input = { model, messages: [{ role: "user", content: "hi" }] };
+  assert.deepEqual(markCacheable(input), input, `${model} must pass through untouched`);
+}
+
+// Claude, by either naming convention, gets a breakpoint.
+for (const model of ["anthropic/claude-opus-4.7", "claude-opus-4-7"]) {
+  const out = markCacheable({ model, messages: [{ role: "user", content: "hi" }] });
+  assert.ok(cached(out), `${model} should be marked cacheable`);
+  assert.equal(out.messages[0].content[0].text, "hi", "normalising to blocks lost the text");
+}
+
+// The marker lands on the last user/assistant turn — never on a tool message, whose content shape
+// maps to tool_result upstream.
+const loop = markCacheable({
+  model: "anthropic/claude-opus-4.7",
+  messages: [
+    { role: "system", content: "sys" },
+    { role: "user", content: "do it" },
+    { role: "assistant", content: "working", tool_calls: [{ id: "t1", function: { name: "ls", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "t1", content: "a\nb" },
+    { role: "system", content: "per-turn extras" },
+  ],
+});
+assert.ok(!cached(loop.messages[0]), "system prompt must not be marked (it changes every turn)");
+assert.ok(!cached(loop.messages[3]), "tool messages must never be marked");
+assert.ok(!cached(loop.messages[4]), "trailing system extras must not be marked");
+assert.ok(cached(loop.messages[2]), "the last assistant turn should carry the breakpoint");
+
+// Degenerate shapes must not throw — this runs on every single request.
+for (const messages of [[], [{ role: "system", content: "only system" }], [{ role: "assistant", content: null, tool_calls: [] }]]) {
+  assert.doesNotThrow(() => markCacheable({ model: "anthropic/claude-opus-4.7", messages }));
+}
+
 console.log("token-savings OK");

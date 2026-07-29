@@ -1811,7 +1811,7 @@ async function main(): Promise<void> {
         agent.setStrategy(v);
         console.log(`strategy → ${v}`);
       } else {
-        console.log(`strategy: ${agent.getStrategy()} (react | single | plan | multi | toolsmith)`);
+        console.log(`strategy: ${agent.getStrategy()} (react | single | plan | toolsmith)`);
       }
       continue;
     }
