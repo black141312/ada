@@ -6,6 +6,47 @@ All notable changes to ada are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-07-30
+
+### Added — plans and token quotas (replaces the allow-list)
+An allow-list answers *"may this person in?"*. For a product anyone can sign up for the question is
+*"what is this person entitled to?"*. Membership no longer gates chat: everyone authenticated gets
+in, lands on `free`, and the plan decides the rest.
+
+| plan | models | tokens / period |
+|---|---|---|
+| free | `:free` only | 2M |
+| pro | all | 25M |
+| team | all | 120M |
+
+- **`403` vs `402`** — 403 means your plan doesn't include this model, 402 means you're out of quota.
+  Collapsing them tells someone to upgrade when they already had.
+- **A lapsed subscription degrades to free**, it doesn't lock out — an expired card should cost you
+  the paid models, not your account. Unknown plan strings and failed lookups also resolve to `free`,
+  which permits only `:free` models and so fails closed at zero upstream cost.
+- **Paid periods anchor to the subscription date**, so the window matches what was charged; free
+  gets the UTC calendar month.
+- `GET /v1/plan` (self-serve) and `POST /v1/plans` (admin) — admin identity comes from
+  `ADA_ADMIN_USERS` (still reading `ADA_ALLOWED_USERS` under its old name) and never from the table
+  it edits, so a bad write can't lock the operator out of the server that would fix it.
+
+### Added — usage persisted to the database
+`appendUsage` writes JSONL to the data directory — right for a self-hosted box, useless for a hosted
+one, since Cloud Run's disk is ephemeral and scales to zero. Nothing could be billed on it.
+`usage_events` now carries the same row in Postgres (sqlite when self-hosting), indexed on
+`(user_id, ts)` — the only query a quota makes. Stored as **tokens, not cost**: prices change, tokens
+don't, so cost is derived at read time from the model on each row.
+
+### Added — checkout sessions
+Upgrading happens on the website, which is static and has no way to know who's asking. Rather than
+putting the account token in a URL — where it lands in browser history and in the `Referer` of every
+third-party asset — the app mints a session server-side and opens a link carrying only its id: 256
+bits of randomness, single-use, 30-minute expiry, revealing nothing but the plan being bought.
+`completeCheckout()` is idempotent, because payment providers replay events out of order.
+`/v1/billing/webhook` answers **501** and is deliberately not stubbed: a webhook that accepts a body
+and grants a plan is an unauthenticated way to give yourself Pro, and signature verification *is* the
+security of a webhook.
+
 ## [0.14.1] — 2026-07-29
 
 ### Fixed — caching now works *within* a session, not just across identical requests
