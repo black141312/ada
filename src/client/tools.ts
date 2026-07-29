@@ -40,8 +40,18 @@ export interface Tool {
   run(args: Record<string, unknown>): Promise<ToolResult>;
 }
 
+/** Keep both ends, not just the head. For the output that actually overflows — `npm install`, a test
+ *  run, a build — the head is progress noise and the verdict is in the last few lines. Dropping the
+ *  tail costs the same tokens and hides the answer, so the model spends another call finding it. */
+export function clip(s: string, max = MAX_OUTPUT): string {
+  if (s.length <= max) return s;
+  const head = Math.floor(max / 3);
+  const tail = max - head;
+  return `${s.slice(0, head)}\n… [truncated ${s.length - max} chars] …\n${s.slice(-tail)}`;
+}
+
 function truncate(s: string): string {
-  return s.length > MAX_OUTPUT ? `${s.slice(0, MAX_OUTPUT)}\n… [truncated ${s.length - MAX_OUTPUT} chars]` : s;
+  return clip(s);
 }
 
 // The front-end (CLI/TUI) installs an asker so the ask_user tool can prompt the user mid-task.
@@ -196,7 +206,7 @@ function spillIfHuge(text: string): string {
     mkdirSync(dir, { recursive: true });
     const f = join(dir, `out-${Date.now()}-${Math.floor(Math.random() * 1e6)}.txt`);
     writeFileSync(f, text, "utf8");
-    return `${text.slice(0, MAX_OUTPUT)}\n… [truncated ${text.length - MAX_OUTPUT} chars; full output: ${relative(process.cwd(), f)}]`;
+    return `${clip(text)}\n[full output: ${relative(process.cwd(), f)}]`;
   } catch {
     return truncate(text);
   }

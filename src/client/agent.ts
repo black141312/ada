@@ -11,10 +11,20 @@ import { type Tool, type ToolResult, isDestructive, toolByName, tools } from "./
 import { afterTool, beforeTool, transformInput } from "./hooks.ts";
 import { configuredServers } from "./mcp.ts";
 import { priceOf } from "./models-dev.ts";
-import { permissionFor } from "./settings.ts";
+import { isTrusted, loadSettings, permissionFor } from "./settings.ts";
 import { routeConfident, routeSkills } from "./skills.ts";
 import { recallBlock } from "./memory.ts";
 import { Session } from "./session.ts";
+import { fileURLToPath } from "node:url";
+import { runIsolatedWorker } from "./worker.ts";
+
+/** "tokens: 1566 in / 18 out · ~$0.0016" → numbers. A child worker reports usage as that string;
+ *  parsing it back beats plumbing a second channel for three integers. */
+function parseUsageLine(s: string): { promptTokens: number; completionTokens: number; cost: number } {
+  const t = /tokens:\s*(\d+)\s*in\s*\/\s*(\d+)\s*out/.exec(s);
+  const c = /~\$([0-9.]+)/.exec(s);
+  return { promptTokens: t ? +t[1]! : 0, completionTokens: t ? +t[2]! : 0, cost: c ? +c[1]! : 0 };
+}
 
 type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 /** Structured turn events — for a caller (e.g. an IDE service) that wants more than plain text.
@@ -24,7 +34,19 @@ export type AgentEvent =
   | { type: "tool_call"; callId: string; name: string; detail: string }
   | { type: "tool_result"; callId: string; name: string; output: string; isError: boolean; display?: string }
   | { type: "done"; text: string; usage: string; context?: number };
-type SendCtrl = { signal?: AbortSignal; steer?: string[]; quiet?: boolean; images?: string[]; onReplyStart?: () => void; onEvent?: (e: AgentEvent) => void };
+type SendCtrl = {
+  signal?: AbortSignal;
+  steer?: string[];
+  /** Suppress stdout. An OUTPUT concern only — it must never change what the agent does. */
+  quiet?: boolean;
+  /** This turn came from a parent agent, not a person: the task is already scoped, so skill routing
+   *  and memory recall are skipped. Distinct from `quiet` — `--json` is quiet but still a real user
+   *  turn, and conflating the two silently disabled skills for every scripted run. */
+  delegated?: boolean;
+  images?: string[];
+  onReplyStart?: () => void;
+  onEvent?: (e: AgentEvent) => void;
+};
 type ToolCall = { id: string; name: string; args: string };
 type StepResult = { content: string; toolCalls: ToolCall[] };
 type ToolDef = OpenAI.Chat.Completions.ChatCompletionTool;
@@ -256,11 +278,22 @@ export function parseTextToolCalls(content: string): Array<{ name: string; args:
 
 const COMPACT_AT = Number(process.env.ADA_COMPACT_AT) || 100_000;
 
+/** Model for sub-agents. A sub-agent gets a task the parent already narrowed and returns one string,
+ *  so its whole tool loop is billable work that never enters the parent's context — the cheapest
+ *  place in the system to trade capability for price. Opt-in: unset falls back to the parent's model,
+ *  because defaulting to a provider the user has no key for would break spawn_agent outright. */
+export function subagentModel(parentModel: string): string {
+  return process.env.ADA_SUBAGENT_MODEL || loadSettings(isTrusted(process.cwd())).subagentModel || parentModel;
+}
+
+/** Token ceiling for a delegated worker. A worker that understood its brief finishes well inside
+ *  this; one that didn't will read the repo until something stops it — measured 174k input tokens
+ *  on a single subtask. Harmless when workers are cheap, but `build` workers run on the user's
+ *  model, where that mistake costs real money. Parents are never capped; this is a worker leash. */
+const WORKER_TOKEN_BUDGET = Number(process.env.ADA_WORKER_BUDGET) || 50_000;
+
 const PLAN_NOTE =
   "PLAN MODE: do not write, edit, or run commands. Investigate with read-only tools if needed, then present a concise numbered plan and stop. The user will approve before you execute.";
-
-const DECOMPOSE_NOTE =
-  "Break the user's request into 2-5 independent subtasks that can each be done on their own. Output one subtask per line — nothing else.";
 
 // ---- orchestration: pluggable agent architectures over a shared Engine ----
 // The Engine holds the harness primitives (streaming, tool-call recovery, compaction, approval,
@@ -273,9 +306,14 @@ export interface Engine {
   runTools(calls: ToolCall[]): Promise<void>;
   say(s: string): void;
   interrupted(): void;
-  addSystem(text: string): void;
+  /** Hand the model a turn's worth of new input mid-orchestration (worker results, "now execute
+   *  the plan", a nudge). Deliberately role:"user", not "system": providers lift system messages
+   *  out into a separate parameter, so a system-role append leaves the conversation ending on the
+   *  assistant's own last message — which Claude rejects as an assistant prefill (400). */
+  addUser(text: string): void;
   aborted(): boolean;
   drainSteer(): boolean;
+  /** Delegate a self-contained subtask to a fresh sub-agent on the cheap model. */
   spawn(prompt: string): Promise<string>;
   soleIntegration(): string | null;
   readDocs(name: string): Promise<string>;
@@ -299,7 +337,7 @@ const reAct: Orchestrator = {
         // text — leaving the user with tool output but no answer. Nudge once for the final response.
         if (!turn.content.trim() && !nudged) {
           nudged = true;
-          e.addSystem(
+          e.addUser(
             "You stopped without giving the user an answer. Based on what you've already found, write your final response to the user now. Don't call more tools unless truly necessary.",
           );
           continue;
@@ -330,7 +368,7 @@ const planExecute: Orchestrator = {
   name: "plan", // read-only plan first, then execute it
   async run(e) {
     if (!(await e.step({ allowTools: false, note: PLAN_NOTE }))) return;
-    e.addSystem("Now execute the plan above, step by step, using your tools.");
+    e.addUser("Now execute the plan above, step by step, using your tools.");
     for (;;) {
       const turn = await e.step();
       if (!turn) return;
@@ -352,24 +390,6 @@ const splitLines = (s: string): string[] =>
     .split("\n")
     .map((l) => l.replace(/^[-*\d.)\s]+/, "").trim())
     .filter((l) => l.length > 1);
-
-const multiAgent: Orchestrator = {
-  name: "multi", // decompose → fan out to subagents → synthesize
-  async run(e) {
-    const plan = await e.step({ allowTools: false, note: DECOMPOSE_NOTE });
-    if (!plan) return;
-    const tasks = splitLines(plan.content).filter((t) => t.length > 8);
-    if (!tasks.length) {
-      e.say("\n");
-      return;
-    }
-    e.say(`\n\x1b[2m• delegating ${tasks.length} subtasks\x1b[0m\n`);
-    const results = await Promise.all(tasks.map((t) => e.spawn(t)));
-    e.addSystem(`Subagent results:\n\n${results.map((r, i) => `### ${tasks[i]}\n${r}`).join("\n\n")}\n\nSynthesize the final answer for the user.`);
-    await e.step({ allowTools: false });
-    e.say("\n");
-  },
-};
 
 const toolsmith: Orchestrator = {
   name: "toolsmith", // read the lone integration's docs → subagents author skills for it
@@ -410,7 +430,12 @@ const toolsmith: Orchestrator = {
   },
 };
 
-const ORCHESTRATORS: Record<string, Orchestrator> = { react: reAct, single: singleShot, plan: planExecute, multi: multiAgent, toolsmith };
+// `multi` (decompose → fan out → synthesize) was removed. It never reduced cost: measured against
+// react on the same task it used 29x the input tokens, and only looked cheaper when the workers ran
+// on a model cheap enough to absorb the extra work. Put the workers on the user's model and it cost
+// 2x react for worse output — splitting one cohesive artifact along file lines leaves nobody
+// holding the whole design. Delegation survives as spawn_agent, for genuinely separable subtasks.
+const ORCHESTRATORS: Record<string, Orchestrator> = { react: reAct, single: singleShot, plan: planExecute, toolsmith };
 
 /** A short, transient hint naming the most relevant skills for a request (or null if none stand out). */
 function suggestSkillNote(query: string): string | null {
@@ -561,10 +586,23 @@ export class Agent {
   private onApprove: OnApprove;
   private autoApprove: boolean;
   private compactAt: number;
+  private tokenBudget: number; // 0 = uncapped
   private apiTools: ToolDef[];
   private brain: string | null = null; // repo map, built lazily on the first turn that needs it
   private promptTokens = 0;
   private completionTokens = 0;
+  private cachedTokens = 0; // prompt tokens served from cache (billed ~0.1x)
+  private cacheWriteTokens = 0; // prompt tokens written to cache (billed ~1.25x)
+  private lastPromptTokens = 0; // the provider's real count for the last request — beats chars/4
+  private subAgents = 0; // delegated runs, rolled up so a swarm's true cost is visible
+  private subPromptTokens = 0;
+  private subCompletionTokens = 0;
+  private subCost = 0;
+  private claimedPaths = new Set<string>(); // output files already owned by a worker this run
+  /** Tokens keyed by the model that actually served them. A turn can override the model (planning
+   *  runs cheap while the conversation stays on the user's pick), so one price for the whole agent
+   *  would bill the cheap step at the expensive rate. */
+  private byModel = new Map<string, { prompt: number; completion: number; cached: number; cacheWrite: number }>();
   private lastAssistant = "";
   private strategy = "react"; // orchestration architecture (see ORCHESTRATORS)
   private pendingNote: string | null = null; // transient skill-routing hint for the next model turn
@@ -581,6 +619,8 @@ export class Agent {
     project?: boolean;
     compactAt?: number;
     history?: Msg[];
+    /** Stop after this many prompt tokens. 0/undefined = no limit (the default for a real user). */
+    tokenBudget?: number;
   }) {
     this.client = opts.client;
     this.model = opts.model;
@@ -589,6 +629,7 @@ export class Agent {
     this.onApprove = opts.onApprove;
     this.autoApprove = !!opts.autoApprove;
     this.compactAt = opts.compactAt || COMPACT_AT;
+    this.tokenBudget = opts.tokenBudget ?? (Number(process.env.ADA_TOKEN_BUDGET) || 0);
     this.apiTools = buildApiTools(); // snapshot the registry (incl. extension/skill/MCP tools) at construction
     this.project = opts.project ?? true;
     this.messages = [{ role: "system", content: systemPrompt(this.project) }, ...(opts.history ?? [])];
@@ -681,17 +722,21 @@ export class Agent {
     this.messages.push(userMsg);
     this.session.append(userMsg);
 
-    if (estimateTokens(this.messages) > this.compactAt) await this.autoCompact("size threshold");
-    if (!ctrl?.quiet) {
+    if (this.contextTokens() > this.compactAt) await this.autoCompact("size threshold");
+    let skillMsg: Msg | null = null;
+    if (!ctrl?.delegated) {
       // Auto-recall: the few memories relevant to this input, injected transiently for this turn only.
       this.pendingMemory = recallBlock(input, !!this.project);
       // Orchestrate skills: when one clearly fits, apply it (inject its procedure into context so
       // even a weak model follows it, persisted across the tool loop). Otherwise, a soft hint.
       const fit = routeConfident(input);
       if (fit) {
-        const sys: Msg = { role: "system", content: `A skill fits this request: "${fit.name}". Follow its procedure for this task unless it clearly doesn't fit what was asked, in which case ignore it and proceed.\n\n${fit.body}` };
-        this.messages.push(sys);
-        this.session.append(sys);
+        // Scoped to THIS request: it has to survive the tool loop, but a skill body is the largest of
+        // the three injections and it applies to one task. Left in `messages` it would be re-sent on
+        // every later turn, and `session.append` would restore it on --resume, forever. Removed in the
+        // finally below; the router re-applies it next input if it still fits.
+        skillMsg = { role: "system", content: `A skill fits this request: "${fit.name}". Follow its procedure for this task unless it clearly doesn't fit what was asked, in which case ignore it and proceed.\n\n${fit.body}` };
+        this.messages.push(skillMsg);
         say(`\x1b[2m↳ skill: ${fit.name}\x1b[0m\n`);
       } else {
         this.pendingNote = suggestSkillNote(input);
@@ -699,7 +744,14 @@ export class Agent {
     }
 
     const engine = this.makeEngine(ctrl, say, interrupted, drainSteer);
-    await (ORCHESTRATORS[this.strategy] ?? reAct).run(engine);
+    try {
+      await (ORCHESTRATORS[this.strategy] ?? reAct).run(engine);
+    } finally {
+      if (skillMsg) {
+        const i = this.messages.indexOf(skillMsg);
+        if (i >= 0) this.messages.splice(i, 1);
+      }
+    }
     ctrl?.onEvent?.({ type: "done", text: this.lastAssistant, usage: this.usageReport(), context: this.contextTokens() });
     return this.lastAssistant;
   }
@@ -713,8 +765,8 @@ export class Agent {
       runTools: (calls) => this.execTools(calls, ctrl, say),
       say,
       interrupted,
-      addSystem: (text) => {
-        const m: Msg = { role: "system", content: text };
+      addUser: (text) => {
+        const m: Msg = { role: "user", content: text };
         this.messages.push(m);
         this.session.append(m);
       },
@@ -727,10 +779,68 @@ export class Agent {
     };
   }
 
-  /** A fresh, headless sub-agent (autoApprove, quiet). Returns its final text. */
+  /** Claim output paths for one worker. Single-threaded JS makes check-and-set atomic within a tick,
+   *  so concurrent workers can't both win the same file. A collision means the planner assigned one
+   *  file to two workers — a decomposition bug, so it's reported rather than silently resolved. */
+  private claimPaths(paths: string[]): { taken: string[]; collided: string[] } {
+    const taken: string[] = [];
+    const collided: string[] = [];
+    for (const p of paths) {
+      if (this.claimedPaths.has(p)) collided.push(p);
+      else {
+        this.claimedPaths.add(p);
+        taken.push(p);
+      }
+    }
+    return { taken, collided };
+  }
+
+  /** A fresh, headless sub-agent (autoApprove, quiet). Returns its final text.
+   *
+   *  Runs in its own git worktree as a child process where possible — the tool layer resolves paths
+   *  against the process-global cwd, so parallel in-process workers would all write into the parent's
+   *  tree (observed: four stray files and a README edit from one swarm run). Falls back to in-process
+   *  when the cwd isn't a git repo, so a subtask never fails purely for lack of isolation. */
   private async spawnSub(prompt: string): Promise<string> {
-    const sub = new Agent({ client: this.client, model: this.model, session: Session.create(), onApprove: this.onApprove, autoApprove: true, project: false });
-    return sub.send(prompt, { quiet: true });
+    const model = subagentModel(this.model);
+    if (process.env.ADA_NO_SUBAGENTS !== "1") {
+      try {
+        const run = await runIsolatedWorker({
+          cwd: process.cwd(),
+          prompt,
+          model,
+          binPath: fileURLToPath(new URL("../../bin/ada.mjs", import.meta.url)),
+          budget: WORKER_TOKEN_BUDGET,
+          claim: (paths) => this.claimPaths(paths),
+        });
+        if (run) {
+          this.subAgents++;
+          const u = parseUsageLine(run.usage);
+          this.subPromptTokens += u.promptTokens;
+          this.subCompletionTokens += u.completionTokens;
+          this.subCost += u.cost;
+          const note = run.collided.length ? `\n\n[not applied — another worker already owns: ${run.collided.join(", ")}]` : "";
+          return run.text + note;
+        }
+      } catch {
+        /* isolation failed mid-run — fall through and do the work in-process rather than lose it */
+      }
+    }
+
+    // Workers inherit the parent's project context. Counterintuitive for cost, but measured the
+    // other way: blind workers spent ~174k input tokens groping around the repo to orient. The map
+    // is ~1.5k and it replaces that search. Cheap models are exactly the ones that can't infer
+    // layout from nothing — and they're now cheap enough that context is the affordable half.
+    const sub = new Agent({ client: this.client, model, session: Session.create(), onApprove: this.onApprove, autoApprove: true, project: this.project, tokenBudget: WORKER_TOKEN_BUDGET });
+    try {
+      return await sub.send(prompt, { quiet: true, delegated: true });
+    } finally {
+      const u = sub.usageRaw(); // roll up even if the subtask threw — the tokens were still billed
+      this.subAgents++;
+      this.subPromptTokens += u.promptTokens;
+      this.subCompletionTokens += u.completionTokens;
+      this.subCost += u.cost ?? 0;
+    }
   }
 
   /** One model turn: stream, collect content + tool calls (recovering leaked ones), push the
@@ -741,6 +851,17 @@ export class Agent {
       interrupted();
       return null;
     }
+    // Checked BEFORE the request, not after: the next call is the one that would overshoot, and on
+    // a large transcript a single turn can be tens of thousands of tokens. Returning no tool calls
+    // ends the orchestrator's loop cleanly, so the caller still gets whatever was accomplished.
+    if (this.tokenBudget && this.promptTokens >= this.tokenBudget) {
+      const msg = `[stopped: token budget reached — ${this.promptTokens} of ${this.tokenBudget} prompt tokens used. The work so far stands; the brief was probably too vague to finish inside the budget.]`;
+      say(`\n\x1b[2m${msg}\x1b[0m\n`);
+      // Becomes the return value of send(), so a parent sees why the subtask stopped short instead
+      // of an empty string it would read as "done, nothing to report".
+      this.lastAssistant = this.lastAssistant ? `${this.lastAssistant}\n\n${msg}` : msg;
+      return { content: msg, toolCalls: [] };
+    }
     const suggest = this.pendingNote;
     const memory = this.pendingMemory;
     this.pendingNote = null; // consume once — the routing hint applies to this turn only
@@ -749,6 +870,11 @@ export class Agent {
     // Send only what this turn can actually use. Answering "hi" needs no repo map and no tools, so
     // it costs the base prompt alone; the next message is assembled fresh and gets the full kit.
     const smallTalk = isSmallTalk(this.messages);
+    // Re-gated per turn, deliberately. Making unlocked tools sticky would keep the cached prefix
+    // stable, but that only pays off when the transcript is actually cached — and it isn't on the
+    // OpenAI-compatible path, which never sends cache_control. Measured: sticky cost +15% input per
+    // turn on a deck task (which trips the document gates) for no cache benefit.
+    // ponytail: revisit if cache_control lands in openai-compat.ts — then sticky is the better trade.
     const allowed = smallTalk ? new Set<string>() : allowedLazyTools(this.messages);
     const lazyNames = new Set(tools.filter((t) => t.lazy).map((t) => t.name));
     const apiTools = smallTalk
@@ -768,6 +894,9 @@ export class Agent {
       const create = () =>
         this.client.chat.completions.create(
           {
+            // A step can override the model: planning/decomposition runs on the cheap one while the
+            // conversation itself stays on the user's pick. Same transcript either way — the wire
+            // format is identical, so the messages array doesn't care which model reads it.
             model: this.model,
             messages: sendMessages,
             // Omit the field entirely when there's nothing to advertise — several providers reject
@@ -807,6 +936,20 @@ export class Agent {
           if (chunk.usage) {
             this.promptTokens += chunk.usage.prompt_tokens ?? 0;
             this.completionTokens += chunk.usage.completion_tokens ?? 0;
+            this.lastPromptTokens = chunk.usage.prompt_tokens ?? this.lastPromptTokens;
+            // Two spellings in the wild: the native Anthropic adapter emits `cache_creation_tokens`,
+            // OpenRouter reports `cache_write_tokens`. Reading only one silently prices cache writes
+            // as fresh input.
+            const d = chunk.usage.prompt_tokens_details as { cached_tokens?: number; cache_creation_tokens?: number; cache_write_tokens?: number } | undefined;
+            this.cachedTokens += d?.cached_tokens ?? 0;
+            this.cacheWriteTokens += d?.cache_creation_tokens ?? d?.cache_write_tokens ?? 0;
+            const key = this.model;
+            const b = this.byModel.get(key) ?? { prompt: 0, completion: 0, cached: 0, cacheWrite: 0 };
+            b.prompt += chunk.usage.prompt_tokens ?? 0;
+            b.completion += chunk.usage.completion_tokens ?? 0;
+            b.cached += d?.cached_tokens ?? 0;
+            b.cacheWrite += d?.cache_creation_tokens ?? d?.cache_write_tokens ?? 0;
+            this.byModel.set(key, b);
           }
           const delta = chunk.choices[0]?.delta;
           if (delta?.content) {
@@ -962,14 +1105,49 @@ export class Agent {
     return `Compacted context: ~${before} → ~${estimateTokens(this.messages)} est. tokens.`;
   }
 
+  /** Real context size. The provider's own count for the last request when we have one — it lands a
+   *  turn stale (it predates the newest user message) but is far closer than chars/4, and it costs
+   *  nothing. Falls back to the estimate before the first response. */
   contextTokens(): number {
-    return estimateTokens(this.messages);
+    return this.lastPromptTokens || estimateTokens(this.messages);
+  }
+
+  /** This agent's own counters, so a parent can roll a finished sub-agent's spend into its own.
+   *  Sub-agents run on a different model at a different price, so the parent aggregates COST, not
+   *  tokens — adding a worker's tokens to the planner's would price them at the planner's rate. */
+  usageRaw(): { model: string; promptTokens: number; completionTokens: number; cost: number | null } {
+    return { model: this.model, promptTokens: this.promptTokens, completionTokens: this.completionTokens, cost: this.ownCost() };
+  }
+
+  /** Cost of this agent's own traffic. Cache reads bill ~0.1x and writes ~1.25x — pricing every
+   *  prompt token at the full input rate over-reports by exactly the cache's savings. */
+  private ownCost(): number | null {
+    // Priced per model that served the tokens, not per agent — see byModel.
+    const buckets = this.byModel.size ? [...this.byModel.entries()] : [[this.model, { prompt: this.promptTokens, completion: this.completionTokens, cached: this.cachedTokens, cacheWrite: this.cacheWriteTokens }] as const];
+    let total = 0;
+    let priced = false;
+    for (const [model, b] of buckets) {
+      const p = priceFor(model);
+      if (!p) continue; // unknown model: leave it out rather than guess at the wrong rate
+      priced = true;
+      const fresh = Math.max(0, b.prompt - b.cached - b.cacheWrite);
+      total += (fresh / 1e6) * p[0] + (b.cached / 1e6) * p[0] * 0.1 + (b.cacheWrite / 1e6) * p[0] * 1.25 + (b.completion / 1e6) * p[1];
+    }
+    return priced ? total : null;
   }
 
   usageReport(): string {
-    const p = priceFor(this.model);
-    const cost = p ? (this.promptTokens / 1e6) * p[0] + (this.completionTokens / 1e6) * p[1] : null;
-    return `tokens: ${this.promptTokens} in / ${this.completionTokens} out${cost !== null ? ` · ~$${cost.toFixed(4)}` : " · (no price table for this model)"}`;
+    const own = this.ownCost();
+    const cache = this.cachedTokens ? ` · cache ${Math.round((this.cachedTokens / this.promptTokens) * 100)}% hit` : "";
+    const head = `tokens: ${this.promptTokens} in / ${this.completionTokens} out${cache}`;
+    // Delegated work is billed too. Reporting only the planner's tokens makes a swarm run look
+    // almost free — the workers burn most of the tokens and none of them land in this transcript.
+    if (this.subAgents) {
+      const total = own !== null && this.subCost !== null ? own + this.subCost : null;
+      const worker = `${this.subAgents} subagent${this.subAgents > 1 ? "s" : ""}: ${this.subPromptTokens} in / ${this.subCompletionTokens} out · ~$${(this.subCost ?? 0).toFixed(4)}`;
+      return `${head} · ~$${(own ?? 0).toFixed(4)} planner\n${worker}${total !== null ? `\ntotal: ~$${total.toFixed(4)}` : ""}`;
+    }
+    return `${head}${own !== null ? ` · ~$${own.toFixed(4)}` : " · (no price table for this model)"}`;
   }
 
   private async autoCompact(reason: string): Promise<void> {

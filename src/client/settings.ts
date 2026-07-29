@@ -16,6 +16,7 @@ export interface Settings {
   backendUrl?: string; // which ada-server the client talks to (a hosted server / Cloudflare Worker); env ADA_BACKEND_URL overrides
   backendKey?: string; // bearer/seat key for that backend
   model?: string;
+  subagentModel?: string; // model for spawn_agent / background_task; unset = same as the main model
   reasoning?: "low" | "medium" | "high";
   autoApprove?: boolean;
   compactAt?: number;

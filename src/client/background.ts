@@ -6,7 +6,7 @@
 // so `ada serve` — the editor — registers them too.
 
 import type OpenAI from "openai";
-import { Agent, type OnApprove } from "./agent.ts";
+import { Agent, type OnApprove, subagentModel } from "./agent.ts";
 import { Session } from "./session.ts";
 import { registerTool } from "./tools.ts";
 
@@ -61,7 +61,8 @@ export function registerSubagentTools(opts: SubagentOpts): void {
   const sub = (autoApprove: boolean): Agent =>
     new Agent({
       client: opts.client,
-      model: opts.model,
+      model: subagentModel(opts.model), // settings.subagentModel / ADA_SUBAGENT_MODEL — see the note there
+
       session: Session.create(),
       onApprove: opts.onApprove,
       autoApprove,
@@ -77,7 +78,7 @@ export function registerSubagentTools(opts: SubagentOpts): void {
     needsApproval: false,
     async run(args) {
       try {
-        const text = await sub(opts.autoApprove).send(String(args.task ?? ""), { quiet: true });
+        const text = await sub(opts.autoApprove).send(String(args.task ?? ""), { quiet: true, delegated: true });
         return { output: text || "(sub-agent returned no text)" };
       } catch (e) {
         return { output: String(e instanceof Error ? e.message : e), isError: true };
@@ -92,7 +93,7 @@ export function registerSubagentTools(opts: SubagentOpts): void {
     needsApproval: false,
     async run(args) {
       const task = String(args.task ?? "");
-      const id = startJob(task, () => sub(true).send(task, { quiet: true }));
+      const id = startJob(task, () => sub(true).send(task, { quiet: true, delegated: true }));
       return { output: `Started background job ${id}. Check results with /jobs (don't wait on it).` };
     },
   });

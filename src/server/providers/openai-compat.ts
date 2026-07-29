@@ -19,6 +19,45 @@ const ADA_VERSION = (() => {
   }
 })();
 
+type Part = { type: string; text?: string; cache_control?: { type: string } };
+type Msg = { role?: string; content?: unknown };
+
+/** Claude is the only family that has to be ASKED to cache. DeepSeek, Kimi and OpenAI cache
+ *  automatically — which is why their runs report a hit rate and Claude's report none at all.
+ *  Routed through an OpenAI-compatible endpoint, nobody was setting `cache_control`, so every turn
+ *  of every Claude session re-sent the whole transcript at full price. In an agentic loop that's the
+ *  dominant cost: turn 10 re-sends turns 1-9. Cache reads bill at ~0.1x.
+ *
+ *  One breakpoint, on the last user/assistant turn. Anthropic matches the longest cached prefix, so
+ *  a single moving marker keeps the growing history warm. Deliberately NOT on a `tool` message —
+ *  those map to tool_result blocks upstream and rewriting their content shape risks breaking the
+ *  mapping for a marginal gain.
+ *
+ *  ponytail: the system prompt is left alone on purpose. Ada appends per-turn extras (repo map,
+ *  recalled memories, skill hints) as a trailing system message, and Anthropic folds every system
+ *  message into one parameter — so the system block changes each turn and can't be cached as-is.
+ *  Making it cacheable means moving the transient parts out of `system` first. */
+export function markCacheable(body: Record<string, unknown>): Record<string, unknown> {
+  const model = String(body.model ?? "");
+  if (!/claude/i.test(model) && !model.startsWith("anthropic/")) return body;
+  const msgs = body.messages;
+  if (!Array.isArray(msgs) || !msgs.length) return body;
+
+  let i = msgs.length - 1;
+  while (i >= 0 && (msgs[i] as Msg)?.role !== "user" && (msgs[i] as Msg)?.role !== "assistant") i--;
+  if (i < 0) return body;
+
+  const m = msgs[i] as Msg;
+  const parts: Part[] | null =
+    typeof m.content === "string" ? [{ type: "text", text: m.content }] : Array.isArray(m.content) ? [...(m.content as Part[])] : null;
+  if (!parts?.length) return body; // assistant turns can be tool_calls with null content
+
+  parts[parts.length - 1] = { ...parts[parts.length - 1]!, cache_control: { type: "ephemeral" } };
+  const out = msgs.slice();
+  out[i] = { ...m, content: parts };
+  return { ...body, messages: out };
+}
+
 async function authHeaders(provider: ProviderName): Promise<Record<string, string>> {
   // GitHub Copilot: bearer comes from the token exchange (or COPILOT_API_KEY), plus the
   // editor-identification headers its endpoint requires.
@@ -41,7 +80,11 @@ export const openAICompatAdapter: Adapter = {
     // Strip a leading "<provider>/" the router used only to disambiguate (copilot/groq/together) — the
     // endpoint wants the bare id. (Cloudflare's "@cf/…" ids aren't "cloudflare/…", so they pass through.)
     const prefix = `${provider}/`;
-    const outBody = typeof body.model === "string" && body.model.startsWith(prefix) ? { ...body, model: body.model.slice(prefix.length) } : body;
+    const stripped = typeof body.model === "string" && body.model.startsWith(prefix) ? { ...body, model: body.model.slice(prefix.length) } : body;
+    // OpenRouter only returns the cache breakdown (cached_tokens / cache_write_tokens) when asked.
+    // Without it a cache hit is invisible and the client prices every token at the fresh rate.
+    const withUsage = provider === "openrouter" ? { ...stripped, usage: { include: true } } : stripped;
+    const outBody = markCacheable(withUsage);
     // If the client goes away, abort the upstream too — else the full completion is generated,
     // billed, and (for enterprise) metered against a request nobody is reading.
     const ac = new AbortController();

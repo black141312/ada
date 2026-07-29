@@ -47,9 +47,12 @@ function serialize(messages: Msg[]): string {
     if (calls) text += calls.map((c) => `\n[calls ${c.function?.name}(${c.function?.arguments ?? ""})]`).join("");
     parts.push(`${m.role}: ${text}`.trim());
   }
-  let out = parts.join("\n\n");
-  if (out.length > SUMMARY_INPUT_MAX) out = `[…older messages omitted…]\n\n${out.slice(-SUMMARY_INPUT_MAX)}`;
-  return out;
+  const out = parts.join("\n\n");
+  if (out.length <= SUMMARY_INPUT_MAX) return out;
+  // Keep both ends. The tail alone loses the opening turns — which is where the user's actual goal
+  // is stated, the one thing the summary prompt is told to preserve above everything else.
+  const head = Math.floor(SUMMARY_INPUT_MAX / 3);
+  return `${out.slice(0, head)}\n\n[…middle of the conversation omitted…]\n\n${out.slice(-(SUMMARY_INPUT_MAX - head))}`;
 }
 
 /** Summarize the older messages and return a compacted transcript: [system, summary, ...tail]. */
