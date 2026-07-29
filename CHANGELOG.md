@@ -6,6 +6,57 @@ All notable changes to ada are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-07-29
+
+### Fixed — headless runs were missing half the agent
+- **`ada -p` registered no skills, no memory tools, and no `spawn_agent`.** Every headless and
+  scripted run went out with none of the built-in skills loaded and no ability to delegate. Benchmark
+  runs showing zero delegation read as "the model chose not to" — the tool was never registered.
+- **`--json` silently disabled skill routing and memory recall.** It set `quiet`, and `quiet` also
+  gated routing, so an output format changed what the agent did. Now split: `quiet` is stdout only,
+  `delegated` marks a turn a parent agent already scoped.
+- **`--strategy plan` failed on every run, and `--strategy multi` could not complete one.** Both
+  appended a system message mid-orchestration; providers hoist system messages into a separate
+  parameter, leaving the conversation ending on the assistant's own message — an assistant prefill,
+  which Claude rejects with a 400. The Engine primitive is now `addUser`.
+
+### Added — prompt caching for Claude on the OpenAI-compatible path
+Claude is the only model family that must be *asked* to cache; DeepSeek, Kimi and OpenAI do it
+automatically. Routed through OpenRouter nothing set `cache_control`, so every turn of every Claude
+session re-sent the whole transcript at full price. Measured, same prompt twice: **$0.0323 → $0.0028
+(100% cache hit)**.
+- Requests `usage: { include: true }` from OpenRouter, which otherwise omits the cache breakdown and
+  leaves a hit invisible.
+- Reads both spellings — OpenRouter's `cache_write_tokens` and the native adapter's
+  `cache_creation_tokens`. Reading one billed cache writes as fresh input.
+- *Known limit:* turns **within** a session still miss. Per-turn extras (repo map, recalled memories,
+  skill hints) ride as a trailing system message, and Anthropic folds all system messages into one
+  parameter — so the system block changes each turn and invalidates the prefix behind it.
+
+### Fixed — cost reporting
+- Cached tokens were priced at the full input rate; cache reads bill ~0.1x and writes ~1.25x.
+- Sub-agent spend wasn't counted at all, so a delegated run reported roughly a third of its cost.
+- Tokens are tracked per model that served them, so `/model` mid-session no longer misprices.
+
+### Changed — context
+- Skill bodies are scoped to the request that loaded them instead of persisting in the transcript.
+- Over-long tool output keeps its **head and tail** — for `npm install` or a test run the verdict is
+  in the last lines, and head-only truncation hid it, costing a follow-up call to find it.
+- Compaction triggers off the provider's real token count rather than a chars/4 estimate, and its
+  summariser keeps both ends of the transcript (the tail alone lost the user's original goal).
+
+### Removed — `--strategy multi`
+It never reduced cost. On the same task it used **29x** the input tokens of plain `react`, and only
+looked cheaper because workers ran on a model cheap enough to absorb the extra work; on the user's own
+model it cost 2x `react` for worse output. Splitting one cohesive artifact along file lines leaves
+nobody holding the whole design — the worker owning `script.js` wrote 5,096 bytes for a page that
+needed 1,154, while the page lost gradients, an animation and a section. An unknown strategy falls
+back to `react`, so existing scripts keep working.
+
+Delegation itself stays: `spawn_agent` / `background_task` on a configurable cheap model
+(`settings.subagentModel` / `ADA_SUBAGENT_MODEL`), each worker isolated in its own git worktree, with
+a 50k prompt-token budget (`ADA_WORKER_BUDGET`).
+
 ### Added — built-in PPTX generation
 - **`generate_pptx` tool.** ada can now produce a real, editable PowerPoint deck with zero external
   dependencies — no Python, no npm. The model emits structured JSON (slides with titles, subtitles,
