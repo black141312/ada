@@ -65,8 +65,9 @@ for (const model of ["anthropic/claude-opus-4.7", "claude-opus-4-7"]) {
   assert.equal(out.messages[0].content[0].text, "hi", "normalising to blocks lost the text");
 }
 
-// The marker lands on the last user/assistant turn — never on a tool message, whose content shape
-// maps to tool_result upstream.
+// The breakpoint goes on the SECOND-to-last user/assistant turn. The last one may be per-turn
+// guidance that differs every request — anchoring there would write a new cache entry each time and
+// never read one. Never on a tool message either: its content maps to tool_result upstream.
 const loop = markCacheable({
   model: "anthropic/claude-opus-4.7",
   messages: [
@@ -74,13 +75,17 @@ const loop = markCacheable({
     { role: "user", content: "do it" },
     { role: "assistant", content: "working", tool_calls: [{ id: "t1", function: { name: "ls", arguments: "{}" } }] },
     { role: "tool", tool_call_id: "t1", content: "a\nb" },
-    { role: "system", content: "per-turn extras" },
+    { role: "user", content: "per-turn hint" },
   ],
 });
-assert.ok(!cached(loop.messages[0]), "system prompt must not be marked (it changes every turn)");
+assert.ok(!cached(loop.messages[0]), "system prompt must not be marked");
 assert.ok(!cached(loop.messages[3]), "tool messages must never be marked");
-assert.ok(!cached(loop.messages[4]), "trailing system extras must not be marked");
-assert.ok(cached(loop.messages[2]), "the last assistant turn should carry the breakpoint");
+assert.ok(!cached(loop.messages[4]), "the newest turn may be transient — it must not be the anchor");
+assert.ok(cached(loop.messages[2]), "the second-to-last turn should carry the breakpoint");
+
+// With only one turn to work with, fall back to marking it — better than no caching at all.
+const first = markCacheable({ model: "anthropic/claude-opus-4.7", messages: [{ role: "system", content: "sys" }, { role: "user", content: "hello" }] });
+assert.ok(cached(first.messages[1]), "a single turn should still be marked");
 
 // Degenerate shapes must not throw — this runs on every single request.
 for (const messages of [[], [{ role: "system", content: "only system" }], [{ role: "assistant", content: null, tool_calls: [] }]]) {

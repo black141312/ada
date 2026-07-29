@@ -881,13 +881,21 @@ export class Agent {
       ? [] // no file edits, shell or search needed to say hello back
       : this.apiTools.filter((t) => !("function" in t) || !lazyNames.has(t.function.name) || allowed.has(t.function.name));
 
-    const extras: string[] = [];
+    // Stable and transient extras are sent SEPARATELY, and that separation is what makes caching
+    // possible at all. Anthropic folds every system message into one parameter which sits ahead of
+    // the whole transcript — so a single per-turn byte in there changes the prefix and invalidates
+    // everything behind it. Previously the repo map and the per-turn hints shared one system
+    // message, so the cache could never hit twice in a session.
+    //   system  ← repo map only. Identical every turn, so the prefix holds.
+    //   user    ← per-turn hints. Last message, AFTER the cache breakpoint, so it costs its own
+    //             tokens and nothing else's.
+    const stable: Msg[] = [];
     if (this.project && !smallTalk) {
       this.brain ??= brainNote(); // built once per session, reused every request
-      if (this.brain) extras.push(this.brain);
+      if (this.brain) stable.push({ role: "system", content: this.brain });
     }
-    if (note) extras.push(note);
-    const sendMessages: Msg[] = extras.length ? [...this.messages, { role: "system", content: extras.join("\n\n") }] : this.messages;
+    const transient: Msg[] = note ? [{ role: "user", content: note }] : [];
+    const sendMessages: Msg[] = stable.length || transient.length ? [...this.messages, ...stable, ...transient] : this.messages;
 
     let overflowRetried = false;
     for (;;) {
