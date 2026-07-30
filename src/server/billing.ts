@@ -118,5 +118,5 @@ export async function completeCheckout(id: string): Promise<boolean> {
  *  in production and the same machine in development. */
 export function checkoutUrl(id: string): string {
   const base = (process.env.ADA_SITE_URL ?? "https://adacodelabs.com").replace(/\/$/, "");
-  return `${base}/upgrade.html?s=${encodeURIComponent(id)}`;
+  return `${base}/upgrade?s=${encodeURIComponent(id)}`;
 }
