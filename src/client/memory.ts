@@ -229,7 +229,15 @@ export function rememberFact(input: { text: string; scope?: MemScope; type?: Mem
   }
   raw.push(m);
   writeScope(scope, raw);
+  try { onRemember?.(m.text); } catch { /* extraction is best-effort; a hook error never breaks remembering */ }
   return { ok: true, memory: m, superseded: supersededId };
+}
+
+// Optional side-effect run after each NEW fact is stored (the knowledge graph wires extraction here).
+// A hook — not a direct import — keeps this module pure and offline-testable; default null = no-op.
+let onRemember: ((fact: string) => void) | null = null;
+export function setFactExtractor(fn: ((fact: string) => void) | null): void {
+  onRemember = fn;
 }
 
 function inferScope(text: string): MemScope {
@@ -266,7 +274,7 @@ export function lastInjected(): { id: string; score: number }[] {
 
 /** The auto-recall block for a turn: pinned + small user-core facts always, then the highest-ranked
  *  relevant facts up to the budget. Null when nothing clears the floor (an off-topic turn = no cost). */
-export function recallBlock(query: string, includeProject: boolean): string | null {
+function memoryBlock(query: string, includeProject: boolean): string | null {
   const mems = loadMemories(includeProject);
   if (!mems.length) return null;
   const pinned = mems.filter((m) => m.pin);
@@ -298,6 +306,21 @@ export function recallBlock(query: string, includeProject: boolean): string | nu
     return `- ${c.m.text}${tail}`;
   });
   return `Relevant memories (auto-recalled from earlier sessions; use if helpful, ignore if not):\n${lines.join("\n")}`;
+}
+
+// Optional recall augmenter — the knowledge graph surfaces related facts here. A hook, not a direct
+// import, so memory.ts stays pure and offline-testable; default null = flat recall only.
+let recallAugment: ((query: string, includeProject: boolean) => string | null) | null = null;
+export function setRecallAugmenter(fn: ((query: string, includeProject: boolean) => string | null) | null): void {
+  recallAugment = fn;
+}
+
+/** Auto-recall for a turn: the relevant flat facts, plus any related facts the graph surfaces. */
+export function recallBlock(query: string, includeProject: boolean): string | null {
+  const mem = memoryBlock(query, includeProject);
+  const graph = recallAugment?.(query, includeProject) ?? null;
+  if (!mem && !graph) return null;
+  return [mem, graph].filter(Boolean).join("\n\n");
 }
 
 // ---- edit / forget / pin / consolidate ----
