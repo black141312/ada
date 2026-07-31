@@ -19,6 +19,7 @@ import { getCommands, loadExtensions } from "./extensions.ts";
 import { registerTool, setAsker } from "./tools.ts";
 import { addRemoteSkill, loadSkills, registerSkillTool } from "./skills.ts";
 import { memoryCommand, registerMemoryTools } from "./memory.ts";
+import { wireGraphMemory } from "./graph.ts";
 import { addConnector, addCustomServer, configuredServers, listConnectors, loadMcpServers, removeConnector } from "./mcp.ts";
 import { addExtension, selfUpdate } from "./pkg.ts";
 import { runTui } from "./tui-mode.ts";
@@ -809,6 +810,7 @@ async function main(): Promise<void> {
     console.log(`ada ${adaVersion()}`);
     return;
   }
+  wireGraphMemory(); // remembered facts auto-extract into the temporal knowledge graph
   if (sub === "login" || sub === "logout") {
     await authCommand(sub, process.argv[3]);
     return;
