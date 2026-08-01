@@ -25,6 +25,7 @@ assert.deepEqual(
   lazy.sort(),
   [
     "browser",
+    "convert_image",
     "create_page",
     "generate_docx",
     "generate_image",

@@ -58,6 +58,7 @@
     "typecheck:worker": "tsc -p src/worker/tsconfig.json --noEmit",
     "selfcheck": "tsx src/selfcheck.ts",
     "bench:swebench": "node bench/swebench.mjs",
+    "bench:arcagi3": "node bench/arcagi3.mjs",
     "catalog:refresh": "node scripts/refresh-catalog.mjs",
     "release": "node scripts/release.mjs"
   },
@@ -74,7 +75,8 @@
     "tsx": "^4.22.4"
   },
   "optionalDependencies": {
-    "node-pty": "^1.1.0"
+    "node-pty": "^1.1.0",
+    "sharp": "^0.34.5"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260702.1",
