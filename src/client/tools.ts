@@ -1359,6 +1359,70 @@ export const tools: Tool[] = [
     },
   },
   {
+    name: "convert_image",
+    lazy: true,
+    description:
+      "Convert or resize an existing image file. Reads jpeg, png, webp, tiff, gif, svg, heic/heif; writes jpeg, png, webp, tiff, gif, avif. Use this for 'svg to png', 'heic to jpg', 'make this smaller', or changing format. Cannot write SVG — vector output would mean redrawing the image, not converting it.",
+    parameters: {
+      type: "object",
+      properties: {
+        from: { type: "string", description: "Path to the existing image to read." },
+        to: { type: "string", description: "Output path. The extension decides the format (.png, .jpg, .webp, .avif, .tiff, .gif)." },
+        width: { type: "number", description: "Optional width in pixels. Height follows automatically unless given." },
+        height: { type: "number", description: "Optional height in pixels." },
+        quality: { type: "number", description: "1-100 for lossy formats (jpeg/webp/avif). Default 90." },
+      },
+      required: ["from", "to"],
+      additionalProperties: false,
+    },
+    needsApproval: true,
+    async run(args) {
+      const from = resolve(process.cwd(), String(args.from));
+      const to = resolve(process.cwd(), String(args.to));
+      const ext = to.slice(to.lastIndexOf(".") + 1).toLowerCase();
+      const OUT: Record<string, string> = { png: "png", jpg: "jpeg", jpeg: "jpeg", webp: "webp", avif: "avif", tiff: "tiff", tif: "tiff", gif: "gif" };
+      if (!existsSync(from)) return { output: `convert_image: no such file: ${args.from}`, isError: true };
+      if (!OUT[ext]) {
+        // Name the reason. "svg" lands here a lot, and "unsupported" alone reads as a bug.
+        const why = ext === "svg" ? "SVG output would mean redrawing the image, not converting it" : `unknown output format '.${ext}'`;
+        return { output: `convert_image: ${why}. Supported: ${[...new Set(Object.keys(OUT))].join(", ")}`, isError: true };
+      }
+      return withFileLock(to, async () => {
+        if (isProtected(to)) return { output: `Refused: ${args.to} is a protected path.`, isError: true };
+        try {
+          // Loaded on demand: sharp carries a ~20MB native binary, and most sessions never convert
+          // an image. A static import would pay that cost on every single agent start.
+          const { default: sharp } = await import("sharp");
+          let img = sharp(from);
+          if (args.width || args.height) {
+            img = img.resize(
+              args.width ? Number(args.width) : null,
+              args.height ? Number(args.height) : null,
+              { fit: "inside", withoutEnlargement: false },
+            );
+          }
+          const q = args.quality ? Number(args.quality) : 90;
+          const fmt = OUT[ext]!;
+          img = (img as unknown as Record<string, (o?: unknown) => typeof img>)[fmt]!(
+            fmt === "png" || fmt === "tiff" || fmt === "gif" ? undefined : { quality: q },
+          );
+          checkpoint.record(to);
+          mkdirSync(dirname(to), { recursive: true });
+          const info = await img.toFile(to);
+          return { output: `Converted → ${relative(process.cwd(), to)} (${info.width}x${info.height}, ${info.size} bytes)` };
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          // sharp missing is the one failure a user can act on, so say so plainly instead of
+          // surfacing a raw module-not-found stack.
+          if (/Cannot find module|MODULE_NOT_FOUND/i.test(msg)) {
+            return { output: "convert_image: image support isn't installed in this build.", isError: true };
+          }
+          return { output: `convert_image: ${msg}`, isError: true };
+        }
+      });
+    },
+  },
+  {
     name: "lsp_diagnostics",
     description: "Get language-server diagnostics (errors/warnings) for a file — call after editing to check it compiles/type-checks. Needs the language server installed (typescript-language-server, pyright, gopls, rust-analyzer) in a trusted project.",
     parameters: {
