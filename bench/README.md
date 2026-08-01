@@ -135,6 +135,9 @@ node bench/arcagi3.mjs --model gpt-... --games ls20-016295f7601e --steps 100
 Flags: `--model` (required, any id ada routes), `--games a,b`, `--limit N` games, `--steps N` actions
 per game (default 200), `--out <dir>`, `--timeout` seconds ada gets per game (default 3600), `--tag`.
 
+Two flags change what the model sees, and both apply to `--model-only`: `--image` sends the frame as
+a PNG instead of hex rows, and `--rules` is described below.
+
 Each game gets its own directory (`runs/arc/<game_id>/`) — that's ada's workspace, and it's where its
 `notes.md` and any scratch scripts end up, next to `arc-session.json` (live game state) and
 `steps.jsonl` (one line per action). `runs/arc/summary.json` has the per-game result plus the closed
@@ -160,6 +163,31 @@ ada's loop is actually worth:
 ```bash
 node bench/arcagi3.mjs --model-only --model claude-opus-4-8 --out runs/arc-baseline --limit 1
 ```
+
+## Rules mode
+
+`--rules` replaces "remember your own reasoning" with "keep a list". After each move the model
+rewrites a short list of what it has learned, labelled `+` (holds), `-` (fails or wastes a move) and
+`?` (suspected, untested). That list is the *only* thing carried between moves.
+
+```bash
+node bench/arcagi3.mjs --rules --model-only --model claude-opus-4-8 --out runs/arc-rules
+```
+
+The point is cost. Replaying retained reasoning to keep a model's train of thought runs to ~100k
+tokens by late game; a rule list is ~200, and it needs nothing beyond plain chat completions. It is
+also closer to how a person plays — you remember that the wall kills you, not the sentence you
+thought when it did.
+
+Re-labelling replaces a rule, so the model can promote a `?` it confirmed or demote a `+` that broke.
+The list is capped, which forces it to drop rules rather than accumulate them.
+
+The harness also tells it, every turn, how many cells its last move changed. **Zero changed cells is
+the single most useful fact in the game** — the move was legal but the game ignored it — and asking a
+model to notice that by diffing two 64×64 grids unaided wastes the attention on bookkeeping.
+
+Worth comparing against a plain `--model-only` run on the same games: the difference is what the
+notes are worth, separately from what the agent loop is worth.
 
 ## Comparing runs
 

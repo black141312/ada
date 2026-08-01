@@ -69,6 +69,7 @@ export function parseArgs(argv) {
     else if (a === "--timeout") f.timeout = Number(argv[++i]);
     else if (a === "--tag") f.tag = argv[++i];
     else if (a === "--image") f.image = true;
+    else if (a === "--rules") f.rules = true;
   }
   return f;
 }
@@ -252,6 +253,76 @@ ${acts.map((a) => `- ${a}`).join("\n")}
 
 Work out what changed since your last action and what the game seems to reward, then answer with the
 action on the FINAL line, alone, exactly in one of the legal forms above. No other text on that line.`;
+}
+
+// --- rules mode ---------------------------------------------------------------------------
+// Instead of replaying the model's own past thinking (expensive, and not how anyone actually plays),
+// carry forward a short list of learned rules labelled by outcome. A rule list is ~200 tokens where
+// a retained-reasoning transcript is ~100,000, and it needs nothing the Chat Completions API can't do.
+
+/** Rules the model wrote, as `+ / - / ?` lines. Last mention of a rule wins, so the model can
+ *  re-label something it previously got wrong. Capped so the prompt can't grow without bound. */
+export function parseRules(text, max = 24) {
+  const seen = new Map();
+  for (const line of String(text ?? "").split("\n")) {
+    const m = /^\s*([+\-?])\s+(\S.{2,158})\s*$/.exec(line);
+    if (!m) continue;
+    const body = m[2].trim();
+    seen.delete(body.toLowerCase()); // re-inserting moves it to the end, keeping recency
+    seen.set(body.toLowerCase(), `${m[1]} ${body}`);
+  }
+  return [...seen.values()].slice(-max);
+}
+
+/** The feedback the harness owes the model after every move. Without this it has to spot the
+ *  difference between two 64x64 grids unaided — which is the job, but it shouldn't be guesswork
+ *  about whether anything happened at all. */
+export function describeOutcome(prev, next, changed) {
+  if (!prev) return "This is the first move of the game.";
+  const bits = [];
+  if ((next.levels_completed ?? 0) > (prev.levels_completed ?? 0))
+    bits.push(
+      `LEVEL COMPLETE — you are now on level ${next.levels_completed}. Whatever you just did was right.`,
+    );
+  if (next.state === "GAME_OVER")
+    bits.push("YOU DIED. That line of play is bad — the run resets.");
+  bits.push(
+    changed === 0
+      ? "Your last move changed NOTHING on the board. The game ignored it — that exact move is not useful here."
+      : `Your last move changed ${changed} cells.`,
+  );
+  return bits.join(" ");
+}
+
+export function buildRulesPrompt(o) {
+  const acts = (o.availableActions ?? []).map((n) =>
+    n === 6 ? "ACTION6 x=<0-63> y=<0-63>  (click a cell)" : `ACTION${n}`,
+  );
+  return `You are playing an ARC-AGI-3 game. Nobody will tell you the rules; you work them out by playing.
+
+You do NOT get to see your earlier thinking. Instead you keep a rules list, and it is the only thing
+that survives between moves. Rewrite it every turn — it is your memory.
+
+Rules you have written so far:
+${o.rules?.length ? o.rules.join("\n") : "(empty — this is the start)"}
+
+${o.outcome}
+
+Current frame${o.asImage ? " (attached image, 64x64 cells at 8 pixels per cell)" : ""}: level ${o.levels ?? 0} of ${o.winLevels ?? "?"} · move ${o.step} of ${o.maxSteps}
+${o.asImage ? "" : `\n${renderGrid(o.grid)}\n`}
+Legal actions:
+${acts.map((a) => `- ${a}`).join("\n")}
+
+Reply in exactly this shape:
+
++ a rule that is confirmed to work
+- a rule about something that fails, or is wasted
+? something you suspect but have not tested, and that would cost you to test
+ACTION<n>
+
+Keep the list short and specific — drop rules that turned out wrong rather than keeping them.
+Prefer a move your + rules predict will work. If nothing predicts, pick the ? that teaches you most
+for the least risk. The FINAL line must be the action alone, nothing else.`;
 }
 
 export function parseAction(text, available, step = 0) {
@@ -565,6 +636,9 @@ async function playAsModel(gameId, f, key, cardId, cookies) {
     body: { game_id: gameId, card_id: cardId },
   });
   const history = [];
+  let rules = []; // --rules: the model's own notes, the only thing carried between moves
+  let prevObs = null;
+  let changed;
   let resets = 0;
   let best = 0;
   let used = 0;
@@ -582,7 +656,7 @@ async function playAsModel(gameId, f, key, cardId, cookies) {
       history.length = 0;
     }
     const grid = latestGrid(obs.frame);
-    const prompt = buildFramePrompt({
+    const shared = {
       grid,
       asImage: !!f.image,
       state: obs.state,
@@ -591,8 +665,14 @@ async function playAsModel(gameId, f, key, cardId, cookies) {
       winLevels: obs.win_levels,
       step,
       maxSteps: f.steps,
-      history: history.slice(-8),
-    });
+    };
+    const prompt = f.rules
+      ? buildRulesPrompt({
+          ...shared,
+          rules,
+          outcome: describeOutcome(prevObs, obs, changed),
+        })
+      : buildFramePrompt({ ...shared, history: history.slice(-8) });
 
     let reply = "";
     let note = "";
@@ -606,11 +686,19 @@ async function playAsModel(gameId, f, key, cardId, cookies) {
     } catch (e) {
       note = `model error: ${e instanceof Error ? e.message : e}`;
     }
+    // Keep the previous list if this reply had none — a turn that forgets to restate the rules
+    // shouldn't wipe the memory.
+    if (f.rules) {
+      const fresh = parseRules(reply);
+      if (fresh.length) rules = fresh;
+    }
     const act = parseAction(reply, obs.available_actions, step);
     const label =
       act.id === 6 ? `ACTION6(${act.x},${act.y})` : `ACTION${act.id}`;
     history.push(label);
 
+    prevObs = obs;
+    const beforeGrid = grid;
     obs = await arc(`/api/cmd/ACTION${act.id}`, {
       key,
       cookies,
@@ -625,11 +713,12 @@ async function playAsModel(gameId, f, key, cardId, cookies) {
         },
       },
     });
+    changed = countChanged(beforeGrid, latestGrid(obs.frame));
     used = step;
     best = Math.max(best, obs.levels_completed ?? 0);
     appendFileSync(
       logPath,
-      `${JSON.stringify({ step, action: label, fallback: act.fallback || undefined, state: obs.state, levels_completed: obs.levels_completed, note: note || undefined })}\n`,
+      `${JSON.stringify({ step, action: label, changed, fallback: act.fallback || undefined, state: obs.state, levels_completed: obs.levels_completed, rules: f.rules ? rules.length : undefined, note: note || undefined })}\n`,
     );
     if (step % 10 === 0 || obs.state !== "NOT_FINISHED") {
       console.error(
@@ -912,6 +1001,77 @@ function runSelftest() {
   assert.ok(
     /nobody will tell you the rules/i.test(ap),
     "agent prompt sets the discovery task",
+  );
+
+  const r1 = parseRules(
+    "noise\n+ clicking a tile toggles it\n- clicking the border does nothing\n? the bar may be a timer\nACTION3",
+  );
+  assert.deepEqual(r1, [
+    "+ clicking a tile toggles it",
+    "- clicking the border does nothing",
+    "? the bar may be a timer",
+  ]);
+  assert.deepEqual(
+    parseRules("? the bar may be a timer\n+ the bar may be a timer"),
+    ["+ the bar may be a timer"],
+    "a re-labelled rule replaces the old label rather than appearing twice",
+  );
+  assert.equal(parseRules("no rules here at all").length, 0);
+  assert.equal(
+    parseRules(
+      Array.from({ length: 50 }, (_, i) => `+ rule ${i}`).join("\n"),
+      24,
+    ).length,
+    24,
+    "rule list is capped",
+  );
+
+  assert.match(describeOutcome(null, {}, undefined), /first move/);
+  assert.match(
+    describeOutcome(
+      { levels_completed: 0 },
+      { levels_completed: 0, state: "NOT_FINISHED" },
+      0,
+    ),
+    /changed NOTHING/,
+  );
+  assert.match(
+    describeOutcome(
+      { levels_completed: 0 },
+      { levels_completed: 1, state: "NOT_FINISHED" },
+      12,
+    ),
+    /LEVEL COMPLETE/,
+  );
+  assert.match(
+    describeOutcome(
+      { levels_completed: 1 },
+      { levels_completed: 1, state: "GAME_OVER" },
+      5,
+    ),
+    /YOU DIED/,
+  );
+
+  const rp = buildRulesPrompt({
+    grid: [[1]],
+    rules: ["+ a"],
+    outcome: "x",
+    availableActions: [6],
+    step: 2,
+    maxSteps: 9,
+  });
+  assert.ok(
+    rp.includes("+ a") && rp.includes("ACTION6 x="),
+    "rules prompt carries the list and the legal actions",
+  );
+  assert.ok(
+    buildRulesPrompt({
+      grid: [[1]],
+      rules: [],
+      outcome: "x",
+      availableActions: [1],
+    }).includes("(empty"),
+    "empty list is stated, not blank",
   );
 
   const png = pngFromGrid(
