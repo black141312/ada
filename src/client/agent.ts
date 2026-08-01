@@ -119,9 +119,12 @@ function systemPrompt(includeProject: boolean): string {
 // asking for a slide deck must not also drag in the notebook and browser schemas.
 export const LAZY_GATES: { tools: string[]; intent: RegExp }[] = [
   {
-    tools: ["generate_pptx", "generate_docx", "generate_image"],
+    tools: ["generate_pptx", "generate_docx", "generate_image", "convert_image"],
+    // svg/webp/heic/ico/resize/convert added so "convert this svg to png" or "make the logo
+    // smaller" reaches convert_image. Without them the tool stays hidden and the model, seeing no
+    // way to do it, tends to claim it can't read your files at all.
     intent:
-      /\b(deck|slides?|presentation|powerpoint|ppts?x?|keynote|docx|word (?:doc\w*|file)|document|report|write-?up|whitepaper|proposal|image|picture|png|jpe?g|illustration|artwork|diagram|mockup|thumbnail|cover art|infographic)\b/i,
+      /\b(deck|slides?|presentation|powerpoint|ppts?x?|keynote|docx|word (?:doc\w*|file)|document|report|write-?up|whitepaper|proposal|image|picture|png|jpe?g|svg|webp|avif|heics?|heif|tiff?|ico|favicon|logo|resize|convert|compress|illustration|artwork|diagram|mockup|thumbnail|cover art|infographic)\b/i,
   },
   {
     tools: ["create_page"],

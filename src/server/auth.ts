@@ -1,18 +1,25 @@
 // Better Auth — accounts, sessions, API keys (seat keys), device flow for CLI/IDE sign-in.
 // Self-hosted on SQLite (ada-auth.db next to the repo); social providers activate only when
 // their env creds are present. Docs: https://www.better-auth.com
+import { createRequire } from "node:module";
 import { betterAuth } from "better-auth";
 import { bearer, deviceAuthorization } from "better-auth/plugins";
-import Database from "better-sqlite3";
+import type Database from "better-sqlite3";
 import { Pool } from "pg";
 
 // Storage: a hosted Postgres (Supabase) when DATABASE_URL is set — makes the backend STATELESS, so it
 // runs on any serverless/container host without a persistent disk. Falls back to local SQLite for dev.
 // Exported so the allowlist can live in the same store (Postgres in prod, SQLite in dev).
 export const usingPostgres = !!process.env.DATABASE_URL;
+// better-sqlite3 is native, so a STATIC import loads its .node the moment this module is imported —
+// even on Postgres, where it is never used. The desktop app runs the agent under Electron's bundled
+// Node, whose ABI differs from the system Node that built it, so that load threw and took the whole
+// agent down. Required only on the branch that actually needs it, as graph.ts already does.
 export const authDatabase = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
-  : new Database(process.env.ADA_AUTH_DB ?? "ada-auth.db");
+  : new (createRequire(import.meta.url)("better-sqlite3") as typeof Database)(
+      process.env.ADA_AUTH_DB ?? "ada-auth.db",
+    );
 
 const socialProviders: Record<string, { clientId: string; clientSecret: string }> = {};
 if (process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET) {
