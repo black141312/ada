@@ -11,7 +11,8 @@ import { adminUsers, verifyIdentity } from "./identity.ts";
 import { addAllowed, isAllowedUser, listAllowed, removeAllowed } from "./allowlist.ts";
 import { recordUsage, usageSince } from "./usage.ts";
 import { billingWebhookImplemented, checkEntitlement, PLANS, planFor, periodStart, setPlan, type PlanName } from "./plans.ts";
-import { checkoutUrl, createCheckout, getCheckout } from "./billing.ts";
+import { checkoutUrl, createCheckout, getCheckout, setCheckoutPlan } from "./billing.ts";
+import { createKelviqCheckout, getKelviqCatalog, handleKelviqWebhook, kelviqEnabled, verifyKelviqSignature, type KelviqEvent } from "./kelviq.ts";
 
 /** The anonymous free-tier pseudo-identity — no account, so nothing to meter or bill. */
 const isAnonymous = (who: Identity): boolean => who.user === "anon" && String(who.role) === "free";
@@ -421,11 +422,89 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       res.writeHead(200, { "content-type": "text/plain" });
       return res.end("ada backend ok");
     }
+    // The website is a different origin and reads the public billing routes from the browser
+    // (plan catalog, session status, purchase). CORS opens exactly those routes — they carry no
+    // bearer credential by design, so "*" widens nothing. Authenticated APIs stay CORS-closed.
+    if (url.pathname.startsWith("/v1/billing/")) {
+      res.setHeader("access-control-allow-origin", "*");
+      res.setHeader("access-control-allow-headers", "content-type");
+      res.setHeader("access-control-allow-methods", "GET, POST, OPTIONS");
+      if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        return res.end();
+      }
+    }
     // Pre-auth login routes (a locked backend must still let a new user authenticate).
     if (req.method === "GET" && url.pathname === "/v1/auth/methods") return await handleAuthMethods(res);
     if (req.method === "POST" && url.pathname === "/v1/auth/oidc/exchange") return await handleOidcExchange(req, res);
     // Better Auth: accounts, sessions, social login, API keys, device flow.
     if (url.pathname.startsWith("/api/auth")) return betterAuthHandler(req, res);
+    // The public plan catalog. PRE-AUTH: it powers the website's pricing/upgrade pages, which are
+    // static and unauthenticated. With Kelviq configured, plans and prices come from the Kelviq
+    // dashboard (edit there, live within a minute); PLANS in code stays the quota truth per tier.
+    if (req.method === "GET" && url.pathname === "/v1/billing/plans") {
+      if (!kelviqEnabled()) {
+        const plans = (Object.keys(PLANS) as PlanName[]).map((p) => ({
+          plan: p,
+          kelviqPlan: null,
+          label: PLANS[p].label,
+          models: PLANS[p].models,
+          monthlyTokens: PLANS[p].monthlyTokens,
+          prices: null,
+        }));
+        return json(res, 200, { source: "static", currency: "USD", symbol: "$", plans });
+      }
+      try {
+        const c = await getKelviqCatalog();
+        const plans = c.plans.map((k) => ({
+          plan: k.plan,
+          kelviqPlan: k.identifier,
+          label: k.name,
+          models: PLANS[k.plan].models,
+          monthlyTokens: PLANS[k.plan].monthlyTokens,
+          prices: k.prices,
+        }));
+        return json(res, 200, { source: "kelviq", currency: c.currency, symbol: c.symbol, plans });
+      } catch (e) {
+        return json(res, 502, { error: { message: `plan catalog unavailable: ${e instanceof Error ? e.message : e}` } });
+      }
+    }
+    // Pick a plan on a pending session → the hosted payment URL. PRE-AUTH like the session read:
+    // the 256-bit session id is the authorization, and this is the only thing it authorizes.
+    const purchase = url.pathname.match(/^\/v1\/billing\/checkout\/([^/]+)\/purchase$/);
+    if (req.method === "POST" && purchase) {
+      const s = await getCheckout(decodeURIComponent(purchase[1]!));
+      if (!s) return json(res, 404, { error: { message: "unknown or invalid checkout session" } });
+      if (s.status !== "pending") return json(res, 410, { error: { message: `this upgrade link is ${s.status}` } });
+      if (!kelviqEnabled()) return json(res, 501, { error: { message: "payments not configured on this server" } });
+      let b: { plan?: string; chargePeriod?: string };
+      try {
+        b = JSON.parse(await readBody(req));
+      } catch {
+        return json(res, 400, { error: { message: "invalid JSON body" } });
+      }
+      try {
+        const catalog = await getKelviqCatalog();
+        // Accept either our tier name ("pro") or Kelviq's identifier ("pro-monthly").
+        const want = String(b.plan ?? s.plan);
+        const target = catalog.plans.find((k) => k.identifier === want) ?? catalog.plans.find((k) => k.plan === want);
+        if (!target || target.plan === "free") return json(res, 400, { error: { message: `pick a paid plan from the catalog` } });
+        if (target.plan !== s.plan) await setCheckoutPlan(s.id, target.plan);
+        const back = checkoutUrl(s.id);
+        const co = await createKelviqCheckout({
+          kelviqPlan: target.identifier,
+          user: s.user,
+          sessionId: s.id,
+          successUrl: `${back}&paid=1`,
+          cancelUrl: back,
+          chargePeriod: typeof b.chargePeriod === "string" ? b.chargePeriod : undefined,
+        });
+        appendAudit({ ts: Date.now(), user: s.user, event: "checkout_payment_started", detail: `${target.identifier} (${target.plan})` });
+        return json(res, 200, { url: co.checkoutUrl });
+      } catch (e) {
+        return json(res, 502, { error: { message: e instanceof Error ? e.message : String(e) } });
+      }
+    }
     // Read a checkout session. PRE-AUTH deliberately: the website that renders it is static and has
     // no credential. Safe because the id is 256 bits of randomness and reading it reveals only the
     // plan being bought — it grants no API access and can't be replayed once spent.
@@ -450,6 +529,28 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     // on billingWebhookImplemented). 501 rather than 404 so a misconfigured provider fails loudly
     // instead of looking like a typo'd URL.
     if (url.pathname === "/v1/billing/webhook") {
+      if (kelviqEnabled() && process.env.KELVIQ_WEBHOOK_SECRET) {
+        if (req.method !== "POST") return json(res, 405, { error: { message: "POST only" } });
+        const raw = await readBody(req);
+        const ok = verifyKelviqSignature(
+          {
+            id: String(req.headers["webhook-id"] ?? ""),
+            timestamp: String(req.headers["webhook-timestamp"] ?? ""),
+            signature: String(req.headers["webhook-signature"] ?? ""),
+          },
+          raw,
+        );
+        if (!ok) return json(res, 401, { error: { message: "invalid webhook signature" } });
+        let evt: KelviqEvent;
+        try {
+          evt = JSON.parse(raw) as KelviqEvent;
+        } catch {
+          return json(res, 400, { error: { message: "invalid JSON" } });
+        }
+        const outcome = await handleKelviqWebhook(evt);
+        if (outcome) appendAudit({ ts: Date.now(), user: "kelviq", event: "billing_webhook", detail: outcome });
+        return json(res, 200, { received: true });
+      }
       if (!billingWebhookImplemented()) {
         return json(res, 501, { error: { message: "billing webhook not implemented — set plans via POST /v1/plans until a payment provider is wired" } });
       }
