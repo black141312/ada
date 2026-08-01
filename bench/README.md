@@ -86,3 +86,133 @@ tests, and reports the **resolved rate** plus a per-instance breakdown.
 ```bash
 node bench/swebench.mjs --selftest     # offline: validates the prompt/prediction/arg helpers
 ```
+
+---
+
+# Benchmarking ada on ARC-AGI-3
+
+[ARC-AGI-3](https://docs.arcprize.org/) is interactive, not a dataset: you see a 64×64 grid frame and
+pick one action per turn until you win or die, and **nobody tells you the rules** — working them out
+is the benchmark.
+
+ada plays it as an agent. The harness opens a game session, then hands ada *this same file* as a CLI
+it drives with its `bash` tool. Every action, every frame, and every hypothesis lives in ada's own
+loop: it takes notes, writes throwaway scripts to diff frames, and resets after a death, all in one
+context. Scoring is the official **scorecard** — we open one, play, close it, print the card URL.
+
+```
+ scorecard/open ──▶ RESET ──▶ ada -p  ⇄  node bench/arcagi3.mjs play ACTIONn  ──▶ scorecard/close
+                              (agent loop, tools, notes)   (arc-session.json)      (official score)
+```
+
+We talk REST directly instead of installing the [`arc-agi` Python SDK](https://docs.arcprize.org/toolkit/overview)
+— it's five endpoints and this is a Node repo. The SDK is still the better choice if you want to edit
+or author games locally.
+
+## Prerequisites
+
+- **ada-server running with provider keys** (same as SWE-bench).
+- **An ARC API key** from the [ARC-AGI-3 console](https://three.arcprize.org) — see
+  [docs.arcprize.org/api-keys](https://docs.arcprize.org/api-keys).
+
+## Run it
+
+```bash
+export ARC_API_KEY=...
+export ANTHROPIC_API_KEY=sk-ant-...   # and/or OPENAI_API_KEY, etc.
+ada-server &
+
+# smoke test: one game, 50 actions
+node bench/arcagi3.mjs --model claude-opus-4-8 --out runs/arc --limit 1 --steps 50
+
+# every public game, 200 actions each
+node bench/arcagi3.mjs --model claude-opus-4-8 --out runs/arc
+
+# one specific game
+node bench/arcagi3.mjs --model gpt-... --games ls20-016295f7601e --steps 100
+```
+
+Flags: `--model` (required, any id ada routes), `--games a,b`, `--limit N` games, `--steps N` actions
+per game (default 200), `--out <dir>`, `--timeout` seconds ada gets per game (default 3600), `--tag`.
+
+Each game gets its own directory (`runs/arc/<game_id>/`) — that's ada's workspace, and it's where its
+`notes.md` and any scratch scripts end up, next to `arc-session.json` (live game state) and
+`steps.jsonl` (one line per action). `runs/arc/summary.json` has the per-game result plus the closed
+scorecard; the card URL prints on stderr.
+
+## Playing it yourself
+
+The CLI ada drives is just a CLI — run it from a game dir to watch or take over:
+
+```bash
+node bench/arcagi3.mjs play              # look at the current frame, costs nothing
+node bench/arcagi3.mjs play ACTION3
+node bench/arcagi3.mjs play ACTION6 12 34
+node bench/arcagi3.mjs play RESET        # after a GAME_OVER, costs no actions
+```
+
+## Baseline: model-only
+
+`--model-only` replaces the agent with one raw model call per frame — no tools, no notes, no memory
+beyond the last few actions. Same games, same scorecard, so the gap between the two runs is what
+ada's loop is actually worth:
+
+```bash
+node bench/arcagi3.mjs --model-only --model claude-opus-4-8 --out runs/arc-baseline --limit 1
+```
+
+## Comparing runs
+
+Hold one variable, change the other. Same model in both modes tells you what the agent loop adds;
+same mode across models tells you which model is better at the game.
+
+```bash
+# same model, with and without the agent loop
+node bench/arcagi3.mjs --model gpt-5.6-luna --out runs/luna-agent
+node bench/arcagi3.mjs --model-only --model gpt-5.6-luna --out runs/luna-chat
+
+node bench/arcagi3.mjs compare runs/luna-agent runs/luna-chat
+```
+
+```
+run                mode       model          wins   levels  actions  resets  illegal   score
+runs/luna-agent    ada        gpt-5.6-luna   1/2    10      4        1       1 (20%)   10
+runs/luna-chat     model-only gpt-5.6-luna   0/2    2       2        0       2 (50%)   2
+
+best level reached per game
+game               runs/luna-agent   runs/luna-chat
+dc22-fdcac232                    3                0
+ls20-9607627b                    7                2
+```
+
+`compare` reads `summary.json` and every `steps.jsonl` under each run directory — no live API calls,
+so it's free and re-runnable. Takes any number of directories.
+
+**`illegal` is the column to watch.** It counts moves the game rejected as not currently legal. Those
+cost no budget, so they don't affect the score directly — but a high rate means the model isn't
+tracking which actions are available, which is a prompt problem, not a game-difficulty one. Compare it
+across runs before concluding anything from the score.
+
+ARC also publishes a no-model reference: each game's `baseline_actions` (17,135 actions to clear all
+25 games) is what a scripted reference agent needs *knowing the rules*. Any model discovering them
+blind should be expected to need considerably more.
+
+## Notes & honest caveats
+
+- The frame reaches the model as **hex-digit text rows**, not an image. Cheap and exact; a
+  vision variant is a different setup and worth comparing separately.
+- **Frames are big**: 64×64 is ~4 KB of text per action, so a long game will trip ada's context
+  compaction. That's part of what's being measured — whether the notes survive the compaction.
+- On `GAME_OVER` a `RESET` costs no actions, only the levels you'd re-play. The step budget is
+  enforced server-side by the harness, so ada can't overspend it.
+- Illegal or malformed actions are refused with a message and **cost no budget** — they show up as a
+  non-zero exit, not a wasted turn.
+- Games are stateful behind a load balancer; session cookies persist in `arc-session.json`, so every
+  `play` call resumes the same session.
+- Games run sequentially. Fine for the handful of public games; parallelise if that changes.
+
+## Quick check
+
+```bash
+node bench/arcagi3.mjs --selftest      # offline: grid rendering, prompts, action parsing, budget banners
+```
