@@ -312,12 +312,15 @@ async function main(): Promise<void> {
       delete process.env.ADA_EXTRA_DIRS;
       assert.deepEqual(workspaceDirs(), [process.cwd()], "no extras means just the working directory");
 
-      process.env.ADA_EXTRA_DIRS = ["C:/x/one", "C:/x/two"].join(sep);
+      // Platform-shaped paths: on POSIX the list separator is ":", which is also the character a
+      // Windows drive letter uses — "C:/x" in a colon-separated list is two segments, not one.
+      const [one, two] = process.platform === "win32" ? ["C:/x/one", "C:/x/two"] : ["/x/one", "/x/two"];
+      process.env.ADA_EXTRA_DIRS = [one, two].join(sep);
       assert.equal(workspaceDirs().length, 3, "cwd plus both extras");
 
       // Adding the folder you are already in must not search it twice — the same hits would come
       // back doubled and crowd out everything else.
-      process.env.ADA_EXTRA_DIRS = [process.cwd(), "C:/x/one"].join(sep);
+      process.env.ADA_EXTRA_DIRS = [process.cwd(), one].join(sep);
       assert.equal(workspaceDirs().length, 2, "cwd repeated as an extra is dropped");
 
       process.env.ADA_EXTRA_DIRS = sep + sep;
