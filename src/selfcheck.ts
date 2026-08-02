@@ -303,6 +303,31 @@ async function main(): Promise<void> {
     assert.ok(/claude-opus-4-8/.test(catalogText("anthropic")), "catalogText <provider> lists its models");
   }
 
+  // --- compaction fires at a share of the model's own window, not a flat number ---
+  {
+    const base = { client: {} as never, session: Session.create(), onApprove: async (): Promise<"yes"> => "yes" };
+    const limitFor = (model: string, compactAt?: number) => new Agent({ ...base, model, compactAt }).compactLimit();
+    const { contextOf } = await import("./client/models-dev.ts");
+
+    assert.equal(limitFor("claude-opus-4-5"), 150_000, "200k window -> 150k");
+    assert.equal(limitFor("claude-opus-4-8"), 750_000, "1M window -> 750k, not the old flat 100k");
+    assert.equal(limitFor("no-such-model-xyz"), 100_000, "an uncatalogued model keeps the flat fallback");
+    assert.equal(limitFor("claude-opus-4-5", 42_000), 42_000, "an explicit compactAt always wins");
+
+    // The threshold must stay UNDER the window it came from — the whole point is compacting before
+    // the provider refuses the request, so a share that ever rounded past the window would be worse
+    // than the flat number it replaced.
+    for (const m of ["claude-opus-4-5", "claude-opus-4-8", "gemini-2.5-pro"])
+      assert.ok(limitFor(m) < contextOf(m)!, `${m}: threshold must sit below its own window`);
+
+    // setModel must move it: a session switched onto a smaller window and left on the bigger
+    // threshold would never compact, and would die on the provider's hard limit instead.
+    const a = new Agent({ ...base, model: "claude-opus-4-8" });
+    const big = a.compactLimit();
+    a.setModel("claude-opus-4-5");
+    assert.ok(a.compactLimit() < big, "switching to a smaller window lowers the threshold");
+  }
+
   // --- provider routing (incl. the new cloudflare + groq/together disambiguation) ---
   {
     const { route } = await import("./server/router.ts");
