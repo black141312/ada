@@ -14,7 +14,7 @@ import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { projectRootOf } from "./brain.ts";
-import { workspaceDirs } from "./settings.ts";
+import { ensureAdaDir, workspaceDirs } from "./settings.ts";
 import { LOCAL_MODEL, embedLocal } from "./embed-local.ts";
 
 // Embeddings run LOCALLY by default (in-process, no key/backend — see embed-local.ts). Set
@@ -151,7 +151,7 @@ function loadManifest(root: string): Manifest {
 }
 function saveManifest(root: string, m: Manifest): void {
   try {
-    mkdirSync(adaDir(root), { recursive: true });
+    ensureAdaDir(adaDir(root));
     writeFileSync(manifestPath(root), JSON.stringify(m));
   } catch {
     /* best-effort */
@@ -184,7 +184,7 @@ function compact(root: string, m: Manifest): void {
     f.base = cur;
     cur += n;
   }
-  mkdirSync(adaDir(root), { recursive: true });
+  ensureAdaDir(adaDir(root));
   writeFileSync(blobPath(root), Buffer.from(out.buffer, out.byteOffset, out.byteLength));
   m.used = cur;
   m.dead = 0;
@@ -198,7 +198,7 @@ export async function refreshIndex(root = process.cwd(), onProgress?: (msg: stri
   // Fresh manifest (first run, or format/scheme change) → start the blob clean so old bytes can't leak.
   if (m.used === 0) {
     try {
-      mkdirSync(adaDir(root), { recursive: true });
+      ensureAdaDir(adaDir(root));
       writeFileSync(blobPath(root), Buffer.alloc(0));
     } catch {
       /* best-effort */

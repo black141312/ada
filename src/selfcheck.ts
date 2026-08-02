@@ -303,6 +303,29 @@ async function main(): Promise<void> {
     assert.ok(/claude-opus-4-8/.test(catalogText("anthropic")), "catalogText <provider> lists its models");
   }
 
+  // --- .ada must not litter someone else's repo ---
+  {
+    const { ensureAdaDir } = await import("./client/settings.ts");
+    const tmp = join(tmpdir(), `ada-gitignore-${Date.now()}`);
+    const ada = join(tmp, ".ada");
+    ensureAdaDir(ada);
+    const gi = readFileSync(join(ada, ".gitignore"), "utf8");
+    // The index is over a megabyte. Unignored it shows up in the user's `git status` and is one
+    // `git add .` from being committed into their history.
+    for (const cache of ["index.vec", "index.json", "brain.json", "graph.db"])
+      assert.ok(gi.includes(cache), `.ada/.gitignore must cover ${cache}`);
+    // Self-ignoring, so a .ada holding only caches leaves the repo completely clean.
+    assert.ok(gi.includes(".gitignore"), ".ada/.gitignore must ignore itself");
+    // But memory and skills are the user's, and meant to be committed and shared with the team.
+    assert.ok(!/^memory\/?$/m.test(gi) && !/^skills\/?$/m.test(gi), "memory and skills must stay committable");
+
+    // A second call must not clobber a file the user has edited.
+    writeFileSync(join(ada, ".gitignore"), "# mine\n");
+    ensureAdaDir(ada);
+    assert.equal(readFileSync(join(ada, ".gitignore"), "utf8"), "# mine\n", "an existing .gitignore is left alone");
+    rmSync(tmp, { recursive: true, force: true });
+  }
+
   // --- workspaceDirs: the prompt and the search must agree about which folders exist ---
   {
     const { workspaceDirs } = await import("./client/settings.ts");
