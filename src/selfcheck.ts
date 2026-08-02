@@ -303,6 +303,35 @@ async function main(): Promise<void> {
     assert.ok(/claude-opus-4-8/.test(catalogText("anthropic")), "catalogText <provider> lists its models");
   }
 
+  // --- a bad billing anchor must not switch metering off ---
+  {
+    const { periodStart } = await import("./server/plans.ts");
+    const now = Date.UTC(2026, 7, 2, 12); // 2 Aug 2026
+    const augustFirst = Date.UTC(2026, 7, 1);
+    const plan = (periodStartValue: number | null) =>
+      ({ user: "u", plan: "pro", status: "active", periodStart: periodStartValue }) as never;
+
+    assert.equal(periodStart(plan(null), now), augustFirst, "no anchor means the calendar month");
+
+    // THE ONE THAT MATTERS. A future anchor makes usageSince() look at a window that has not begun:
+    // used reads 0, `used >= limit` never fires, and the account bills nothing forever. Found in
+    // production as 12321313123123 — the year 2360.
+    assert.equal(periodStart(plan(12321313123123), now), augustFirst, "an anchor in the future falls back to the month");
+    assert.ok(periodStart(plan(12321313123123), now) <= now, "a period can never start in the future");
+
+    // Garbage that isn't even a number must not produce NaN, which compares false against everything.
+    assert.equal(periodStart(plan(Number.NaN), now), augustFirst, "NaN falls back to the month");
+
+    // A real anchor still anchors: subscribed on the 20th, so the period runs from the 20th.
+    assert.equal(
+      periodStart(plan(Date.UTC(2026, 5, 20, 9, 30)), now),
+      Date.UTC(2026, 6, 20, 9, 30),
+      "an anchor rolls forward to the period containing now",
+    );
+    // An old anchor rolls forward rather than reaching back years.
+    assert.ok(periodStart(plan(Date.UTC(1970, 4, 23)), now) > Date.UTC(2026, 5, 1), "a 1970 anchor still lands in 2026");
+  }
+
   // --- .ada must not litter someone else's repo ---
   {
     const { ensureAdaDir } = await import("./client/settings.ts");

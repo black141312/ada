@@ -107,17 +107,24 @@ export function effectivePlan(p: UserPlan): PlanDef & { name: PlanName } {
 /** Start of the current billing period. Paid plans anchor to their subscription date so the window
  *  matches what was charged; everyone else gets the UTC calendar month. */
 export function periodStart(p: UserPlan, now = Date.now()): number {
-  if (p.periodStart == null) {
+  const calendarMonth = () => {
     const d = new Date(now);
     return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
-  }
+  };
+  // A period that has not started yet measures usage over an empty window: `used` reads 0, and
+  // `used >= limit` is never true, so the QUOTA SILENTLY STOPS APPLYING. A bad anchor must cost a
+  // reporting inaccuracy, never metering itself. Seen in production — a hand-entered row held
+  // 12321313123123, which is the year 2360, and that account had been unmetered ever since.
+  if (p.periodStart == null || !Number.isFinite(p.periodStart) || p.periodStart > now) return calendarMonth();
   // Roll the anchor forward in whole months until it's the period containing `now`.
   const anchor = new Date(p.periodStart);
   const d = new Date(now);
   let months = (d.getUTCFullYear() - anchor.getUTCFullYear()) * 12 + (d.getUTCMonth() - anchor.getUTCMonth());
   if (d.getUTCDate() < anchor.getUTCDate()) months--;
-  if (months < 0) months = 0; // an anchor in the future: treat the first period as current
-  return Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth() + months, anchor.getUTCDate(), anchor.getUTCHours(), anchor.getUTCMinutes());
+  if (months < 0) months = 0;
+  const start = Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth() + months, anchor.getUTCDate(), anchor.getUTCHours(), anchor.getUTCMinutes());
+  // Belt and braces: month-end anchors (the 31st) can roll into a shorter month and overshoot.
+  return start > now ? calendarMonth() : start;
 }
 
 export interface Entitlement {
