@@ -738,6 +738,33 @@ export const tools: Tool[] = [
     },
   },
   {
+    name: "project_map",
+    description:
+      "File paths and top-level symbols for a FOLDER, the same map you get for the working directory. Use it to orient in another folder of the workspace before searching or reading there.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Absolute path to the folder. Defaults to the working directory." },
+      },
+      additionalProperties: false,
+    },
+    needsApproval: false,
+    async run(args) {
+      const dir = resolve(process.cwd(), String(args.path ?? "."));
+      if (!existsSync(dir)) return { output: `Not found: ${String(args.path ?? ".")}`, isError: true };
+      try {
+        // loadBrain caches to that folder's own .ada/brain.json, so the second call is a file read.
+        // Deliberately on demand: every extra folder's map riding on every turn would cost ~1.5k
+        // tokens each, forever, whether or not the turn had anything to do with that folder.
+        const { loadBrain } = await import("./brain.ts");
+        const map = loadBrain(dir);
+        return { output: map ? truncate(map) : `No mappable source files under ${dir}.` };
+      } catch (e) {
+        return { output: String(e instanceof Error ? e.message : e), isError: true };
+      }
+    },
+  },
+  {
     name: "ls",
     description: "List entries in a directory (directories shown with a trailing slash).",
     parameters: {
@@ -887,10 +914,21 @@ export const tools: Tool[] = [
     needsApproval: false,
     async run(args) {
       try {
-        const { searchCodebase } = await import("./embed-index.ts"); // lazy — only pay for it when used
-        const hits = await searchCodebase(String(args.query), Math.min(Number(args.k) || 6, 20));
+        const { searchWorkspace } = await import("./embed-index.ts"); // lazy — only pay for it when used
+        const { workspaceDirs } = await import("./settings.ts");
+        const roots = workspaceDirs();
+        const hits = await searchWorkspace(String(args.query), Math.min(Number(args.k) || 6, 20), roots);
         if (!hits.length) return { output: "No indexed content matched. Is the repo empty, or all files skipped?" };
-        return { output: hits.map((h) => `${h.file}:${h.start}-${h.end}  (score ${h.score.toFixed(3)})\n${h.snippet}`).join("\n\n---\n\n") };
+        // With more than one folder open a bare relative path is ambiguous — src/auth.ts could be
+        // any of them. The folder is named only when there IS more than one, so the ordinary
+        // single-folder case reads exactly as it did.
+        const label = (h: { root: string; file: string }) =>
+          roots.length > 1 ? `${h.root.split(/[\\/]/).filter(Boolean).pop()}/${h.file}` : h.file;
+        return {
+          output: hits
+            .map((h) => `${label(h)}:${h.start}-${h.end}  (score ${h.score.toFixed(3)})\n${h.snippet}`)
+            .join("\n\n---\n\n"),
+        };
       } catch (e) {
         return { output: String(e instanceof Error ? e.message : e), isError: true };
       }

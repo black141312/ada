@@ -11,7 +11,7 @@ import { type Tool, type ToolResult, isDestructive, toolByName, tools } from "./
 import { afterTool, beforeTool, transformInput } from "./hooks.ts";
 import { configuredServers } from "./mcp.ts";
 import { contextOf, priceOf } from "./models-dev.ts";
-import { isTrusted, loadSettings, permissionFor } from "./settings.ts";
+import { isTrusted, loadSettings, permissionFor, workspaceDirs } from "./settings.ts";
 import { routeConfident, routeSkills } from "./skills.ts";
 import { recallBlock } from "./memory.ts";
 import { Session } from "./session.ts";
@@ -98,18 +98,33 @@ function isSmallTalk(messages: Msg[]): boolean {
   return false; // no user turn yet
 }
 
+/** Folders the IDE added beside the project (ADA_EXTRA_DIRS, delimiter-separated). Tools already
+ *  accept absolute paths anywhere, so this changes no capability — it is the only way the model
+ *  learns those folders exist. Without it, it works in cwd and reports the rest as unreachable. */
+function extraDirsNote(): string {
+  const dirs = workspaceDirs().slice(1); // [0] is cwd, already named above
+  if (!dirs.length) return "";
+  // Their MAPS are deliberately not sent. One map per folder on every turn is ~1.5k tokens each,
+  // forever, whether or not the turn has anything to do with that folder — project_map fetches one
+  // when it is actually wanted, and caches it in that folder's own .ada.
+  return `Also in this workspace (use absolute paths to read or edit them; call project_map with a path to see that folder's structure):\n${dirs.map((d) => `- ${d}`).join("\n")}`;
+}
+
 function systemPrompt(includeProject: boolean): string {
   return (
     [
       "You are ada, a minimal coding agent running in a terminal, in the spirit of pi, Codex, and Cursor.",
       `Working directory: ${process.cwd()}`,
+      extraDirsNote(),
       `Platform: ${process.platform}`,
       // The tool schemas already describe each tool — this only covers what they can't: when to pick one.
       "Explore with grep/glob/ls; use codebase_search when searching by meaning, not exact text. Read a file before editing; prefer edit_file over rewriting, apply_patch for multi-file changes; lsp_diagnostics after edits; ask_user only when blocked. Documents, decks and images can be generated on request.",
       "Call list_skills then use_skill before a specialized task.",
       "Call remember_fact when the user states a durable preference, convention or constraint ('always use X', 'we deploy via Y'). Not transient state, not secrets. Relevant memories are recalled automatically.",
       "Be concise. Don't narrate routine actions or pad with preamble. When you have enough information to act, act. Ask only when genuinely blocked or before destructive, irreversible actions.",
-    ].join("\n") + (includeProject ? projectContext() : "")
+    ]
+      .filter(Boolean)
+      .join("\n") + (includeProject ? projectContext() : "")
   );
 }
 

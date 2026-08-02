@@ -14,7 +14,7 @@ import { expandPrompt, loadPrompts } from "./prompts.ts";
 import { Session, list, type SessionMeta } from "./session.ts";
 import { deleteCredential, getCredential, listCredentials, setCredential } from "../server/credentials.ts";
 import { deviceGrant, deviceLogin, oauthConfig } from "../server/oauth.ts";
-import { addTrust, isTrusted, loadSettings, setActiveAgentPermissions, setGlobal, setOrgPermissions, type PermRule, type Settings } from "./settings.ts";
+import { addTrust, isTrusted, loadSettings, setActiveAgentPermissions, setGlobal, setOrgPermissions, workspaceDirs, type PermRule, type Settings } from "./settings.ts";
 import { getCommands, loadExtensions } from "./extensions.ts";
 import { registerTool, setAsker } from "./tools.ts";
 import { addRemoteSkill, loadSkills, registerSkillTool } from "./skills.ts";
@@ -1411,6 +1411,30 @@ async function main(): Promise<void> {
           `               POST /v1/sessions/:id/abort · /steer {"text":"…"} · PATCH /v1/sessions/:id {"mode":"ask"|"plan"|"auto"}`,
       ),
     );
+    // Build the search index for every workspace folder NOW, in the background, rather than letting
+    // the first codebase_search pay for it mid-turn — a 233-file folder took 18s to index, and that
+    // was 18s of someone waiting on an answer. Adding a folder in the IDE restarts this serve, so a
+    // folder added later gets warmed the moment it appears.
+    //
+    // Deliberately after listen(): /health is how the IDE knows the agent is up, and indexing must
+    // not delay that. Serial, not parallel — the embedder is local and CPU-bound, so N at once
+    // would just fight for the same cores while the first turn is trying to run.
+    void (async () => {
+      try {
+        const { refreshIndex } = await import("./embed-index.ts");
+        for (const dir of workspaceDirs()) {
+          try {
+            await refreshIndex(dir);
+          } catch (e) {
+            // One folder failing must not stop the others — but say so. A prewarm that silently
+            // never runs looks exactly like one that worked, until a search is slow months later.
+            console.error(`[ada] could not pre-index ${dir}: ${e instanceof Error ? e.message : e}`);
+          }
+        }
+      } catch (e) {
+        console.error(`[ada] search index unavailable: ${e instanceof Error ? e.message : e}`);
+      }
+    })();
     await new Promise(() => {}); // keep the process alive for the server
     return;
   }
