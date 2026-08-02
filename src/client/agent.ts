@@ -10,7 +10,7 @@ import { MarkdownStreamer } from "./render.ts";
 import { type Tool, type ToolResult, isDestructive, toolByName, tools } from "./tools.ts";
 import { afterTool, beforeTool, transformInput } from "./hooks.ts";
 import { configuredServers } from "./mcp.ts";
-import { priceOf } from "./models-dev.ts";
+import { contextOf, priceOf } from "./models-dev.ts";
 import { isTrusted, loadSettings, permissionFor } from "./settings.ts";
 import { routeConfident, routeSkills } from "./skills.ts";
 import { recallBlock } from "./memory.ts";
@@ -279,7 +279,23 @@ export function parseTextToolCalls(content: string): Array<{ name: string; args:
   return out.length ? out : null;
 }
 
-const COMPACT_AT = Number(process.env.ADA_COMPACT_AT) || 100_000;
+// Compaction fires at a share of the MODEL'S OWN window, not a flat number. A fixed 100k was wrong
+// in both directions: on a 1M-token model it threw away context that was paid for and still fitted,
+// and on a 32k one it never fired at all — the conversation just hit the provider's hard limit and
+// relied on the overflow retry to save it, one wasted request at a time.
+//
+// The remaining quarter is headroom, and it is not generous: this check runs ONCE per turn, before
+// the tool loop, so everything the loop then reads lands after the decision is made — a couple of
+// large file reads can be tens of thousands of tokens. isContextOverflowError already backstops a
+// miss by compacting and retrying, which costs one wasted request, so the quarter doesn't have to
+// cover the worst case, only the common one.
+//
+// Note this RAISES spend per turn on a large-window model: at 1M it lets context reach 750k before
+// compacting, where the old flat number capped it at 100k. That's the point — you paid for the
+// window — but anyone who wants the old ceiling back sets compactAt or ADA_COMPACT_AT, which wins.
+const COMPACT_SHARE = 0.75;
+// Models the catalogue doesn't know. Keeps the old flat default rather than guessing a window.
+const COMPACT_FALLBACK = 100_000;
 
 /** Model for sub-agents. A sub-agent gets a task the parent already narrowed and returns one string,
  *  so its whole tool loop is billable work that never enters the parent's context — the cheapest
@@ -631,7 +647,8 @@ export class Agent {
     this.session = opts.session;
     this.onApprove = opts.onApprove;
     this.autoApprove = !!opts.autoApprove;
-    this.compactAt = opts.compactAt || COMPACT_AT;
+    // 0 means "derive from the model" — resolved per call in compactLimit(), so setModel() moves it.
+    this.compactAt = opts.compactAt || Number(process.env.ADA_COMPACT_AT) || 0;
     this.tokenBudget = opts.tokenBudget ?? (Number(process.env.ADA_TOKEN_BUDGET) || 0);
     this.apiTools = buildApiTools(); // snapshot the registry (incl. extension/skill/MCP tools) at construction
     this.project = opts.project ?? true;
@@ -725,7 +742,7 @@ export class Agent {
     this.messages.push(userMsg);
     this.session.append(userMsg);
 
-    if (this.contextTokens() > this.compactAt) await this.autoCompact("size threshold");
+    if (this.contextTokens() > this.compactLimit()) await this.autoCompact("size threshold");
     let skillMsg: Msg | null = null;
     if (!ctrl?.delegated) {
       // Auto-recall: the few memories relevant to this input, injected transiently for this turn only.
@@ -1121,6 +1138,15 @@ export class Agent {
    *  nothing. Falls back to the estimate before the first response. */
   contextTokens(): number {
     return this.lastPromptTokens || estimateTokens(this.messages);
+  }
+
+  /** Where THIS model should compact. Resolved per call rather than fixed at construction, because
+   *  setModel() can move a live session onto a window of a different size. An explicit compactAt
+   *  (settings or ADA_COMPACT_AT) always wins — someone who set a number meant that number. */
+  compactLimit(): number {
+    if (this.compactAt) return this.compactAt;
+    const ctx = contextOf(this.model);
+    return ctx ? Math.round(ctx * COMPACT_SHARE) : COMPACT_FALLBACK;
   }
 
   /** This agent's own counters, so a parent can roll a finished sub-agent's spend into its own.
