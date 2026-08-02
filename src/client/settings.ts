@@ -117,3 +117,20 @@ export function addTrust(dir: string): void {
   dirs.add(dir);
   writeGlobal({ ...g, trustedDirs: [...dirs] });
 }
+
+/**
+ * Every folder of the current workspace: the working directory first, then any the IDE added
+ * (ADA_EXTRA_DIRS). One definition, because the agent's prompt and the search tool have to agree
+ * about which folders exist — if they drift, the model is told about a folder it cannot search.
+ */
+export function workspaceDirs(): string[] {
+  const raw = process.env.ADA_EXTRA_DIRS?.trim();
+  const extra = raw ? raw.split(process.platform === "win32" ? ";" : ":").filter(Boolean) : [];
+  const seen = new Set<string>();
+  return [process.cwd(), ...extra].filter((d) => {
+    const key = resolve(d).toLowerCase();
+    if (seen.has(key)) return false; // adding the folder you are already in must not double it
+    seen.add(key);
+    return true;
+  });
+}

@@ -303,6 +303,46 @@ async function main(): Promise<void> {
     assert.ok(/claude-opus-4-8/.test(catalogText("anthropic")), "catalogText <provider> lists its models");
   }
 
+  // --- workspaceDirs: the prompt and the search must agree about which folders exist ---
+  {
+    const { workspaceDirs } = await import("./client/settings.ts");
+    const before = process.env.ADA_EXTRA_DIRS;
+    const sep = process.platform === "win32" ? ";" : ":";
+    try {
+      delete process.env.ADA_EXTRA_DIRS;
+      assert.deepEqual(workspaceDirs(), [process.cwd()], "no extras means just the working directory");
+
+      process.env.ADA_EXTRA_DIRS = ["C:/x/one", "C:/x/two"].join(sep);
+      assert.equal(workspaceDirs().length, 3, "cwd plus both extras");
+
+      // Adding the folder you are already in must not search it twice — the same hits would come
+      // back doubled and crowd out everything else.
+      process.env.ADA_EXTRA_DIRS = [process.cwd(), "C:/x/one"].join(sep);
+      assert.equal(workspaceDirs().length, 2, "cwd repeated as an extra is dropped");
+
+      process.env.ADA_EXTRA_DIRS = sep + sep;
+      assert.deepEqual(workspaceDirs(), [process.cwd()], "empty segments are not folders");
+    } finally {
+      if (before === undefined) delete process.env.ADA_EXTRA_DIRS;
+      else process.env.ADA_EXTRA_DIRS = before;
+    }
+  }
+
+  // --- project_map: a folder's map ON DEMAND, so extra workspace folders cost nothing per turn ---
+  {
+    const pm = tool("project_map");
+    const here = process.cwd();
+    const r = await pm.run({ path: here });
+    assert.ok(!r.isError && r.output.length > 0, "project_map maps the folder it is given");
+    // The default has to be cwd, or a model that omits the argument silently maps nothing.
+    assert.equal((await pm.run({})).output, r.output, "no path means the working directory");
+    const bad = await pm.run({ path: join(here, "definitely-not-here-9x") });
+    assert.ok(bad.isError, "a folder that isn't there is an error, not an empty map");
+    // Free until called: the whole point is that extra folders don't ride on every turn.
+    assert.equal(pm.needsApproval, false, "reading a map is not a destructive act");
+    assert.ok(!pm.lazy, "project_map must always be offered — it is how the model reaches other folders");
+  }
+
   // --- compaction fires at a share of the model's own window, not a flat number ---
   {
     const base = { client: {} as never, session: Session.create(), onApprove: async (): Promise<"yes"> => "yes" };
