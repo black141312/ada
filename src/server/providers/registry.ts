@@ -25,6 +25,7 @@ const ADAPTERS: Record<ProviderName, Adapter> = {
   copilot: openAICompatAdapter, // GitHub Copilot's OpenAI-compatible endpoint (+ custom headers in the adapter)
   cloudflare: openAICompatAdapter, // Cloudflare Workers AI / AI Gateway (OpenAI-compatible)
   ollama: openAICompatAdapter,
+  omniroute: openAICompatAdapter, // a local OmniRoute gateway, OpenAI-compatible by design
 };
 
 export function adapterFor(provider: ProviderName): Adapter {

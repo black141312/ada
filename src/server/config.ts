@@ -35,6 +35,10 @@ export const PROVIDERS: Record<ProviderName, ProviderDef> = {
     keyEnv: "CLOUDFLARE_API_TOKEN",
   },
   ollama: { baseURL: process.env.OLLAMA_BASE_URL ?? "http://localhost:11434/v1", keyEnv: "" },
+  // A local OmniRoute gateway (github.com/diegosouzapw/OmniRoute) — one more OpenAI-compatible
+  // upstream, reached as `omniroute/<model>`. Keyless like Ollama because it runs on the user's own
+  // machine and holds its own provider keys; OMNIROUTE_API_KEY is honoured if theirs is protected.
+  omniroute: { baseURL: process.env.OMNIROUTE_BASE_URL ?? "http://localhost:20128/v1", keyEnv: "OMNIROUTE_API_KEY" },
 };
 
 // ADA_PORT wins for local dev; PORT is the convention PaaS hosts (Render, Cloud Run, Railway) inject.
