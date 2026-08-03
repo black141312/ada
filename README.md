@@ -10,6 +10,8 @@ that holds every provider key and speaks one wire
 format to the client.
 
 ![ada architecture](docs/architecture.svg)
+use ada code from here https://github.com/black141312/ada-releases
+we udpate our progress here https://adacodelabs.com/
 
 The client talks **only** OpenAI Chat Completions to the backend. The backend routes each request
 to the right provider by model id and normalizes every provider back to that one format — so a new
