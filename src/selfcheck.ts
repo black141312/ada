@@ -725,12 +725,16 @@ async function main(): Promise<void> {
 
   // --- autostart helpers: URL classification + /health derivation ---
   {
-    const { isLocalBackend, healthUrl } = await import("./client/autostart.ts");
+    const { isLocalBackend, healthUrl, modelsUrl } = await import("./client/autostart.ts");
     assert.ok(isLocalBackend("http://localhost:8787/v1"), "localhost is local");
     assert.ok(isLocalBackend("http://127.0.0.1:8787/v1"), "127.0.0.1 is local");
     assert.ok(!isLocalBackend("https://ada.example.com/v1"), "remote URL is not local");
     assert.equal(healthUrl("http://localhost:8787/v1"), "http://localhost:8787/health", "/v1 base → /health");
     assert.equal(healthUrl("http://localhost:8787"), "http://localhost:8787/health", "bare base → /health");
+    // /models keeps the /v1 — it is an API path, unlike /health which sits at the root. Getting
+    // this wrong is what makes a third-party gateway look dead and sends ada off to spawn its own.
+    assert.equal(modelsUrl("http://localhost:20128/v1"), "http://localhost:20128/v1/models", "/v1 base → /v1/models");
+    assert.equal(modelsUrl("http://localhost:20128/v1/"), "http://localhost:20128/v1/models", "a trailing slash is not a path segment");
     // Remote URL → ensureBackend short-circuits to "remote" without spawning anything.
     const { ensureBackend } = await import("./client/autostart.ts");
     const v = await ensureBackend("https://ada.example.com/v1", { quiet: true, waitMs: 200 });
