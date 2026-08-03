@@ -13,7 +13,8 @@ export type ProviderName =
   | "dashscope"
   | "copilot"
   | "cloudflare"
-  | "ollama";
+  | "ollama"
+  | "omniroute";
 
 export interface ModelInfo {
   id: string;

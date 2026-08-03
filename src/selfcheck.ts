@@ -303,6 +303,163 @@ async function main(): Promise<void> {
     assert.ok(/claude-opus-4-8/.test(catalogText("anthropic")), "catalogText <provider> lists its models");
   }
 
+  // --- reading the paid-through date out of a provider payload ---
+  {
+    const { paidThroughOf } = await import("./server/kelviq.ts");
+    const ms = Date.UTC(2027, 0, 15);
+    assert.equal(paidThroughOf({ currentPeriodEnd: ms }), ms, "milliseconds pass through");
+    assert.equal(paidThroughOf({ current_period_end: Math.floor(ms / 1000) }), ms, "seconds are scaled up");
+    assert.equal(paidThroughOf({ expiresAt: "2027-01-15T00:00:00.000Z" }), ms, "an ISO string parses");
+    // Anything unrecognised must yield null — which means "never expires", i.e. today's behaviour.
+    // Guessing wrong here would cut off a paying customer, so the failure has to be the safe way.
+    assert.equal(paidThroughOf({}), null, "no date means no expiry");
+    assert.equal(paidThroughOf({ currentPeriodEnd: "not a date" }), null, "garbage means no expiry");
+    assert.equal(paidThroughOf({ periodEnd: Number.NaN }), null, "NaN means no expiry");
+  }
+
+  // --- a paid plan must lapse on its own, not only when a webhook says so ---
+  {
+    const { effectivePlan, PLANS } = await import("./server/plans.ts");
+    const now = Date.UTC(2026, 7, 3, 12);
+    const p = (over: Record<string, unknown>) =>
+      ({ user: "u", plan: "pro", status: "active", periodStart: null, paidThrough: null, ...over }) as never;
+
+    // null = never expires. Plans granted by hand must not die because nobody wrote a date —
+    // every existing row in production has a null here.
+    assert.equal(effectivePlan(p({}), now).name, "pro", "no paid-through date means it never lapses");
+
+    assert.equal(effectivePlan(p({ paidThrough: now + 86_400_000 }), now).name, "pro", "paid through tomorrow is still pro");
+    // THE POINT: without this, the only thing that ever revokes a plan is a cancellation webhook
+    // being delivered AND processed. A missed one grants a paid tier forever.
+    assert.equal(effectivePlan(p({ paidThrough: now - 1 }), now).name, "free", "one ms past the paid period is free");
+    assert.equal(effectivePlan(p({ paidThrough: now }), now).name, "free", "the boundary itself is over");
+
+    // A lapsed plan drops to free QUOTAS too, not just the label — otherwise it keeps the paid cap.
+    assert.equal(effectivePlan(p({ paidThrough: now - 1 }), now).monthlyTokens, PLANS.free.monthlyTokens, "lapsed gets the free quota");
+    // Status still wins independently: a cancelled plan is free even if paid through next year.
+    assert.equal(effectivePlan(p({ status: "canceled", paidThrough: now + 1e10 }), now).name, "free", "status still applies");
+  }
+
+  // --- a bad billing anchor must not switch metering off ---
+  {
+    const { periodStart } = await import("./server/plans.ts");
+    const now = Date.UTC(2026, 7, 2, 12); // 2 Aug 2026
+    const augustFirst = Date.UTC(2026, 7, 1);
+    const plan = (periodStartValue: number | null) =>
+      ({ user: "u", plan: "pro", status: "active", periodStart: periodStartValue }) as never;
+
+    assert.equal(periodStart(plan(null), now), augustFirst, "no anchor means the calendar month");
+
+    // THE ONE THAT MATTERS. A future anchor makes usageSince() look at a window that has not begun:
+    // used reads 0, `used >= limit` never fires, and the account bills nothing forever. Found in
+    // production as 12321313123123 — the year 2360.
+    assert.equal(periodStart(plan(12321313123123), now), augustFirst, "an anchor in the future falls back to the month");
+    assert.ok(periodStart(plan(12321313123123), now) <= now, "a period can never start in the future");
+
+    // Garbage that isn't even a number must not produce NaN, which compares false against everything.
+    assert.equal(periodStart(plan(Number.NaN), now), augustFirst, "NaN falls back to the month");
+
+    // A real anchor still anchors: subscribed on the 20th, so the period runs from the 20th.
+    assert.equal(
+      periodStart(plan(Date.UTC(2026, 5, 20, 9, 30)), now),
+      Date.UTC(2026, 6, 20, 9, 30),
+      "an anchor rolls forward to the period containing now",
+    );
+    // An old anchor rolls forward rather than reaching back years.
+    assert.ok(periodStart(plan(Date.UTC(1970, 4, 23)), now) > Date.UTC(2026, 5, 1), "a 1970 anchor still lands in 2026");
+  }
+
+  // --- .ada must not litter someone else's repo ---
+  {
+    const { ensureAdaDir } = await import("./client/settings.ts");
+    const tmp = join(tmpdir(), `ada-gitignore-${Date.now()}`);
+    const ada = join(tmp, ".ada");
+    ensureAdaDir(ada);
+    const gi = readFileSync(join(ada, ".gitignore"), "utf8");
+    // The index is over a megabyte. Unignored it shows up in the user's `git status` and is one
+    // `git add .` from being committed into their history.
+    for (const cache of ["index.vec", "index.json", "brain.json", "graph.db"])
+      assert.ok(gi.includes(cache), `.ada/.gitignore must cover ${cache}`);
+    // Self-ignoring, so a .ada holding only caches leaves the repo completely clean.
+    assert.ok(gi.includes(".gitignore"), ".ada/.gitignore must ignore itself");
+    // But memory and skills are the user's, and meant to be committed and shared with the team.
+    assert.ok(!/^memory\/?$/m.test(gi) && !/^skills\/?$/m.test(gi), "memory and skills must stay committable");
+
+    // A second call must not clobber a file the user has edited.
+    writeFileSync(join(ada, ".gitignore"), "# mine\n");
+    ensureAdaDir(ada);
+    assert.equal(readFileSync(join(ada, ".gitignore"), "utf8"), "# mine\n", "an existing .gitignore is left alone");
+    rmSync(tmp, { recursive: true, force: true });
+  }
+
+  // --- workspaceDirs: the prompt and the search must agree about which folders exist ---
+  {
+    const { workspaceDirs } = await import("./client/settings.ts");
+    const before = process.env.ADA_EXTRA_DIRS;
+    const sep = process.platform === "win32" ? ";" : ":";
+    try {
+      delete process.env.ADA_EXTRA_DIRS;
+      assert.deepEqual(workspaceDirs(), [process.cwd()], "no extras means just the working directory");
+
+      // Platform-shaped paths: on POSIX the list separator is ":", which is also the character a
+      // Windows drive letter uses — "C:/x" in a colon-separated list is two segments, not one.
+      const [one, two] = process.platform === "win32" ? ["C:/x/one", "C:/x/two"] : ["/x/one", "/x/two"];
+      process.env.ADA_EXTRA_DIRS = [one, two].join(sep);
+      assert.equal(workspaceDirs().length, 3, "cwd plus both extras");
+
+      // Adding the folder you are already in must not search it twice — the same hits would come
+      // back doubled and crowd out everything else.
+      process.env.ADA_EXTRA_DIRS = [process.cwd(), one].join(sep);
+      assert.equal(workspaceDirs().length, 2, "cwd repeated as an extra is dropped");
+
+      process.env.ADA_EXTRA_DIRS = sep + sep;
+      assert.deepEqual(workspaceDirs(), [process.cwd()], "empty segments are not folders");
+    } finally {
+      if (before === undefined) delete process.env.ADA_EXTRA_DIRS;
+      else process.env.ADA_EXTRA_DIRS = before;
+    }
+  }
+
+  // --- project_map: a folder's map ON DEMAND, so extra workspace folders cost nothing per turn ---
+  {
+    const pm = tool("project_map");
+    const here = process.cwd();
+    const r = await pm.run({ path: here });
+    assert.ok(!r.isError && r.output.length > 0, "project_map maps the folder it is given");
+    // The default has to be cwd, or a model that omits the argument silently maps nothing.
+    assert.equal((await pm.run({})).output, r.output, "no path means the working directory");
+    const bad = await pm.run({ path: join(here, "definitely-not-here-9x") });
+    assert.ok(bad.isError, "a folder that isn't there is an error, not an empty map");
+    // Free until called: the whole point is that extra folders don't ride on every turn.
+    assert.equal(pm.needsApproval, false, "reading a map is not a destructive act");
+    assert.ok(!pm.lazy, "project_map must always be offered — it is how the model reaches other folders");
+  }
+
+  // --- compaction fires at a share of the model's own window, not a flat number ---
+  {
+    const base = { client: {} as never, session: Session.create(), onApprove: async (): Promise<"yes"> => "yes" };
+    const limitFor = (model: string, compactAt?: number) => new Agent({ ...base, model, compactAt }).compactLimit();
+    const { contextOf } = await import("./client/models-dev.ts");
+
+    assert.equal(limitFor("claude-opus-4-5"), 150_000, "200k window -> 150k");
+    assert.equal(limitFor("claude-opus-4-8"), 750_000, "1M window -> 750k, not the old flat 100k");
+    assert.equal(limitFor("no-such-model-xyz"), 100_000, "an uncatalogued model keeps the flat fallback");
+    assert.equal(limitFor("claude-opus-4-5", 42_000), 42_000, "an explicit compactAt always wins");
+
+    // The threshold must stay UNDER the window it came from — the whole point is compacting before
+    // the provider refuses the request, so a share that ever rounded past the window would be worse
+    // than the flat number it replaced.
+    for (const m of ["claude-opus-4-5", "claude-opus-4-8", "gemini-2.5-pro"])
+      assert.ok(limitFor(m) < contextOf(m)!, `${m}: threshold must sit below its own window`);
+
+    // setModel must move it: a session switched onto a smaller window and left on the bigger
+    // threshold would never compact, and would die on the provider's hard limit instead.
+    const a = new Agent({ ...base, model: "claude-opus-4-8" });
+    const big = a.compactLimit();
+    a.setModel("claude-opus-4-5");
+    assert.ok(a.compactLimit() < big, "switching to a smaller window lowers the threshold");
+  }
+
   // --- provider routing (incl. the new cloudflare + groq/together disambiguation) ---
   {
     const { route } = await import("./server/router.ts");
@@ -568,12 +725,16 @@ async function main(): Promise<void> {
 
   // --- autostart helpers: URL classification + /health derivation ---
   {
-    const { isLocalBackend, healthUrl } = await import("./client/autostart.ts");
+    const { isLocalBackend, healthUrl, modelsUrl } = await import("./client/autostart.ts");
     assert.ok(isLocalBackend("http://localhost:8787/v1"), "localhost is local");
     assert.ok(isLocalBackend("http://127.0.0.1:8787/v1"), "127.0.0.1 is local");
     assert.ok(!isLocalBackend("https://ada.example.com/v1"), "remote URL is not local");
     assert.equal(healthUrl("http://localhost:8787/v1"), "http://localhost:8787/health", "/v1 base → /health");
     assert.equal(healthUrl("http://localhost:8787"), "http://localhost:8787/health", "bare base → /health");
+    // /models keeps the /v1 — it is an API path, unlike /health which sits at the root. Getting
+    // this wrong is what makes a third-party gateway look dead and sends ada off to spawn its own.
+    assert.equal(modelsUrl("http://localhost:20128/v1"), "http://localhost:20128/v1/models", "/v1 base → /v1/models");
+    assert.equal(modelsUrl("http://localhost:20128/v1/"), "http://localhost:20128/v1/models", "a trailing slash is not a path segment");
     // Remote URL → ensureBackend short-circuits to "remote" without spawning anything.
     const { ensureBackend } = await import("./client/autostart.ts");
     const v = await ensureBackend("https://ada.example.com/v1", { quiet: true, waitMs: 200 });

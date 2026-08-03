@@ -17,6 +17,8 @@ export function route(model: string, explicit?: string): ProviderName {
   // `groq/…` / `together/…` disambiguate shared model names (llama-3.3, gemma2…) that no prefix can.
   if (m.startsWith("groq/")) return "groq";
   if (m.startsWith("together/")) return "together";
+  // Explicit prefix, never a default: OmniRoute is opt-in and may not be running.
+  if (m.startsWith("omniroute/")) return "omniroute";
   if (m.includes("/")) return "openrouter";
   // "model:tag" → a local Ollama model (e.g. gemma4:latest).
   if (m.includes(":")) return "ollama";

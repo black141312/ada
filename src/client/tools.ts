@@ -738,6 +738,33 @@ export const tools: Tool[] = [
     },
   },
   {
+    name: "project_map",
+    description:
+      "File paths and top-level symbols for a FOLDER, the same map you get for the working directory. Use it to orient in another folder of the workspace before searching or reading there.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Absolute path to the folder. Defaults to the working directory." },
+      },
+      additionalProperties: false,
+    },
+    needsApproval: false,
+    async run(args) {
+      const dir = resolve(process.cwd(), String(args.path ?? "."));
+      if (!existsSync(dir)) return { output: `Not found: ${String(args.path ?? ".")}`, isError: true };
+      try {
+        // loadBrain caches to that folder's own .ada/brain.json, so the second call is a file read.
+        // Deliberately on demand: every extra folder's map riding on every turn would cost ~1.5k
+        // tokens each, forever, whether or not the turn had anything to do with that folder.
+        const { loadBrain } = await import("./brain.ts");
+        const map = loadBrain(dir);
+        return { output: map ? truncate(map) : `No mappable source files under ${dir}.` };
+      } catch (e) {
+        return { output: String(e instanceof Error ? e.message : e), isError: true };
+      }
+    },
+  },
+  {
     name: "ls",
     description: "List entries in a directory (directories shown with a trailing slash).",
     parameters: {
@@ -887,10 +914,21 @@ export const tools: Tool[] = [
     needsApproval: false,
     async run(args) {
       try {
-        const { searchCodebase } = await import("./embed-index.ts"); // lazy — only pay for it when used
-        const hits = await searchCodebase(String(args.query), Math.min(Number(args.k) || 6, 20));
+        const { searchWorkspace } = await import("./embed-index.ts"); // lazy — only pay for it when used
+        const { workspaceDirs } = await import("./settings.ts");
+        const roots = workspaceDirs();
+        const hits = await searchWorkspace(String(args.query), Math.min(Number(args.k) || 6, 20), roots);
         if (!hits.length) return { output: "No indexed content matched. Is the repo empty, or all files skipped?" };
-        return { output: hits.map((h) => `${h.file}:${h.start}-${h.end}  (score ${h.score.toFixed(3)})\n${h.snippet}`).join("\n\n---\n\n") };
+        // With more than one folder open a bare relative path is ambiguous — src/auth.ts could be
+        // any of them. The folder is named only when there IS more than one, so the ordinary
+        // single-folder case reads exactly as it did.
+        const label = (h: { root: string; file: string }) =>
+          roots.length > 1 ? `${h.root.split(/[\\/]/).filter(Boolean).pop()}/${h.file}` : h.file;
+        return {
+          output: hits
+            .map((h) => `${label(h)}:${h.start}-${h.end}  (score ${h.score.toFixed(3)})\n${h.snippet}`)
+            .join("\n\n---\n\n"),
+        };
       } catch (e) {
         return { output: String(e instanceof Error ? e.message : e), isError: true };
       }
@@ -1354,6 +1392,70 @@ export const tools: Tool[] = [
           };
         } catch (e) {
           return { output: e instanceof Error ? e.message : String(e), isError: true };
+        }
+      });
+    },
+  },
+  {
+    name: "convert_image",
+    lazy: true,
+    description:
+      "Convert or resize an existing image file. Reads jpeg, png, webp, tiff, gif, svg, heic/heif; writes jpeg, png, webp, tiff, gif, avif. Use this for 'svg to png', 'heic to jpg', 'make this smaller', or changing format. Cannot write SVG — vector output would mean redrawing the image, not converting it.",
+    parameters: {
+      type: "object",
+      properties: {
+        from: { type: "string", description: "Path to the existing image to read." },
+        to: { type: "string", description: "Output path. The extension decides the format (.png, .jpg, .webp, .avif, .tiff, .gif)." },
+        width: { type: "number", description: "Optional width in pixels. Height follows automatically unless given." },
+        height: { type: "number", description: "Optional height in pixels." },
+        quality: { type: "number", description: "1-100 for lossy formats (jpeg/webp/avif). Default 90." },
+      },
+      required: ["from", "to"],
+      additionalProperties: false,
+    },
+    needsApproval: true,
+    async run(args) {
+      const from = resolve(process.cwd(), String(args.from));
+      const to = resolve(process.cwd(), String(args.to));
+      const ext = to.slice(to.lastIndexOf(".") + 1).toLowerCase();
+      const OUT: Record<string, string> = { png: "png", jpg: "jpeg", jpeg: "jpeg", webp: "webp", avif: "avif", tiff: "tiff", tif: "tiff", gif: "gif" };
+      if (!existsSync(from)) return { output: `convert_image: no such file: ${args.from}`, isError: true };
+      if (!OUT[ext]) {
+        // Name the reason. "svg" lands here a lot, and "unsupported" alone reads as a bug.
+        const why = ext === "svg" ? "SVG output would mean redrawing the image, not converting it" : `unknown output format '.${ext}'`;
+        return { output: `convert_image: ${why}. Supported: ${[...new Set(Object.keys(OUT))].join(", ")}`, isError: true };
+      }
+      return withFileLock(to, async () => {
+        if (isProtected(to)) return { output: `Refused: ${args.to} is a protected path.`, isError: true };
+        try {
+          // Loaded on demand: sharp carries a ~20MB native binary, and most sessions never convert
+          // an image. A static import would pay that cost on every single agent start.
+          const { default: sharp } = await import("sharp");
+          let img = sharp(from);
+          if (args.width || args.height) {
+            img = img.resize(
+              args.width ? Number(args.width) : null,
+              args.height ? Number(args.height) : null,
+              { fit: "inside", withoutEnlargement: false },
+            );
+          }
+          const q = args.quality ? Number(args.quality) : 90;
+          const fmt = OUT[ext]!;
+          img = (img as unknown as Record<string, (o?: unknown) => typeof img>)[fmt]!(
+            fmt === "png" || fmt === "tiff" || fmt === "gif" ? undefined : { quality: q },
+          );
+          checkpoint.record(to);
+          mkdirSync(dirname(to), { recursive: true });
+          const info = await img.toFile(to);
+          return { output: `Converted → ${relative(process.cwd(), to)} (${info.width}x${info.height}, ${info.size} bytes)` };
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          // sharp missing is the one failure a user can act on, so say so plainly instead of
+          // surfacing a raw module-not-found stack.
+          if (/Cannot find module|MODULE_NOT_FOUND/i.test(msg)) {
+            return { output: "convert_image: image support isn't installed in this build.", isError: true };
+          }
+          return { output: `convert_image: ${msg}`, isError: true };
         }
       });
     },

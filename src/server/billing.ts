@@ -98,6 +98,17 @@ export async function getCheckout(id: string): Promise<CheckoutSession | null> {
   return s;
 }
 
+/** Retarget a pending session to a different paid plan. The website's plan picker calls this via
+ *  the purchase route — the session id authorizes the change, and only while still pending, so a
+ *  paid or expired session can never be redirected. */
+export async function setCheckoutPlan(id: string, plan: PlanName): Promise<boolean> {
+  if (!(plan in PLANS) || plan === "free") return false;
+  await ensure();
+  return usingPostgres
+    ? (((await pg().query("update checkout_sessions set plan = $1 where id = $2 and status = 'pending'", [plan, id])).rowCount ?? 0) > 0)
+    : lite().prepare("update checkout_sessions set plan = ? where id = ? and status = 'pending'").run(plan, id).changes > 0;
+}
+
 /** Mark a session paid and grant the plan. This is what a verified payment webhook calls.
  *
  *  Idempotent and single-use: the UPDATE only matches a row still `pending`, so a provider replaying

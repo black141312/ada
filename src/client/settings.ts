@@ -1,7 +1,7 @@
 // Layered settings: global (~/.ada/settings.json) merged with project (.ada/settings.json),
 // project winning. Also the project-trust list — project files are only loaded for trusted dirs.
 
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -116,4 +116,62 @@ export function addTrust(dir: string): void {
   const dirs = new Set(g.trustedDirs ?? []);
   dirs.add(dir);
   writeGlobal({ ...g, trustedDirs: [...dirs] });
+}
+
+/**
+ * Every folder of the current workspace: the working directory first, then any the IDE added
+ * (ADA_EXTRA_DIRS). One definition, because the agent's prompt and the search tool have to agree
+ * about which folders exist — if they drift, the model is told about a folder it cannot search.
+ */
+export function workspaceDirs(): string[] {
+  const raw = process.env.ADA_EXTRA_DIRS?.trim();
+  const extra = raw ? raw.split(process.platform === "win32" ? ";" : ":").filter(Boolean) : [];
+  const seen = new Set<string>();
+  return [process.cwd(), ...extra].filter((d) => {
+    const key = resolve(d).toLowerCase();
+    if (seen.has(key)) return false; // adding the folder you are already in must not double it
+    seen.add(key);
+    return true;
+  });
+}
+
+/**
+ * Create a project's `.ada/` and make its CACHES self-ignoring.
+ *
+ * Ada writes into whatever repo you open, and the search index alone is over a megabyte. Without
+ * this those files show up as `?? .ada/` in the user's own project — noise in every `git status`,
+ * and one `git add .` away from a binary blob in someone's history.
+ *
+ * A `.gitignore` INSIDE the directory ignores it wherever it lands, without touching the repo's own
+ * .gitignore. Deliberately not a blanket `*`: memory/ and skills/ are meant to be committed and
+ * shared with the team, so only the machine-generated caches are listed.
+ */
+export function ensureAdaDir(dir: string): string {
+  mkdirSync(dir, { recursive: true });
+  const f = join(dir, ".gitignore");
+  if (!existsSync(f)) {
+    try {
+      writeFileSync(
+        f,
+        [
+          "# Written by ada. These are local caches — rebuilt on demand, never worth committing.",
+          "# memory/ and skills/ are NOT listed: those are yours, and meant to be shared.",
+          "# This file ignores itself so an untouched .ada leaves `git status` completely clean;",
+          "# ada rewrites it whenever the folder is missing one, so nothing is lost by not tracking it.",
+          ".gitignore",
+          "brain.json",
+          "index.json",
+          "index.vec",
+          "graph.db",
+          "sessions/",
+          "tmp/",
+          "worktrees/",
+          "",
+        ].join("\n"),
+      );
+    } catch {
+      /* read-only checkout — the caches still work, they are just visible to git */
+    }
+  }
+  return dir;
 }

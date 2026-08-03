@@ -9,6 +9,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
+import { ensureAdaDir } from "./settings.ts";
 
 const SKIP = new Set(["node_modules", ".git", "dist", ".ada", ".next", "build", "coverage", "out", "vendor", "target", ".venv", "__pycache__"]);
 const CODE_EXT = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|cs|c|h|cpp|hpp|swift|scala|svelte|vue)$/i;
@@ -171,7 +172,7 @@ export function loadBrain(cwd: string = process.cwd()): string {
 
   const map = render(addSymbols(cwd, files)); // cache missed — now pay to read the files
   try {
-    mkdirSync(resolve(cacheRoot, ".ada"), { recursive: true });
+    ensureAdaDir(resolve(cacheRoot, ".ada"));
     writeFileSync(cachePath, JSON.stringify({ fingerprint: fp, map } satisfies BrainCache));
   } catch {
     /* read-only fs — still return the freshly built map */
