@@ -38,6 +38,9 @@ export interface UserPlan {
   status: PlanStatus;
   /** Period anchor in ms. Null means "calendar month", which is what an unpaid account gets. */
   periodStart: number | null;
+  /** Access is good until this ms timestamp. NULL MEANS NEVER EXPIRES — a plan granted by hand
+   *  should not die because nobody wrote a date. Only a payment provider sets a real one. */
+  paidThrough: number | null;
 }
 
 const pg = () => authDatabase as Pool;
@@ -53,10 +56,20 @@ function ensure(): Promise<void> {
       plan text not null default 'free',
       status text not null default 'active',
       period_start bigint,
+      paid_through bigint,
       updated_at bigint not null
     )`;
-    if (usingPostgres) await pg().query(ddl);
-    else lite().exec(ddl.replace("bigint", "integer").replace("bigint", "integer"));
+    if (usingPostgres) {
+      await pg().query(ddl);
+      // `create table if not exists` does nothing to a table that already exists, so an installation
+      // that predates paid_through would silently never get the column.
+      await pg().query("alter table user_plans add column if not exists paid_through bigint");
+    } else {
+      lite().exec(ddl.replace(/bigint/g, "integer"));
+      // SQLite has no `add column if not exists`; adding a column twice is an error, so ask first.
+      const cols = lite().prepare("pragma table_info(user_plans)").all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === "paid_through")) lite().exec("alter table user_plans add column paid_through integer");
+    }
   })();
   return ready;
 }
@@ -68,7 +81,7 @@ export function invalidatePlanCache(user?: string): void {
   else cache.clear();
 }
 
-const DEFAULT_PLAN = (user: string): UserPlan => ({ user, plan: "free", status: "active", periodStart: null });
+const DEFAULT_PLAN = (user: string): UserPlan => ({ user, plan: "free", status: "active", periodStart: null, paidThrough: null });
 
 /** The plan for an account. No row means free — signing up is enough to be a free user, so a
  *  missing row is a normal state, not an error. A DB failure also yields free rather than throwing:
@@ -76,12 +89,12 @@ const DEFAULT_PLAN = (user: string): UserPlan => ({ user, plan: "free", status: 
 export async function planFor(user: string): Promise<UserPlan> {
   const hit = cache.get(user);
   if (hit && hit.exp > Date.now()) return hit.plan;
-  let row: { plan?: string; status?: string; period_start?: number | string | null } | undefined;
+  let row: { plan?: string; status?: string; period_start?: number | string | null; paid_through?: number | string | null } | undefined;
   try {
     await ensure();
     row = usingPostgres
-      ? ((await pg().query("select plan, status, period_start from user_plans where user_id = $1", [user])).rows[0] as typeof row)
-      : (lite().prepare("select plan, status, period_start from user_plans where user_id = ?").get(user) as typeof row);
+      ? ((await pg().query("select plan, status, period_start, paid_through from user_plans where user_id = $1", [user])).rows[0] as typeof row)
+      : (lite().prepare("select plan, status, period_start, paid_through from user_plans where user_id = ?").get(user) as typeof row);
   } catch (e) {
     console.error("[ada] plan lookup failed:", e instanceof Error ? e.message : e);
     return DEFAULT_PLAN(user);
@@ -92,6 +105,7 @@ export async function planFor(user: string): Promise<UserPlan> {
     plan: PLANS[name] ? name : "free", // an unknown plan string must not grant the full catalogue
     status: (row?.status ?? "active") as PlanStatus,
     periodStart: row?.period_start != null ? Number(row.period_start) : null,
+    paidThrough: row?.paid_through != null ? Number(row.paid_through) : null,
   };
   cache.set(user, { plan, exp: Date.now() + TTL });
   return plan;
@@ -99,8 +113,14 @@ export async function planFor(user: string): Promise<UserPlan> {
 
 /** Entitlements after status is applied. A lapsed subscription drops to free rather than locking
  *  the account out — a card that expires shouldn't read as a ban. */
-export function effectivePlan(p: UserPlan): PlanDef & { name: PlanName } {
-  const name: PlanName = p.status === "active" ? p.plan : "free";
+export function effectivePlan(p: UserPlan, now = Date.now()): PlanDef & { name: PlanName } {
+  // Access lapses on its own once the paid period ends. Without this the ONLY thing that ever
+  // revokes a plan is a `subscription.cancelled` webhook arriving and being processed — so a missed
+  // event, an exhausted retry or a card that quietly expires leaves a paid tier granted forever.
+  // Fail closed on time, not open on silence.
+  const lapsed = p.paidThrough != null && p.paidThrough <= now;
+  // null = never expires: a plan granted by hand must not die because nobody wrote a date.
+  const name: PlanName = p.status === "active" && !lapsed ? p.plan : "free";
   return { ...PLANS[name], name };
 }
 
@@ -186,23 +206,29 @@ export function billingWebhookImplemented(): boolean {
 }
 
 /** Set or change an account's plan. Called by the admin API today, by a payment webhook later. */
-export async function setPlan(user: string, plan: PlanName, status: PlanStatus = "active", anchorNow = true): Promise<void> {
+export async function setPlan(
+  user: string,
+  plan: PlanName,
+  status: PlanStatus = "active",
+  anchorNow = true,
+  paidThrough: number | null = null,
+): Promise<void> {
   await ensure();
   const now = Date.now();
   const start = anchorNow && plan !== "free" ? now : null;
   if (usingPostgres) {
     await pg().query(
-      `insert into user_plans (user_id, plan, status, period_start, updated_at) values ($1,$2,$3,$4,$5)
-       on conflict (user_id) do update set plan = excluded.plan, status = excluded.status, period_start = excluded.period_start, updated_at = excluded.updated_at`,
-      [user, plan, status, start, now],
+      `insert into user_plans (user_id, plan, status, period_start, paid_through, updated_at) values ($1,$2,$3,$4,$5,$6)
+       on conflict (user_id) do update set plan = excluded.plan, status = excluded.status, period_start = excluded.period_start, paid_through = excluded.paid_through, updated_at = excluded.updated_at`,
+      [user, plan, status, start, paidThrough, now],
     );
   } else {
     lite()
       .prepare(
-        `insert into user_plans (user_id, plan, status, period_start, updated_at) values (?,?,?,?,?)
-         on conflict (user_id) do update set plan = excluded.plan, status = excluded.status, period_start = excluded.period_start, updated_at = excluded.updated_at`,
+        `insert into user_plans (user_id, plan, status, period_start, paid_through, updated_at) values (?,?,?,?,?,?)
+         on conflict (user_id) do update set plan = excluded.plan, status = excluded.status, period_start = excluded.period_start, paid_through = excluded.paid_through, updated_at = excluded.updated_at`,
       )
-      .run(user, plan, status, start, now);
+      .run(user, plan, status, start, paidThrough, now);
   }
   invalidatePlanCache(user);
 }

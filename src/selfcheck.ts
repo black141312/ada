@@ -303,6 +303,43 @@ async function main(): Promise<void> {
     assert.ok(/claude-opus-4-8/.test(catalogText("anthropic")), "catalogText <provider> lists its models");
   }
 
+  // --- reading the paid-through date out of a provider payload ---
+  {
+    const { paidThroughOf } = await import("./server/kelviq.ts");
+    const ms = Date.UTC(2027, 0, 15);
+    assert.equal(paidThroughOf({ currentPeriodEnd: ms }), ms, "milliseconds pass through");
+    assert.equal(paidThroughOf({ current_period_end: Math.floor(ms / 1000) }), ms, "seconds are scaled up");
+    assert.equal(paidThroughOf({ expiresAt: "2027-01-15T00:00:00.000Z" }), ms, "an ISO string parses");
+    // Anything unrecognised must yield null — which means "never expires", i.e. today's behaviour.
+    // Guessing wrong here would cut off a paying customer, so the failure has to be the safe way.
+    assert.equal(paidThroughOf({}), null, "no date means no expiry");
+    assert.equal(paidThroughOf({ currentPeriodEnd: "not a date" }), null, "garbage means no expiry");
+    assert.equal(paidThroughOf({ periodEnd: Number.NaN }), null, "NaN means no expiry");
+  }
+
+  // --- a paid plan must lapse on its own, not only when a webhook says so ---
+  {
+    const { effectivePlan, PLANS } = await import("./server/plans.ts");
+    const now = Date.UTC(2026, 7, 3, 12);
+    const p = (over: Record<string, unknown>) =>
+      ({ user: "u", plan: "pro", status: "active", periodStart: null, paidThrough: null, ...over }) as never;
+
+    // null = never expires. Plans granted by hand must not die because nobody wrote a date —
+    // every existing row in production has a null here.
+    assert.equal(effectivePlan(p({}), now).name, "pro", "no paid-through date means it never lapses");
+
+    assert.equal(effectivePlan(p({ paidThrough: now + 86_400_000 }), now).name, "pro", "paid through tomorrow is still pro");
+    // THE POINT: without this, the only thing that ever revokes a plan is a cancellation webhook
+    // being delivered AND processed. A missed one grants a paid tier forever.
+    assert.equal(effectivePlan(p({ paidThrough: now - 1 }), now).name, "free", "one ms past the paid period is free");
+    assert.equal(effectivePlan(p({ paidThrough: now }), now).name, "free", "the boundary itself is over");
+
+    // A lapsed plan drops to free QUOTAS too, not just the label — otherwise it keeps the paid cap.
+    assert.equal(effectivePlan(p({ paidThrough: now - 1 }), now).monthlyTokens, PLANS.free.monthlyTokens, "lapsed gets the free quota");
+    // Status still wins independently: a cancelled plan is free even if paid through next year.
+    assert.equal(effectivePlan(p({ status: "canceled", paidThrough: now + 1e10 }), now).name, "free", "status still applies");
+  }
+
   // --- a bad billing anchor must not switch metering off ---
   {
     const { periodStart } = await import("./server/plans.ts");

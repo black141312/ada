@@ -140,6 +140,21 @@ export interface KelviqEvent {
   data?: { object?: Record<string, unknown> };
 }
 
+/** When the paid period ends, from whatever the provider called it. Kelviq's payload shape is not
+ *  pinned down here, so several spellings are tried and anything unrecognised yields null — and null
+ *  means "never expires", i.e. exactly today's behaviour. A wrong guess must not cut someone off. */
+export function paidThroughOf(obj: Record<string, unknown>): number | null {
+  for (const k of ["currentPeriodEnd", "current_period_end", "periodEnd", "period_end", "expiresAt", "expires_at", "endsAt", "ends_at"]) {
+    const v = obj[k];
+    if (typeof v === "number" && Number.isFinite(v)) return v > 1e12 ? v : v * 1000; // seconds or ms
+    if (typeof v === "string" && v) {
+      const t = Date.parse(v);
+      if (Number.isFinite(t)) return t;
+    }
+  }
+  return null;
+}
+
 /** Apply a verified webhook event. Payment events carry our session id in metadata and complete it
  *  (idempotent — replays are no-ops); lifecycle events without one fall back to the customer id,
  *  which IS our user id. Returns a short description for the audit log, or null if irrelevant. */
@@ -157,11 +172,22 @@ export async function handleKelviqWebhook(evt: KelviqEvent): Promise<string | nu
   if (/^subscription\.(updated|plan_changed)$/.test(type) && customer) {
     const ident = obj.planIdentifier ?? (obj.plan as Record<string, unknown> | undefined)?.identifier;
     if (typeof ident === "string" && ident) {
-      await setPlan(customer, mapPlan(ident), "active");
-      return `${type} → ${customer} set to ${mapPlan(ident)}`;
+      const until = paidThroughOf(obj);
+      await setPlan(customer, mapPlan(ident), "active", true, until);
+      return `${type} → ${customer} set to ${mapPlan(ident)}${until ? ` until ${new Date(until).toISOString().slice(0, 10)}` : ""}`;
     }
   }
   if (type === "subscription.cancelled" && customer) {
+    // Cancelling is not a refund: someone who cancels on day 2 keeps what they bought until the
+    // period they paid for runs out. With no end date in the payload this stays an immediate
+    // downgrade, which is the old behaviour.
+    const until = paidThroughOf(obj);
+    if (until && until > Date.now()) {
+      const ident = obj.planIdentifier ?? (obj.plan as Record<string, unknown> | undefined)?.identifier;
+      const keep = typeof ident === "string" && ident ? mapPlan(ident) : "pro";
+      await setPlan(customer, keep, "active", false, until);
+      return `${type} → ${customer} keeps ${keep} until ${new Date(until).toISOString().slice(0, 10)}`;
+    }
     await setPlan(customer, "free", "active");
     return `${type} → ${customer} downgraded to free`;
   }
