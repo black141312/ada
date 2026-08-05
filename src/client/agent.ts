@@ -31,6 +31,9 @@ type Msg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
  *  When `onEvent` is set on SendCtrl, `send()` emits these instead of writing to stdout. */
 export type AgentEvent =
   | { type: "text"; delta: string }
+  /** The model thinking out loud, when reasoning is on. Separate from `text` because it is not part
+   *  of the answer — a caller shows it while the turn runs and drops it once the answer lands. */
+  | { type: "reasoning"; delta: string }
   | { type: "tool_call"; callId: string; name: string; detail: string }
   | { type: "tool_result"; callId: string; name: string; output: string; isError: boolean; display?: string }
   | { type: "done"; text: string; usage: string; context?: number };
@@ -995,6 +998,13 @@ export class Agent {
             this.byModel.set(key, b);
           }
           const delta = chunk.choices[0]?.delta;
+          // Reasoning arrives beside the content, under a field name nobody agrees on: OpenRouter
+          // and DeepSeek send `reasoning`, others `reasoning_content`. Never added to `content` —
+          // it is not the answer, and folding it in would put the model's scratch work in the
+          // transcript and in every later request.
+          const think = (delta as { reasoning?: string; reasoning_content?: string } | undefined);
+          const thinkDelta = think?.reasoning ?? think?.reasoning_content;
+          if (thinkDelta) ctrl?.onEvent?.({ type: "reasoning", delta: thinkDelta });
           if (delta?.content) {
             content += delta.content;
             if (!sniffed && content.trim()) {

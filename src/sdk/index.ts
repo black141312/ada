@@ -23,6 +23,9 @@ export interface PromptResult {
 /** One event from an interactive session's prompt stream. */
 export type SessionEvent =
   | { type: "text"; delta: string }
+  /** The model thinking out loud, when reasoning is on — shown while the turn runs, not part of
+   *  the answer. Only arrives from models that stream it. */
+  | { type: "reasoning"; delta: string }
   | { type: "tool_call"; callId: string; name: string; detail: string }
   | { type: "tool_result"; callId: string; name: string; output: string; isError: boolean }
   | { type: "approval_request"; id: string; name: string; summary: string }
