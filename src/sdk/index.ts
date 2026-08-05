@@ -23,6 +23,9 @@ export interface PromptResult {
 /** One event from an interactive session's prompt stream. */
 export type SessionEvent =
   | { type: "text"; delta: string }
+  /** The model thinking out loud, when reasoning is on — shown while the turn runs, not part of
+   *  the answer. Only arrives from models that stream it. */
+  | { type: "reasoning"; delta: string }
   | { type: "tool_call"; callId: string; name: string; detail: string }
   | { type: "tool_result"; callId: string; name: string; output: string; isError: boolean }
   | { type: "approval_request"; id: string; name: string; summary: string }
@@ -47,6 +50,8 @@ export interface AdaSession {
   steer(text: string): Promise<void>;
   /** Switch the session's permission mode: ask (gate every edit), plan (read-only), auto (run freely). */
   setMode(mode: "ask" | "plan" | "auto"): Promise<void>;
+  /** How hard the model thinks before answering, on models that support it. "off" clears it. */
+  setReasoning(effort: "low" | "medium" | "high" | "off"): Promise<void>;
   /** Free the session's resources server-side. (Does not delete the on-disk transcript.) */
   close(): Promise<void>;
 }
@@ -67,7 +72,7 @@ export interface AdaClient {
    * Pass `resume: "latest"` or a `file` from `listSessions()` to reattach an existing conversation
    * (e.g. after `ada serve` restarted and the old in-memory sessionId is gone).
    */
-  session(opts?: { model?: string; resume?: string }): Promise<AdaSession>;
+  session(opts?: { model?: string; resume?: string; reasoning?: "low" | "medium" | "high" | "off" }): Promise<AdaSession>;
   /** On-disk session transcripts, newest first — for building a "resume which conversation?" picker. */
   listSessions(): Promise<SessionMeta[]>;
   /** Server health + the default model. */
@@ -109,7 +114,7 @@ export function createClient(baseUrl = "http://localhost:8788"): AdaClient {
       const res = await fetch(`${url}/v1/sessions`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: opts?.model, resume: opts?.resume }),
+        body: JSON.stringify({ model: opts?.model, resume: opts?.resume, reasoning: opts?.reasoning }),
       });
       if (!res.ok) throw new Error(`ada ${res.status}: ${await res.text().catch(() => res.statusText)}`);
       const { sessionId, file, resumed } = (await res.json()) as { sessionId: string; file: string; resumed: boolean };
@@ -152,6 +157,14 @@ export function createClient(baseUrl = "http://localhost:8788"): AdaClient {
             body: JSON.stringify({ mode }),
           });
           if (!r.ok) throw new Error(`ada ${r.status}: could not set mode`);
+        },
+        async setReasoning(effort) {
+          const r = await fetch(`${url}/v1/sessions/${sessionId}`, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ reasoning: effort }),
+          });
+          if (!r.ok) throw new Error(`ada ${r.status}: could not set reasoning`);
         },
         async close() {
           await fetch(`${url}/v1/sessions/${sessionId}`, { method: "DELETE" });
