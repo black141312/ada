@@ -1082,6 +1082,11 @@ async function main(): Promise<void> {
     const sessions = new Map<string, AgentSession>();
     // `resumeFile` reattaches to an existing on-disk transcript (e.g. after `ada serve` restarted) —
     // its history replays into the new in-memory Agent so the conversation picks up where it left off.
+    // "off" is how a caller clears the effort — JSON has no way to say "the absence of a value", and
+    // an omitted field already means "leave it alone".
+    const isEffort = (v: string): boolean => v === "low" || v === "medium" || v === "high" || v === "off";
+    const effortOf = (v: string): "low" | "medium" | "high" | undefined => (v === "off" ? undefined : (v as "low" | "medium" | "high"));
+
     const makeSession = (m: string, resumeFile?: string): { id: string; rec: AgentSession } => {
       const session = resumeFile ? Session.open(resumeFile) : Session.create();
       const history = resumeFile ? (session.load() as unknown as Msg[]) : undefined;
@@ -1093,6 +1098,10 @@ async function main(): Promise<void> {
         history,
         project: trusted,
         compactAt: settings.compactAt,
+        // `ada serve` was dropping this: the saved setting reached every other way of running the
+        // agent except the one the desktop app uses, so effort was always off there. `settings`, not
+        // `flags` — serve runs long before the interactive flag parsing exists.
+        reasoning: settings.reasoning,
         autoApprove: false,
         onApprove: async (toolName, summary): Promise<ApprovalDecision> => {
           if (!rec.emit) return "no"; // no open stream to ask through — fail closed, don't silently run
@@ -1179,9 +1188,11 @@ async function main(): Promise<void> {
         req.on("end", () => {
           let m = model;
           let resume: string | undefined;
+          let effort: "low" | "medium" | "high" | undefined;
           try {
-            const j = JSON.parse(body || "{}") as { model?: string; resume?: string };
+            const j = JSON.parse(body || "{}") as { model?: string; resume?: string; reasoning?: string };
             m = j.model || model;
+            if (j.reasoning !== undefined && isEffort(j.reasoning)) effort = effortOf(j.reasoning);
             // "latest" picks the most recently modified transcript; otherwise resume expects one of
             // the `file` values from GET /v1/sessions (a restarted `ada serve` has no memory of which
             // in-memory sessionIds existed before, so the IDE re-resolves by transcript file instead).
@@ -1201,7 +1212,10 @@ async function main(): Promise<void> {
             }
           }
           const { id, rec } = makeSession(m, resume);
-          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: id, model: m, file: rec.file, resumed: !!resume }));
+          // Falls back to the serve-wide setting when the caller says nothing, so an IDE that never
+          // sends the field behaves exactly as it did before this existed.
+          if (effort !== undefined) rec.agent.setReasoning(effort);
+          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: id, model: m, file: rec.file, resumed: !!resume, reasoning: rec.agent.reasoning ?? "off" }));
         });
         return;
       }
@@ -1323,19 +1337,25 @@ async function main(): Promise<void> {
         req.on("end", () => {
           let mode: string | undefined;
           let model: string | undefined;
+          let reasoning: string | undefined;
           try {
-            const parsed = JSON.parse(body || "{}") as { mode?: string; model?: string };
+            const parsed = JSON.parse(body || "{}") as { mode?: string; model?: string; reasoning?: string };
             mode = parsed.mode;
             model = parsed.model;
+            reasoning = parsed.reasoning;
           } catch {
-            /* both stay undefined */
+            /* all stay undefined */
           }
           if (mode !== undefined && mode !== "ask" && mode !== "plan" && mode !== "auto") {
             res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: 'mode must be "ask" | "plan" | "auto"' }));
             return;
           }
-          if (mode === undefined && model === undefined) {
-            res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: "nothing to update — send mode and/or model" }));
+          if (reasoning !== undefined && !isEffort(reasoning)) {
+            res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: 'reasoning must be "low" | "medium" | "high" | "off"' }));
+            return;
+          }
+          if (mode === undefined && model === undefined && reasoning === undefined) {
+            res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: "nothing to update — send mode, model and/or reasoning" }));
             return;
           }
           if (mode !== undefined) {
@@ -1345,7 +1365,9 @@ async function main(): Promise<void> {
           }
           // Models are stateless — the context lives in the transcript, so switching mid-session is safe.
           if (model !== undefined && model.trim()) rec.agent.setModel(model.trim());
-          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, mode: rec.mode, model: rec.agent.model }));
+          // Same for effort: it is a per-request field, so the next turn simply carries the new one.
+          if (reasoning !== undefined) rec.agent.setReasoning(effortOf(reasoning));
+          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, mode: rec.mode, model: rec.agent.model, reasoning: rec.agent.reasoning ?? "off" }));
         });
         return;
       }
@@ -1408,7 +1430,7 @@ async function main(): Promise<void> {
           `  interactive: POST /v1/sessions → {sessionId}   (GET lists resumable transcripts)\n` +
           `               POST /v1/sessions/:id/prompt {"text":"…","images"?:[…]}  (SSE: text/tool_call/tool_result/approval_request/done)\n` +
           `               POST /v1/sessions/:id/approve {"id":"…","decision":"yes"|"all"|"no"}\n` +
-          `               POST /v1/sessions/:id/abort · /steer {"text":"…"} · PATCH /v1/sessions/:id {"mode":"ask"|"plan"|"auto"}`,
+          `               POST /v1/sessions/:id/abort · /steer {"text":"…"} · PATCH /v1/sessions/:id {"mode":"ask"|"plan"|"auto","model"?,"reasoning"?:"low"|"medium"|"high"|"off"}`,
       ),
     );
     // Build the search index for every workspace folder NOW, in the background, rather than letting
