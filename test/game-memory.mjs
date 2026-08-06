@@ -130,3 +130,73 @@ assert.deepEqual(detectShift(view(), view()), { dx: 0, dy: 0, mismatch: 0 }, "id
 }
 
 console.log("game-memory: ok");
+
+// ================= v2: navigator (avatar, walkability, routes, effects) =================
+const { trackMover, routes } = await import("../bench/game-memory.mjs");
+
+// A 16x16 maze: floor 5, border walls 3, internal wall column x=8 with a gap at y=12,
+// a single-cell avatar (9) at (ax, ay), a 2-cell target (7) at (12, 3..4).
+function maze(ax, ay, extra) {
+  const g = Array.from({ length: 16 }, (_, y) => Array.from({ length: 16 }, (_, x) => {
+    if (x === 0 || y === 0 || x === 15 || y === 15) return 3;
+    if (x === 8 && y !== 12) return 3;
+    return 5;
+  }));
+  g[3][12] = 7;
+  g[4][12] = 7;
+  g[ay][ax] = 9;
+  if (extra) for (const [x, y, c] of extra) g[y][x] = c;
+  return g;
+}
+
+// ---- trackMover ----
+{
+  const m = trackMover(maze(2, 2), maze(3, 2));
+  assert.ok(m, "mover found");
+  assert.equal(m.color, 9);
+  assert.deepEqual([m.from.x, m.from.y, m.to.x, m.to.y], [2, 2, 3, 2]);
+  assert.equal(trackMover(maze(2, 2), maze(2, 2)), null, "no motion = no mover");
+}
+
+// ---- avatar learning through updateMemory ----
+{
+  let st = newMemory();
+  st = updateMemory(st, "ACTION4", maze(2, 2), maze(3, 2)).state; // moved +1 x
+  st = updateMemory(st, "ACTION2", maze(3, 2), maze(3, 3)).state; // moved +1 y
+  assert.equal(st.moves["ACTION4"]?.["1,0"], 1, `avatar motion tallied: ${JSON.stringify(st.moves)}`);
+  assert.equal(st.moves["ACTION2"]?.["0,1"], 1);
+  assert.deepEqual({ x: st.avatar.x, y: st.avatar.y }, { x: 3, y: 3 }, "avatar position tracked");
+  assert.ok(st.walk["2,2"] && st.walk["3,2"], "vacated cells marked walkable");
+
+  // inert move with a learned direction records the wall CELL ahead
+  st = updateMemory(st, "ACTION4", maze(3, 3), maze(3, 3)).state;
+  assert.ok(st.walls["4,3"], `wall recorded ahead: ${JSON.stringify(st.walls)}`);
+
+  // ---- routes: BFS around the internal wall to the target ----
+  const r = routes(st, maze(3, 3));
+  const toTarget = r.find((q) => q.target.color === 7);
+  assert.ok(toTarget, `route to target exists: ${JSON.stringify(r)}`);
+  // direct manhattan distance ~ 9; the wall at x=8 forces a detour through (8,12)
+  assert.ok(toTarget.moves > 9, `detour is longer than manhattan: ${toTarget.moves}`);
+  assert.match(toTarget.path, /ACTION4/, "path expressed in learned actions");
+}
+
+// ---- effect catalog: reaching an object while other cells change ----
+{
+  let st = newMemory();
+  st = updateMemory(st, "ACTION4", maze(9, 3), maze(10, 3)).state;
+  // next move lands adjacent to the target AND a distant "door" (2,14) flips colour
+  st = updateMemory(st, "ACTION4", maze(10, 3), maze(11, 3, [[2, 14, 8], [3, 14, 8]])).state;
+  assert.equal(st.effects?.length, 1, `effect logged: ${JSON.stringify(st.effects)}`);
+  assert.match(st.effects[0], /color 7/, "effect names the touched object");
+
+  // reset keeps effects and walkable colours, clears positions
+  const fresh = resetMemory(st);
+  assert.equal(fresh.effects.length, 1, "effects survive reset");
+  assert.ok(fresh.walkColors.includes(5), "walkable colours survive reset");
+  assert.equal(fresh.avatar, null, "avatar cleared");
+  assert.deepEqual(fresh.walk, {}, "walk map cleared");
+  assert.deepEqual(fresh.walls, {}, "walls cleared");
+}
+
+console.log("game-memory v2 (navigator): ok");
