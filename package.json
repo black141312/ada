@@ -57,6 +57,8 @@
     "typecheck": "tsc --noEmit",
     "typecheck:worker": "tsc -p src/worker/tsconfig.json --noEmit",
     "selfcheck": "tsx src/selfcheck.ts",
+    "bench:memory": "tsx bench/memory.ts",
+    "bench:extraction": "tsx bench/extraction.ts",
     "bench:swebench": "node bench/swebench.mjs",
     "bench:arcagi3": "node bench/arcagi3.mjs",
     "catalog:refresh": "node scripts/refresh-catalog.mjs",

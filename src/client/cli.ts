@@ -843,7 +843,7 @@ async function main(): Promise<void> {
     return;
   }
   if (sub === "memory") {
-    memoryCommand(process.argv.slice(3), isTrusted(process.cwd()));
+    await memoryCommand(process.argv.slice(3), isTrusted(process.cwd()));
     return;
   }
   if (sub === "mcp") {
@@ -1775,7 +1775,7 @@ async function main(): Promise<void> {
       continue;
     }
     if (line === "/memory" || line.startsWith("/memory ")) {
-      memoryCommand(line.slice(7).trim().split(/\s+/).filter(Boolean), includeProject);
+      await memoryCommand(line.slice(7).trim().split(/\s+/).filter(Boolean), includeProject);
       continue;
     }
     if (line === "/connect" || line.startsWith("/connect ")) {
