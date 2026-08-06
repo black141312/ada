@@ -307,6 +307,11 @@ async function main(): Promise<void> {
   assert.equal(permPhrase("write_file", false), "create or modify files on disk", "write phrase");
   assert.ok(permPhrase("merchant__x", false).includes("connector"), "MCP phrase mentions the connector");
 
+  // --- browser approval rendering ---
+  assert.equal(describeCall("browser", { action: "click", ref: "ref_2" }).detail, "click ref_2");
+  assert.ok(permPhrase("browser", true).toLowerCase().includes("enter"), "press-Enter phrase should warn about submitting");
+  assert.ok(!permPhrase("browser", false).startsWith("run the"), "browser needs its own perm phrase");
+
   // --- baked offline catalog seeds pricing/limits (no network) ---
   {
     const { priceOf, contextOf, catalogSize, catalogText } = await import("./client/models-dev.ts");

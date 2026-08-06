@@ -563,6 +563,8 @@ export function describeCall(name: string, args: Record<string, unknown>): { lab
       return { label: "sub-agent", detail: s(a.task) };
     case "background_task":
       return { label: "background", detail: s(a.task) };
+    case "browser":
+      return { label: "browser", detail: [s(a.action), s(a.ref) || s(a.url) || s(a.key) || s(a.tab)].filter(Boolean).join(" ") };
     default:
       if (name.includes("__")) return { label: name.split("__")[0]!, detail: name.split("__").slice(1).join("__") };
       return { label: name, detail: summarize(a) };
@@ -575,6 +577,7 @@ export function permPhrase(name: string, destructive: boolean): string {
   if (name === "write_file" || name === "edit_file" || name === "apply_patch") return "create or modify files on disk";
   if (name === "generate_pptx") return "write a PowerPoint (.pptx) file to disk";
   if (name === "web_fetch" || name === "web_search") return "make a network request";
+  if (name === "browser") return destructive ? "⚠ press Enter in the browser — this can submit a form" : "look at and act in a real browser";
   if (name.includes("__")) return `use the ${name.split("__")[0]} connector`;
   return `run the ${name} tool`;
 }
@@ -1145,7 +1148,9 @@ export class Agent {
         printResult(c.id, c.name, results[i]!);
         continue;
       }
-      const forceConfirm = c.name === "bash" && isDestructive(String(args.command ?? ""));
+      const forceConfirm =
+        (c.name === "bash" && isDestructive(String(args.command ?? ""))) ||
+        (c.name === "browser" && String(args.action ?? "") === "press" && String(args.key ?? "").toLowerCase() === "enter");
       const autoOk = (this.autoApprove || perm === "allow") && !forceConfirm && perm !== "ask";
       if (autoOk) {
         results[i] = await runTool(tool, c.name, args);
