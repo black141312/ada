@@ -135,27 +135,36 @@ function cellsOf(grid, comp) {
 export function trackMover(before, after) {
   const bg = mostCommonColor(before);
   const key = (c) => `${c.color}:${c.cells}`;
-  const b = components(before, bg).filter((c) => c.cells <= 8);
-  const a = components(after, bg).filter((c) => c.cells <= 8);
+  // ≤64: a sprite can be 5×5×2 colours (LS20's is 25 cells); bars and scenery are bigger.
+  const b = components(before, bg).filter((c) => c.cells <= 64);
+  const a = components(after, bg).filter((c) => c.cells <= 64);
   const at = (list, c) => list.some((o) => o.color === c.color && o.x0 === c.x0 && o.y0 === c.y0);
   const gone = b.filter((c) => !at(a, c));
   const appeared = a.filter((c) => !at(b, c));
   const movers = gone
     .map((g) => ({ g, n: appeared.filter((p) => key(p) === key(g)) }))
     .filter(({ n }) => n.length === 1);
-  if (movers.length !== 1) return null;
-  const { g, n } = movers[0];
+  if (!movers.length) return null;
+  // Several parts all displaced by the same amount = one multi-colour avatar (LS20's
+  // sprite is two stacked colours). Different displacements = genuinely ambiguous.
+  const delta = ({ g, n }) => `${n[0].x0 - g.x0},${n[0].y0 - g.y0}`;
+  if (new Set(movers.map(delta)).size !== 1) return null;
+  const parts = movers.sort((p, q) => q.g.cells - p.g.cells);
+  const { g, n } = parts[0];
+  const toCells = parts.flatMap((p) => cellsOf(after, p.n[0]));
+  const xs = toCells.map(([x]) => x);
+  const ys = toCells.map(([, y]) => y);
   return {
     color: g.color,
-    cells: g.cells,
-    from: { x: g.x0, y: g.y0 },
-    to: { x: n[0].x0, y: n[0].y0 },
-    fromCells: cellsOf(before, g),
-    toCells: cellsOf(after, n[0]),
+    cells: parts.reduce((s, p) => s + p.g.cells, 0),
+    from: { x: Math.min(...parts.map((p) => p.g.x0)), y: Math.min(...parts.map((p) => p.g.y0)) },
+    to: { x: Math.min(...xs), y: Math.min(...ys) },
+    w: Math.max(...xs) - Math.min(...xs) + 1,
+    h: Math.max(...ys) - Math.min(...ys) + 1,
+    fromCells: parts.flatMap((p) => cellsOf(before, p.g)),
+    toCells,
   };
 }
-
-const ARROWS = { "1,0": "→", "-1,0": "←", "0,1": "↓", "0,-1": "↑" };
 
 /** dir "dx,dy" → the action whose majority meaning matches it, from learned moves. */
 function actionFor(state, dir) {
@@ -163,47 +172,58 @@ function actionFor(state, dir) {
   return null;
 }
 
-/** BFS from the avatar to the 3 nearest interesting objects, over cells whose color the
- *  avatar has stood on and that aren't known walls. Paths come out as learned actions. */
+/** BFS from the avatar to the 3 nearest interesting objects. Edges are the LEARNED move
+ *  vectors (one button press each — a stride game hops 5 cells per press), a position is
+ *  valid when the avatar's whole footprint sits on walked-on colors off any known wall,
+ *  and a target counts as reached when the footprint touches its bounding box. */
 export function routes(state, grid) {
   const av = state.avatar;
   if (!av) return [];
-  const dirsLearned = Object.values(state.moves).map(meaningOf).filter((d) => d && ARROWS[d]);
-  if (new Set(dirsLearned).size < 2) return []; // can't express a path yet
+  const edges = [...new Set(Object.values(state.moves).map(meaningOf).filter(Boolean))]
+    .map((d) => d.split(",").map(Number))
+    .filter(([dx, dy]) => dx || dy);
+  if (edges.length < 2) return []; // can't express a path yet
   const bg = mostCommonColor(grid);
-  const h = grid.length;
-  const w = grid[0]?.length ?? 0;
-  const walkable = (x, y) =>
-    x >= 0 && y >= 0 && x < w && y < h && state.walkColors.includes(grid[y][x]) && !state.walls[`${x},${y}`];
-  // BFS flood from the avatar once; then read off distances at cells adjacent to each object.
+  const H = grid.length;
+  const W = grid[0]?.length ?? 0;
+  const aw = av.w ?? 1;
+  const ah = av.h ?? 1;
+  const fits = (x, y) => {
+    if (x < 0 || y < 0 || x + aw > W || y + ah > H) return false;
+    for (let yy = y; yy < y + ah; yy++)
+      for (let xx = x; xx < x + aw; xx++) {
+        const own = xx >= av.x && xx < av.x + aw && yy >= av.y && yy < av.y + ah;
+        if (state.walls[`${xx},${yy}`]) return false;
+        if (!own && !state.walkColors.includes(grid[yy][xx]) && grid[yy][xx] !== av.color) return false;
+      }
+    return true;
+  };
   const dist = new Map([[`${av.x},${av.y}`, 0]]);
   const prev = new Map();
   const queue = [[av.x, av.y]];
   while (queue.length) {
     const [cx, cy] = queue.shift();
     const d = dist.get(`${cx},${cy}`);
-    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+    for (const [dx, dy] of edges) {
       const k = `${cx + dx},${cy + dy}`;
-      if (!walkable(cx + dx, cy + dy) || dist.has(k)) continue;
+      if (dist.has(k) || !fits(cx + dx, cy + dy)) continue;
       dist.set(k, d + 1);
       prev.set(k, `${cx},${cy}`);
       queue.push([cx + dx, cy + dy]);
     }
   }
   const targets = components(grid, bg).filter(
-    (c) => c.cells <= 200 && !(c.color === av.color && c.x0 === av.x && c.y0 === av.y),
+    (c) => c.cells <= 200 && !(c.color === av.color && c.x0 >= av.x && c.x1 < av.x + aw && c.y0 >= av.y && c.y1 < av.y + ah),
   );
+  const touches = (x, y, t) => x + aw >= t.x0 && x <= t.x1 + 1 && y + ah >= t.y0 && y <= t.y1 + 1;
   const found = [];
   for (const t of targets) {
     let best = null;
-    for (const [x, y] of cellsOf(grid, t)) {
-      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-        const k = `${x + dx},${y + dy}`;
-        if (dist.has(k) && (!best || dist.get(k) < dist.get(best))) best = k;
-      }
+    for (const [k, d] of dist) {
+      const [x, y] = k.split(",").map(Number);
+      if (touches(x, y, t) && (best === null || d < dist.get(best))) best = k;
     }
-    if (!best) continue;
-    // walk the prev-chain back to the avatar, then express it as actions
+    if (best === null || dist.get(best) === 0) continue;
     const steps = [];
     for (let k = best; prev.has(k); k = prev.get(k)) {
       const [x, y] = k.split(",").map(Number);
@@ -212,7 +232,7 @@ export function routes(state, grid) {
     }
     const runs = [];
     for (const s of steps) {
-      const act = actionFor(state, s) ?? `?${ARROWS[s] ?? s}`;
+      const act = actionFor(state, s) ?? `?(${s})`;
       const last = runs[runs.length - 1];
       if (last && last.act === act) last.n++;
       else runs.push({ act, n: 1 });
@@ -252,13 +272,19 @@ export function updateMemory(state, action, before, after) {
       event = `${action} did nothing — wall at (${wx},${wy})`;
     }
   } else if (sameShape) {
+    // Chrome learning first, mover or not: cells that change on nearly every move (an energy
+    // bar, a move counter) are HUD, and must not gate or pollute avatar/effect detection.
+    for (let y = 0; y < before.length; y++)
+      for (let x = 0; x < before[y].length; x++)
+        if (before[y][x] !== after[y][x]) state.changeFreq[`${x},${y}`] = (state.changeFreq[`${x},${y}`] ?? 0) + 1;
     const { dx, dy, mismatch } = detectShift(before, after);
     const mover = dx === 0 && dy === 0 ? trackMover(before, after) : null;
     if ((dx !== 0 || dy !== 0) && mismatch <= MOTION_GATE) {
       stitch(state, before); // seed/refresh the map at the old position first
       state.pos = { x: state.pos.x - dx, y: state.pos.y - dy }; // content +dx ⇒ camera −dx
       stitch(state, after);
-      const key = `${dx},${dy}`;
+      // moves always store PLAYER motion, whichever way it was observed (camera or avatar)
+      const key = `${-dx},${-dy}`;
       (state.moves[action] ??= {})[key] = ((state.moves[action] ?? {})[key] ?? 0) + 1;
       event = `${action}: you moved (${-dx},${-dy}) — now at world ${state.pos.x},${state.pos.y}`;
     } else if (mover) {
@@ -267,7 +293,7 @@ export function updateMemory(state, action, before, after) {
       const mdy = mover.to.y - mover.from.y;
       const key = `${mdx},${mdy}`;
       (state.moves[action] ??= {})[key] = ((state.moves[action] ?? {})[key] ?? 0) + 1;
-      state.avatar = { color: mover.color, cells: mover.cells, x: mover.to.x, y: mover.to.y };
+      state.avatar = { color: mover.color, cells: mover.cells, x: mover.to.x, y: mover.to.y, w: mover.w ?? 1, h: mover.h ?? 1 };
       for (const [x, y] of mover.fromCells) {
         state.walk[`${x},${y}`] = 1;
         const floor = after[y]?.[x];
@@ -296,13 +322,14 @@ function recordEffect(state, before, after, mover) {
   for (let y = 0; y < before.length; y++)
     for (let x = 0; x < before[y].length; x++)
       if (before[y][x] !== after[y][x] && !own.has(`${x},${y}`)) extra.push([x, y]);
-  for (const [x, y] of extra) state.changeFreq[`${x},${y}`] = (state.changeFreq[`${x},${y}`] ?? 0) + 1;
+  // changeFreq is tallied once per move in updateMemory, mover or not
   const real = extra.filter(([x, y]) => (state.changeFreq[`${x},${y}`] ?? 0) < 3); // ≥3 = HUD chrome
   if (!real.length) return "";
   const bg = mostCommonColor(after);
   // Cell-level adjacency, smallest component first — a maze's wall ring spans the whole
   // screen by bounding box and would otherwise claim every effect.
   const near = components(after, bg)
+    .filter((c) => c.cells <= 200) // a maze's whole wall network is scenery, not a "thing you touched"
     .filter((c) => !(c.color === mover.color && c.x0 === mover.to.x && c.y0 === mover.to.y))
     .sort((p, q) => p.cells - q.cells)
     .find((c) =>
@@ -339,9 +366,7 @@ export function summarize(state, grid, event) {
   const meanings = Object.entries(state.moves)
     .map(([act, tally]) => {
       const m = meaningOf(tally);
-      if (!m) return null;
-      const [dx, dy] = m.split(",").map(Number);
-      return `${act} moves you (${-dx},${-dy})`;
+      return m ? `${act} moves you (${m})` : null;
     })
     .filter(Boolean);
   const walls = Object.entries(state.blocked).map(([act, at]) => `${act} failed at: ${[...new Set(at)].slice(-5).join(" ")}`);

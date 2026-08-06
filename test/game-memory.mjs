@@ -68,14 +68,14 @@ assert.deepEqual(detectShift(view(), view()), { dx: 0, dy: 0, mismatch: 0 }, "id
   st = r1.state;
   assert.match(r1.summary, /moved/i, "summary reports motion");
   const tally = st.moves["ACTION3"];
-  assert.ok(tally && tally["-5,0"] === 1, `ACTION3 tallied shift -5,0: ${JSON.stringify(st.moves)}`);
+  assert.ok(tally && tally["5,0"] === 1, `ACTION3 tallied player +5,0: ${JSON.stringify(st.moves)}`);
   assert.deepEqual(st.pos, { x: 5, y: 0 }, `pos tracks camera, got ${JSON.stringify(st.pos)}`);
   const covered1 = Object.keys(st.world).length;
   assert.ok(covered1 > 256, `stitching extends beyond one screen: ${covered1}`);
   const r2 = updateMemory(st, "ACTION3", view(5, 0), view(10, 0));
   st = r2.state;
   assert.ok(Object.keys(st.world).length > covered1, "second move maps more world");
-  assert.equal(st.moves["ACTION3"]["-5,0"], 2, "meaning learning accumulates");
+  assert.equal(st.moves["ACTION3"]["5,0"], 2, "meaning learning accumulates");
   assert.deepEqual(st.pos, { x: 10, y: 0 });
   // stitched world must agree with the texture at a far-out world coordinate
   assert.equal(st.world["20,7"], tex(20, 7), "world cells stored at true world coords");
@@ -172,12 +172,16 @@ function maze(ax, ay, extra) {
   st = updateMemory(st, "ACTION4", maze(3, 3), maze(3, 3)).state;
   assert.ok(st.walls["4,3"], `wall recorded ahead: ${JSON.stringify(st.walls)}`);
 
+  // learn the remaining two directions — routes only use buttons it has seen work
+  st = updateMemory(st, "ACTION3", maze(3, 3), maze(2, 3)).state; // (-1,0)
+  st = updateMemory(st, "ACTION1", maze(2, 3), maze(2, 2)).state; // (0,-1)
+
   // ---- routes: BFS around the internal wall to the target ----
-  const r = routes(st, maze(3, 3));
+  const r = routes(st, maze(2, 2));
   const toTarget = r.find((q) => q.target.color === 7);
   assert.ok(toTarget, `route to target exists: ${JSON.stringify(r)}`);
-  // direct manhattan distance ~ 9; the wall at x=8 forces a detour through (8,12)
-  assert.ok(toTarget.moves > 9, `detour is longer than manhattan: ${toTarget.moves}`);
+  // direct manhattan distance ~ 10; the wall at x=8 forces a detour through (8,12)
+  assert.ok(toTarget.moves > 10, `detour is longer than manhattan: ${toTarget.moves}`);
   assert.match(toTarget.path, /ACTION4/, "path expressed in learned actions");
 }
 
@@ -200,3 +204,63 @@ function maze(ax, ay, extra) {
 }
 
 console.log("game-memory v2 (navigator): ok");
+
+// ---- v3: composite (multi-color) avatar + chrome learning ----
+{
+  // LS20-style: avatar is TWO adjacent components (12 and 9) moving together, while a
+  // HUD bar (11) at the bottom also changes every move.
+  function world(ax, ay, bar) {
+    const g = Array.from({ length: 16 }, () => Array(16).fill(4));
+    // static maze structure, as in a real game — without it, a 1-cell avatar step is
+    // cheaper to explain as camera motion and the shift detector wins
+    for (let i = 0; i < 16; i++) { g[0][i] = 3; g[14][i] = 3; g[i][0] = 3; g[i][15] = 3; }
+    for (const [x, y] of [[3, 3], [3, 4], [10, 8], [11, 8], [12, 2], [2, 10]]) g[y][x] = 3;
+    g[ay][ax] = 12; g[ay][ax + 1] = 12;      // top part of the avatar
+    g[ay + 1][ax] = 9; g[ay + 1][ax + 1] = 9; // bottom part
+    for (let x = 1; x <= bar; x++) g[15][x] = 11; // shrinking energy bar
+    return g;
+  }
+  const m = trackMover(world(5, 5, 10), world(6, 5, 9));
+  assert.ok(m, "composite avatar found despite HUD noise");
+  assert.equal(m.cells, 4, `composite counts all parts: ${JSON.stringify(m)}`);
+  assert.deepEqual([m.to.x - m.from.x, m.to.y - m.from.y], [1, 0], "delta from composite");
+
+  let st = newMemory();
+  st = updateMemory(st, "ACTION4", world(5, 5, 10), world(6, 5, 9)).state;
+  assert.equal(st.moves["ACTION4"]?.["1,0"], 1, `composite move tallied: ${JSON.stringify(st.moves)}`);
+  assert.ok(st.avatar, "avatar set from composite mover");
+  // chrome learning must not depend on a mover being found
+  let st2 = newMemory();
+  const flat = () => Array.from({ length: 16 }, () => Array(16).fill(4));
+  for (let i = 0; i < 3; i++) {
+    const a = flat(); const b = flat();
+    b[15][2] = 11; // same cell flips every time = HUD chrome
+    st2 = updateMemory(st2, "ACTION1", a, b).state;
+  }
+  assert.ok((st2.changeFreq["2,15"] ?? 0) >= 3, `chrome learned without a mover: ${JSON.stringify(st2.changeFreq)}`);
+}
+// ---- v3: stride movement (LS20-style — one press hops 5 cells) ----
+{
+  // 32x32: border walls 1, floor 3, a 5×5 two-colour avatar at anchor (ax,ay), 3×3 target 7.
+  function stride(ax, ay) {
+    const g = Array.from({ length: 32 }, (_, y) => Array.from({ length: 32 }, (_, x) =>
+      x === 0 || y === 0 || x === 31 || y === 31 ? 1 : 3));
+    for (let y = 6; y < 9; y++) for (let x = 20; x < 23; x++) g[y][x] = 7;
+    for (let y = ay; y < ay + 2; y++) for (let x = ax; x < ax + 5; x++) g[y][x] = 12;
+    for (let y = ay + 2; y < ay + 5; y++) for (let x = ax; x < ax + 5; x++) g[y][x] = 9;
+    return g;
+  }
+  let st = newMemory();
+  st = updateMemory(st, "ACTION4", stride(5, 5), stride(10, 5)).state;   // (5,0)
+  st = updateMemory(st, "ACTION2", stride(10, 5), stride(10, 10)).state; // (0,5)
+  st = updateMemory(st, "ACTION1", stride(10, 10), stride(10, 5)).state; // (0,-5)
+  st = updateMemory(st, "ACTION3", stride(10, 5), stride(5, 5)).state;   // (-5,0)
+  assert.equal(st.moves["ACTION4"]?.["5,0"], 1, `stride learned: ${JSON.stringify(st.moves)}`);
+  assert.equal(st.avatar.w, 5, "avatar footprint width tracked");
+  const r = routes(st, stride(5, 5));
+  const toTarget = r.find((q) => q.target.color === 7);
+  assert.ok(toTarget, `stride route exists: ${JSON.stringify(r)}`);
+  assert.equal(toTarget.moves, 2, `two presses to touch the target: ${JSON.stringify(toTarget)}`);
+  assert.match(toTarget.path, /ACTION4×2/, "stride path compressed to presses");
+}
+console.log("game-memory v3 (composite avatar + strides): ok");
