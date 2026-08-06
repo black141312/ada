@@ -588,7 +588,7 @@ export const tools: Tool[] = [
       const url = args.url ? String(args.url) : undefined;
       if (url && !/^https?:\/\//i.test(url)) return { output: `browser: url must start with http:// or https:// (got ${url})`, isError: true };
       try {
-        const r = await browserAction(action, url, Number(args.width) || 1280, Number(args.height) || 800);
+        const r = await browserAction(action, { url, width: Number(args.width) || 1280, height: Number(args.height) || 800 });
         if (!r.screenshot) return { output: truncate(r.text) };
         const rel = String(args.path ?? "screenshot.png");
         const abs = resolve(process.cwd(), rel.toLowerCase().endsWith(".png") ? rel : `${rel}.png`);
