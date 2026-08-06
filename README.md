@@ -231,6 +231,7 @@ are supported; their tools appear as `<server>__<tool>`, approval-gated, in trus
 | `ADA_PORT` | `8787` | Listen port |
 | `ADA_CLIENT_KEYS` | *(unset = dev/no-auth)* | Comma-separated allowed client keys |
 | `ADA_REQUIRE_LOGIN` / `ADA_ALLOWED_USERS` | — | Gate access to verified GitHub/Google users |
+| `ADA_FREE_MODELS` | *(unset)* | Extra model IDs the free tier may use, comma-separated (e.g. `deepseek/deepseek-v4-flash-0731`) on top of `:free`-suffixed ones |
 | `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | Local Ollama endpoint |
 | *(provider keys)* | — | See the [Providers](#providers) table |
 
