@@ -563,8 +563,11 @@ export function describeCall(name: string, args: Record<string, unknown>): { lab
       return { label: "sub-agent", detail: s(a.task) };
     case "background_task":
       return { label: "background", detail: s(a.task) };
-    case "browser":
-      return { label: "browser", detail: [s(a.action), s(a.ref) || s(a.url) || s(a.key) || s(a.tab)].filter(Boolean).join(" ") };
+    case "browser": {
+      const text = s(a.text);
+      const preview = text ? (text.length > 80 ? `${text.slice(0, 80)}…` : text) : "";
+      return { label: "browser", detail: [s(a.action), s(a.ref) || s(a.url) || s(a.key) || s(a.tab), preview].filter(Boolean).join(" ") };
+    }
     default:
       if (name.includes("__")) return { label: name.split("__")[0]!, detail: name.split("__").slice(1).join("__") };
       return { label: name, detail: summarize(a) };

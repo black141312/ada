@@ -336,7 +336,9 @@ export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {})
     if (action === "click") {
       const backendNodeId = needRef();
       await domReady();
-      await cdp.send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
+      await cdp.send("DOM.scrollIntoViewIfNeeded", { backendNodeId }).catch(() => {
+        throw new Error("element is not visible — `read` again");
+      });
       const q = (await cdp.send("DOM.getContentQuads", { backendNodeId }).catch(() => ({}))) as { quads?: number[][] };
       const quad = q.quads?.[0];
       if (!quad || quad.length < 8) throw new Error("element is not visible — `read` again");
@@ -351,8 +353,12 @@ export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {})
     if (action === "type") {
       const backendNodeId = needRef();
       await domReady();
-      await cdp.send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
-      await cdp.send("DOM.focus", { backendNodeId });
+      await cdp.send("DOM.scrollIntoViewIfNeeded", { backendNodeId }).catch(() => {
+        throw new Error("element is not visible — `read` again");
+      });
+      await cdp.send("DOM.focus", { backendNodeId }).catch(() => {
+        throw new Error("element is not visible — `read` again");
+      });
       // select existing content so insertText replaces it (selection APIs aren't trust-gated)
       await cdp.send("Runtime.evaluate", { expression: "{const e=document.activeElement; if(e&&typeof e.select==='function')e.select(); else if(e&&e.isContentEditable)document.execCommand('selectAll');}" });
       const text = String(opts.text ?? "");
@@ -369,7 +375,9 @@ export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {})
       if (opts.ref) {
         const backendNodeId = needRef();
         await domReady();
-        await cdp.send("DOM.scrollIntoViewIfNeeded", { backendNodeId });
+        await cdp.send("DOM.scrollIntoViewIfNeeded", { backendNodeId }).catch(() => {
+          throw new Error("element is not visible — `read` again");
+        });
         return { text: `scrolled ${opts.ref} into view on ${here}` };
       }
       const dir = String(opts.direction ?? "down");

@@ -54,6 +54,7 @@ async function main(): Promise<void> {
     console.log("browser check: ok");
   } finally {
     srv.close();
+    srv.closeAllConnections();
   }
 }
 
