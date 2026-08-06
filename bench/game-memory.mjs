@@ -211,15 +211,18 @@ export function routes(state, grid) {
   const W = grid[0]?.length ?? 0;
   const aw = av.w ?? 1;
   const ah = av.h ?? 1;
-  const targets = components(grid, bg).filter(
+  const all = components(grid, bg);
+  const targets = all.filter(
     (c) => c.cells <= 200 && !(c.x0 >= av.x && c.x1 < av.x + aw && c.y0 >= av.y && c.y1 < av.y + ah),
   );
+  // Small components are ITEMS lying on the floor (keys, locks, pickups), not architecture —
+  // walkable during search. Without this, a key beside a lock blocks the route to the lock.
+  const itemCells = new Set(all.filter((c) => c.cells <= 64).flatMap((c) => cellsOf(grid, c)).map(([x, y]) => `${x},${y}`));
   const touches = (x, y, t) => x + aw >= t.x0 && x <= t.x1 + 1 && y + ah >= t.y0 && y <= t.y1 + 1;
   const found = [];
   for (const t of targets) {
-    // Reaching an object usually means STEPPING ONTO it (keys, doors, pickups), so for this
-    // target's search its own cells count as walkable — for every other cell the avatar must
-    // have stood on that colour before.
+    // Reaching an object usually means STEPPING ONTO it, so this target's own cells are
+    // walkable too even if it's large (a door), on top of the global item allowance.
     const inT = (x, y) => x >= t.x0 && x <= t.x1 && y >= t.y0 && y <= t.y1;
     const fits = (x, y) => {
       if (x < 0 || y < 0 || x + aw > W || y + ah > H) return false;
@@ -227,7 +230,7 @@ export function routes(state, grid) {
         for (let xx = x; xx < x + aw; xx++) {
           const own = xx >= av.x && xx < av.x + aw && yy >= av.y && yy < av.y + ah;
           if (state.walls[`${xx},${yy}`]) return false;
-          if (!own && !inT(xx, yy) && !state.walkColors.includes(grid[yy][xx]) && grid[yy][xx] !== av.color) return false;
+          if (!own && !inT(xx, yy) && !itemCells.has(`${xx},${yy}`) && !state.walkColors.includes(grid[yy][xx]) && grid[yy][xx] !== av.color) return false;
         }
       return true;
     };

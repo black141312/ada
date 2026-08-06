@@ -294,5 +294,17 @@ console.log("game-memory v2 (navigator): ok");
   const toItem = r2.find((q) => q.target.color === 13);
   assert.ok(toItem, `route onto a floor item exists: ${JSON.stringify(r2)}`);
   assert.match(toItem.path, /ACTION/, "item path expressed in actions");
+
+  // a MIXED-COLOUR item cluster (key beside a lock): the neighbour item's cells must not
+  // block the route to the target — small components are items, not architecture
+  const withCluster = (ax, ay) => {
+    const g = withItem(ax, ay);
+    g[12][23] = 14; // a second, different-coloured item hugging the first
+    g[13][22] = 14;
+    return g;
+  };
+  const r3 = routes(st, withCluster(5, 5));
+  const toLock = r3.find((q) => q.target.color === 13);
+  assert.ok(toLock, `route to a clustered item exists: ${JSON.stringify(r3)}`);
 }
 console.log("game-memory v3 (composite avatar + strides): ok");
