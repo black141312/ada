@@ -142,6 +142,68 @@ class Cdp {
   }
 }
 
+// ---- accessibility tree → refs ----
+
+export interface AxNode {
+  nodeId: string;
+  ignored?: boolean;
+  role?: { value?: string };
+  name?: { value?: string };
+  value?: { value?: unknown };
+  childIds?: string[];
+  parentId?: string;
+  backendDOMNodeId?: number;
+}
+
+const INTERACTIVE = new Set(["button", "link", "textbox", "searchbox", "checkbox", "radio", "combobox", "listbox", "option", "tab", "menuitem", "slider", "switch"]);
+
+/** Serialize Accessibility.getFullAXTree output to an indented outline; interactive nodes get
+ *  ref_N tags mapping to their backendDOMNodeId. Pure — unit-tested offline in selfcheck. */
+export function formatAxTree(nodes: AxNode[]): { text: string; refs: Map<string, number> } {
+  const byId = new Map(nodes.map((n) => [n.nodeId, n]));
+  const refs = new Map<string, number>();
+  const lines: string[] = [];
+  const walk = (n: AxNode, depth: number): void => {
+    let d = depth;
+    if (!n.ignored) {
+      const role = n.role?.value ?? "";
+      const name = String(n.name?.value ?? "").trim();
+      const val = n.value?.value;
+      // unnamed layout wrappers add depth, not information — flatten them
+      const boring = (role === "generic" || role === "none" || role === "InlineTextBox") && !name;
+      if (!boring) {
+        let line = `${"  ".repeat(depth)}${role || "node"}${name ? ` "${name}"` : ""}`;
+        if (val !== undefined && val !== "") line += ` = ${JSON.stringify(String(val))}`;
+        if (INTERACTIVE.has(role) && n.backendDOMNodeId !== undefined) {
+          const ref = `ref_${refs.size + 1}`;
+          refs.set(ref, n.backendDOMNodeId);
+          line += ` [${ref}]`;
+        }
+        lines.push(line);
+        d = depth + 1;
+      }
+    }
+    for (const c of n.childIds ?? []) {
+      const k = byId.get(c);
+      if (k) walk(k, d);
+    }
+  };
+  for (const r of nodes.filter((n) => !n.parentId || !byId.has(n.parentId))) walk(r, 0);
+  return { text: lines.join("\n"), refs };
+}
+
+/** CDP key event parameters for the supported `press` keys, by lowercase name. */
+const KEYS: Record<string, { key: string; code: string; keyCode: number; text?: string }> = {
+  enter: { key: "Enter", code: "Enter", keyCode: 13, text: "\r" },
+  tab: { key: "Tab", code: "Tab", keyCode: 9 },
+  escape: { key: "Escape", code: "Escape", keyCode: 27 },
+  backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
+  arrowup: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
+  arrowdown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
+  arrowleft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
+  arrowright: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
+};
+
 export interface BrowserResult {
   text: string;
   screenshot?: Buffer;
