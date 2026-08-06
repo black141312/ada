@@ -76,7 +76,12 @@
   },
   "optionalDependencies": {
     "node-pty": "^1.1.0",
-    "sharp": "^0.34.5"
+    "sharp": "^0.35.3"
+  },
+  "//overrides": "Two high-severity advisories reach us only through @huggingface/transformers, and there is no upstream fix to wait for: transformers 4.2.0 is the latest and pins onnxruntime-node 1.24.3 exactly, while even onnxruntime-node 1.27.0 still asks for adm-zip ^0.5.16. sharp is the one that matters — convert_image runs it on arbitrary local files, so the libvips CVEs are reachable. adm-zip is only used by onnxruntime-node to unpack its own bundled binaries, never attacker-controlled input, so that one is hygiene. Drop these once transformers ships ranges that resolve clean.",
+  "overrides": {
+    "adm-zip": "^0.6.0",
+    "sharp": "^0.35.3"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260702.1",
