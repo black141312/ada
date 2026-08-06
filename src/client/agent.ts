@@ -13,7 +13,8 @@ import { configuredServers } from "./mcp.ts";
 import { contextOf, priceOf } from "./models-dev.ts";
 import { isTrusted, loadSettings, permissionFor, workspaceDirs } from "./settings.ts";
 import { routeConfident, routeSkills } from "./skills.ts";
-import { recallBlock } from "./memory.ts";
+import { recallBlock, setSmartWriter } from "./memory.ts";
+import { AUTO_LEARN, LEARN_EVERY, learnFromTranscript, rememberSmart } from "./memory-llm.ts";
 import { Session } from "./session.ts";
 import { fileURLToPath } from "node:url";
 import { runIsolatedWorker } from "./worker.ts";
@@ -644,6 +645,8 @@ export class Agent {
   private strategy = "react"; // orchestration architecture (see ORCHESTRATORS)
   private pendingNote: string | null = null; // transient skill-routing hint for the next model turn
   private pendingMemory: string | null = null; // transient auto-recalled memories for the next model turn
+  private turnsSinceLearn = 0; // turns since the last extraction pass (see maybeLearn)
+  private learning = false; // one extraction pass in flight at a time
   private project: boolean; // cwd is trusted → load project skills/memory
 
   constructor(opts: {
@@ -763,8 +766,12 @@ export class Agent {
     if (this.contextTokens() > this.compactLimit()) await this.autoCompact("size threshold");
     let skillMsg: Msg | null = null;
     if (!ctrl?.delegated) {
+      // Point the judged-write path at the agent actually running, so remember_fact resolves a new
+      // fact against the ones it resembles instead of the first-two-tokens guess. Re-bound per turn
+      // rather than in the constructor: a sub-agent must not leave its own model wired behind it.
+      setSmartWriter((i) => rememberSmart(this.client, subagentModel(this.model), i, !!this.project));
       // Auto-recall: the few memories relevant to this input, injected transiently for this turn only.
-      this.pendingMemory = recallBlock(input, !!this.project);
+      this.pendingMemory = await recallBlock(input, !!this.project);
       // Orchestrate skills: when one clearly fits, apply it (inject its procedure into context so
       // even a weak model follows it, persisted across the tool loop). Otherwise, a soft hint.
       const fit = routeConfident(input);
@@ -790,8 +797,29 @@ export class Agent {
         if (i >= 0) this.messages.splice(i, 1);
       }
     }
+    if (!ctrl?.delegated) this.maybeLearn();
     ctrl?.onEvent?.({ type: "done", text: this.lastAssistant, usage: this.usageReport(), context: this.contextTokens() });
     return this.lastAssistant;
+  }
+
+  /** Every LEARN_EVERY turns, read back the recent transcript on the cheap model and write down what
+   *  was durable — so ada learns from a session even when the model never called remember_fact.
+   *  Fire-and-forget by design: it runs AFTER the answer is delivered, adds nothing to the turn's
+   *  latency, and a failure is silent. Off with ADA_MEMORY_AUTO=0. */
+  private maybeLearn(): void {
+    if (!AUTO_LEARN || this.learning || ++this.turnsSinceLearn < LEARN_EVERY) return;
+    this.turnsSinceLearn = 0;
+    this.learning = true;
+    void learnFromTranscript(this.client, subagentModel(this.model), this.messages.slice(-14), !!this.project)
+      .then((facts) => {
+        for (const f of facts) process.stdout.write(`\x1b[2m✎ learned: ${f}\x1b[0m\n`);
+      })
+      .catch(() => {
+        /* extraction is best-effort — a dead provider must never surface as a turn error */
+      })
+      .finally(() => {
+        this.learning = false;
+      });
   }
 
   // ---- Engine: the harness primitives an Orchestrator composes ----

@@ -615,6 +615,9 @@ async function main(): Promise<void> {
   {
     const dir = join(tmpdir(), `ada-mem-${Date.now()}`);
     process.env.ADA_MEMORY_DIR = dir;
+    // Semantic recall off: the selfcheck must stay offline and deterministic, and this also asserts
+    // the real guarantee — every behaviour below holds on the lexical path alone.
+    process.env.ADA_MEMORY_SEMANTIC = "0";
     const mem = await import("./client/memory.ts");
     try {
       assert.ok(mem.rememberFact({ text: "We deploy from the release branch", scope: "project", type: "decision" }).ok, "remember a project fact");
@@ -653,26 +656,76 @@ async function main(): Promise<void> {
       assert.ok(!mem.rememberFact({ text: "the template marker is <!-- here -->" }).ok, "a comment marker in fact text is refused");
 
       // recall: relevant surfaces, off-topic injects nothing
-      const hit = mem.recallBlock("what branch do we deploy from", true);
+      const hit = await mem.recallBlock("what branch do we deploy from", true);
       assert.ok(hit && hit.includes("release branch"), "recall surfaces the relevant fact");
-      const off = mem.recallBlock("quantum chromodynamics lunch menu roster", true);
+      const off = await mem.recallBlock("quantum chromodynamics lunch menu roster", true);
       assert.ok(!(off ?? "").includes("release branch") && !(off ?? "").includes("test runner"), "off-topic recall surfaces no ranked project facts (floor)");
 
       // pinned is always recalled regardless of query
       const g = mem.rememberFact({ text: "prod migrations need ops on-call sign-off", scope: "project", type: "gotcha" });
       assert.ok(g.ok);
-      mem.memoryCommand(["pin", (g as { memory: { id: string } }).memory.id], true);
-      const pinnedBlock = mem.recallBlock("some entirely unrelated question about widgets", true);
+      await mem.memoryCommand(["pin", (g as { memory: { id: string } }).memory.id], true);
+      const pinnedBlock = await mem.recallBlock("some entirely unrelated question about widgets", true);
       assert.ok(pinnedBlock && pinnedBlock.includes("ops on-call sign-off"), "pinned fact is recalled for any query");
 
       // reference: the body is never in the recall block (only the title)
       mem.rememberFact({ text: "release runbook", scope: "project", type: "reference", body: "STEP-BODY-SECRET-MARKER: do the release" });
-      const refBlock = mem.recallBlock("release runbook steps", true);
+      const refBlock = await mem.recallBlock("release runbook steps", true);
       assert.ok(!(refBlock ?? "").includes("STEP-BODY-SECRET-MARKER"), "reference body is not auto-injected");
+
+      // judged write: explicit supersedes retires the named ids and REPLACES the subject heuristic,
+      // so a reworded fact the bigram guess would miss still retires the one it contradicts.
+      const oldF = mem.rememberFact({ text: "the staging box is rebuilt nightly", scope: "project" });
+      assert.ok(oldF.ok);
+      const oldId = (oldF as { memory: { id: string } }).memory.id;
+      const merged = mem.rememberFact({ text: "staging is rebuilt every night at 02:00 UTC", scope: "project", supersedes: [oldId] });
+      assert.ok(merged.ok, "judged write stores");
+      const live = mem.loadMemories(true).filter((m) => m.text.includes("staging"));
+      assert.equal(live.length, 1, "explicit supersedes retires the target");
+      assert.ok(live[0]!.text.includes("02:00"), "the judged wording is what stays live");
+      // a target that no longer exists must be a no-op, never a thrown write
+      assert.ok(mem.rememberFact({ text: "the linter is biome", scope: "project", supersedes: ["m-does-not-exist"] }).ok, "unknown supersede target is harmless");
+
+      // usage signal: recall records that a fact was used, and is throttled to once per fact per day
+      // so the hot path can't rewrite the ledger every turn.
+      const hitsOf = (): number => mem.loadMemories(true).find((m) => m.text.includes("biome"))!.hits;
+      assert.equal(hitsOf(), 0, "a never-recalled fact has no hits");
+      await mem.recallBlock("which linter biome", true);
+      assert.equal(hitsOf(), 1, "recall records usage");
+      await mem.recallBlock("which linter biome", true);
+      assert.equal(hitsOf(), 1, "a second recall the same day does not rewrite the ledger");
+      const stillOff = await mem.recallBlock("quantum chromodynamics lunch menu roster", true);
+      assert.ok(!(stillOff ?? "").includes("release branch"), "a recalled-often fact still respects the relevance floor");
     } finally {
       delete process.env.ADA_MEMORY_DIR;
+      delete process.env.ADA_MEMORY_SEMANTIC;
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+
+  // --- memory LLM passes: reply parsing is tolerant, and never trusts what it wasn't shown ---
+  {
+    const llm = await import("./client/memory-llm.ts");
+    assert.deepEqual(llm.parseFacts("[]"), [], "empty extraction is a valid answer");
+    assert.deepEqual(llm.parseFacts("total nonsense, no json here"), [], "unparseable extraction yields nothing");
+    const fenced = llm.parseFacts('```json\n[{"text":"the test runner is vitest","type":"convention","scope":"project"}]\n```');
+    assert.equal(fenced.length, 1, "a fenced reply still parses");
+    assert.equal(fenced[0]!.type, "convention");
+    assert.equal(llm.parseFacts('[{"text":"short","type":"fact"}]').length, 0, "a too-short fact is dropped");
+    assert.equal(llm.parseFacts(`[{"text":"${"x".repeat(300)}","type":"fact"}]`).length, 0, "a paragraph-length 'fact' is a summary, dropped");
+    assert.equal(llm.parseFacts('[{"text":"a fact one here","type":"nonsense"}]')[0]!.type, "fact", "an unknown type falls back to fact");
+    // Asserted against the exported constant, not a literal — the cap is a tuned value (raised from
+    // 3 to 6 after bench/extraction.ts showed it capping recall on dense sessions) and the invariant
+    // being tested is "there IS a cap", not what it currently equals.
+    const many = Array.from({ length: llm.MAX_PER_PASS + 4 }, (_, i) => `{"text":"durable fact number ${i}"}`).join(",");
+    assert.equal(llm.parseFacts(`[${many}]`).length, llm.MAX_PER_PASS, "extraction is capped per pass");
+
+    const offered = new Set(["m1", "m2"]);
+    assert.equal(llm.parseJudgment('{"action":"skip","targets":[],"text":"x"}', "new fact", offered).action, "skip");
+    assert.deepEqual(llm.parseJudgment('{"action":"update","targets":["m1","m9"],"text":"merged wording"}', "new fact", offered).targets, ["m1"], "a hallucinated target id is discarded");
+    assert.equal(llm.parseJudgment('{"action":"update","targets":["m9"],"text":"merged wording"}', "new fact", offered).action, "store", "an update with no surviving target degrades to store, never a silent drop");
+    assert.equal(llm.parseJudgment("garbage", "new fact", offered).action, "store", "an unparseable judgment defaults to store");
+    assert.equal(llm.parseJudgment("garbage", "new fact", offered).text, "new fact", "…keeping the original wording");
   }
 
   // --- org policy merge: restrictive wins, org can tighten but never loosen ---

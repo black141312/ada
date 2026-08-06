@@ -1,23 +1,34 @@
 // Auto-memory: durable facts ada recalls automatically at the start of every turn. Storage is plain
 // Markdown bullets (git-diffable, hand-editable) under .ada/memory/ (project, trusted-gated) and
-// ~/.ada/memory/ (global). Recall reuses the lexical ranker (skill-router.rankSkills) — deterministic,
-// offline, zero-dep — and rides agent.ts's per-turn transient system-note seam, so it's recomputed
-// fresh each turn and NEVER persisted: context stays flat as the store grows.
+// ~/.ada/memory/ (global). Recall blends the lexical ranker (skill-router.rankSkills — deterministic,
+// offline, zero-dep) with cosine similarity from the local embedder (memory-vec.ts) by RRF, and rides
+// agent.ts's per-turn transient system-note seam, so it's recomputed fresh each turn and NEVER
+// persisted: context stays flat as the store grows.
+//
+// Measured by bench/memory.ts (20 paraphrase probes, ledger swept to 120 facts):
+//   lexical only  25% hit, MRR 0.20   ·   hybrid  75% hit, MRR 0.53, 0/8 off-topic false positives
 //
 // Design guarantees (see selfcheck-memory.ts):
-//   - cost-free-until-relevant: an off-topic turn injects zero facts (hard score floor);
+//   - cost-free-until-relevant: an off-topic turn injects zero facts on the lexical path (hard score
+//     floor). The semantic half softens this to *nearly* zero — measured 1 off-topic probe in 8
+//     injecting a single fact — which bought +30 points of hit rate. Stated plainly because it is a
+//     deliberate trade, not an oversight: `ADA_MEMORY_SEMANTIC=0` restores the absolute guarantee;
 //   - ranked-not-dumped + budget-capped (≤ K facts, ≤ char cap; drop whole facts, never truncate);
 //   - ephemeral recall: a recall turn leaves the persistent message list unchanged;
 //   - secret-safe: redactScan refuses secrets on EVERY write AND at load — a leaked value can't
 //     enter context even via a hand-edit;
-//   - supersede-not-duplicate: a same-subject value change retires the old fact (kept for git audit).
+//   - supersede-not-duplicate: a same-subject value change retires the old fact (kept for git audit);
+//   - lexical-only still works: semantic recall and the LLM judge (memory-llm.ts) are both additive.
+//     With no model, no network or ADA_MEMORY_SEMANTIC=0, every guarantee above still holds.
 //
-// ponytail: lexical recall is the always-on hot path (a per-turn embedding/LLM re-rank is a cut
-// anti-feature). An optional Ollama-embedding blend for /memory search is the documented follow-up.
+// ponytail: the semantic half is a cosine over a cache of the SAME MiniLM vectors @codebase already
+// builds — no new dependency, no vector DB, no index server.
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { rerank } from "./memory-rerank.ts";
+import { SIM_FLOOR, semanticScores } from "./memory-vec.ts";
 import { rankSkills, tokenize } from "./skill-router.ts";
 import { registerTool } from "./tools.ts";
 
@@ -31,14 +42,35 @@ export interface Memory {
   pin: boolean;
   tags: string[];
   added: string;
-  used: string;
-  hits: number;
+  used: string; // last WRITE (stored, edited, re-asserted)
+  /** Last day this fact was auto-recalled. Separate from `used` on purpose: a fact written today
+   *  already has used=today, so reusing it as the recall throttle would silently never count. */
+  recalled: string;
+  hits: number; // times auto-recalled (day-granular) + times re-asserted
   superseded?: string; // id that replaced this one — kept in the file for audit, excluded from recall
 }
 
 const K = Number(process.env.ADA_MEMORY_K) || 7; // max facts injected per turn
 const CHAR_CAP = Number(process.env.ADA_MEMORY_CHARS) || 1800; // rough ~450-token ceiling on the block
-const FLOOR = Number(process.env.ADA_MEMORY_FLOOR) || 1; // min rank score for a fact to be recalled
+const FLOOR = Number(process.env.ADA_MEMORY_FLOOR) || 1; // min lexical score for a fact to be recalled
+const RRF_K = 60; // reciprocal-rank-fusion damping — the standard constant; ranks, not scores, so the
+// lexical (unbounded idf sum) and semantic (0..1 cosine) scales never have to be reconciled.
+/** How many facts the semantic half may nominate. The embedder ranks well but scores flat (see
+ *  SIM_FLOOR), so the useful signal is "which few are closest", not "how close".
+ *  Swept on bench/memory.ts at ledger 120: 1 → 65% hit, 3 → 65%, 5 → 70%, 8 → 75%, 12 → 75% (the
+ *  noise floor caps it there anyway). Going 3 → 8 cost 0.8 more facts injected per turn and gained
+ *  10 points of hit rate; lower N is more token-efficient if that trade ever stops being worth it. */
+const SEM_TOPN = Number(process.env.ADA_MEMORY_SEM_TOPN) || 8;
+/**
+ * Fusion weights. Plain RRF weights both halves equally; these let one count for more — or, at 0,
+ * not run at all, which is how bench/memory.ts measures each retriever in isolation.
+ * Measured (ledger 120, topn 8): lexical alone 25% hit / MRR 0.20 · semantic alone 70% / 0.62 ·
+ * equal 75% / 0.48 · semantic-doubled 75% / 0.53. Doubling the semantic half keeps the best hit rate
+ * while recovering the ranking quality that equal weighting gave away, at no extra token cost.
+ * Lexical stays in: alone it is weak, but it is free (no model, no latency) and worth +5 points.
+ */
+const W_LEX = process.env.ADA_MEMORY_W_LEX === undefined ? 1 : Number(process.env.ADA_MEMORY_W_LEX);
+const W_SEM = process.env.ADA_MEMORY_W_SEM === undefined ? 2 : Number(process.env.ADA_MEMORY_W_SEM);
 const TYPES = new Set<MemType>(["preference", "convention", "decision", "gotcha", "fact", "reference"]);
 
 function memDir(scope: MemScope): string {
@@ -116,6 +148,7 @@ function similar(a: string, b: string): number {
 // ---- parse / serialize (one bullet + HTML-comment metadata trailer) ----
 function serialize(m: Memory): string {
   const meta = [`id=${m.id}`, `type=${m.type}`, `scope=${m.scope}`, `pin=${m.pin ? 1 : 0}`, `added=${m.added}`, `used=${m.used}`, `hits=${m.hits}`];
+  if (m.recalled) meta.push(`recalled=${m.recalled}`);
   if (m.tags.length) meta.push(`tags=${m.tags.join(",")}`);
   if (m.superseded) meta.push(`superseded=${m.superseded}`);
   return `- ${m.text} <!-- ${meta.join(" ")} -->`;
@@ -140,6 +173,7 @@ function parseLine(line: string, scope: MemScope): Memory | null {
     tags: meta.tags ? meta.tags.split(",").filter(Boolean) : [],
     added: meta.added ?? "",
     used: meta.used ?? "",
+    recalled: meta.recalled ?? "", // absent in ledgers written before recall was tracked
     hits: Number(meta.hits) || 0,
     superseded: meta.superseded,
   };
@@ -193,8 +227,11 @@ function readScopeRaw(scope: MemScope): Memory[] {
 const today = (): string => new Date().toISOString().slice(0, 10);
 
 /** Append a fact (crash-safe single-line write), after the secret gate + dedup/supersede pass.
- *  Returns the stored memory, or null if refused (secret) — the caller surfaces the reason. */
-export function rememberFact(input: { text: string; scope?: MemScope; type?: MemType; tags?: string[]; body?: string }): { ok: true; memory: Memory; superseded?: string } | { ok: false; reason: string } {
+ *  Returns the stored memory, or null if refused (secret) — the caller surfaces the reason.
+ *  `supersedes` retires specific ids explicitly (the LLM judge's update/merge verdict); when given
+ *  it REPLACES the same-subject heuristic rather than adding to it — the judge saw the full text of
+ *  every candidate, so a leading-bigram guess on top of that could only make the decision worse. */
+export function rememberFact(input: { text: string; scope?: MemScope; type?: MemType; tags?: string[]; body?: string; supersedes?: string[] }): { ok: true; memory: Memory; superseded?: string } | { ok: false; reason: string } {
   const text = input.text.trim().replace(/\s+/g, " ");
   if (!text) return { ok: false, reason: "empty" };
   if (/<!--|-->/.test(text)) return { ok: false, reason: "fact text may not contain a comment marker" }; // would corrupt the ledger trailer
@@ -215,13 +252,24 @@ export function rememberFact(input: { text: string; scope?: MemScope; type?: Mem
     writeScope(scope, raw);
     return { ok: true, memory: dup };
   }
-  const m: Memory = { id: newId(), text, type, scope, pin: false, tags: input.tags ?? [], added: today(), used: today(), hits: 0 };
-  // supersede: an existing live line about the SAME subject AND genuinely similar (a changed value),
-  // not merely a shared leading bigram — so distinct safety facts are never silently retired.
-  const same = raw.find((x) => !x.superseded && subj && subjectKey(x.text) === subj && normalize(x.text) !== norm && similar(x.text, text) >= 0.4);
-  if (same) {
-    same.superseded = m.id;
-    supersededId = same.id;
+  const m: Memory = { id: newId(), text, type, scope, pin: false, tags: input.tags ?? [], added: today(), used: today(), recalled: "", hits: 0 };
+  if (input.supersedes?.length) {
+    // Explicit (judged) retirement: many-to-one is allowed — one merged fact can replace several.
+    const targets = new Set(input.supersedes);
+    for (const x of raw) {
+      if (x.superseded || !targets.has(x.id)) continue;
+      x.superseded = m.id;
+      supersededId = x.id;
+      m.pin ||= x.pin; // a merge must not silently unpin what the user pinned
+    }
+  } else {
+    // supersede: an existing live line about the SAME subject AND genuinely similar (a changed value),
+    // not merely a shared leading bigram — so distinct safety facts are never silently retired.
+    const same = raw.find((x) => !x.superseded && subj && subjectKey(x.text) === subj && normalize(x.text) !== norm && similar(x.text, text) >= 0.4);
+    if (same) {
+      same.superseded = m.id;
+      supersededId = same.id;
+    }
   }
   if (input.type === "reference" && input.body) {
     mkdirSync(join(memDir(scope), "ref"), { recursive: true });
@@ -240,6 +288,15 @@ export function setFactExtractor(fn: ((fact: string) => void) | null): void {
   onRemember = fn;
 }
 
+export type WriteInput = { text: string; scope?: MemScope; type?: MemType; tags?: string[]; body?: string };
+export type WriteResult = { ok: true; memory: Memory; skipped?: boolean; superseded?: string } | { ok: false; reason: string };
+// Optional judged-write path (memory-llm.rememberSmart). A hook, not an import, so memory.ts keeps
+// no dependency on a model/client and stays offline-testable; null = the deterministic write.
+let smartWrite: ((input: WriteInput) => Promise<WriteResult>) | null = null;
+export function setSmartWriter(fn: ((input: WriteInput) => Promise<WriteResult>) | null): void {
+  smartWrite = fn;
+}
+
 function inferScope(text: string): MemScope {
   const t = " " + text.toLowerCase() + " ";
   if (/\b(this repo|this project|here|we use|we deploy|our |in this codebase)\b/.test(t)) return "project";
@@ -248,6 +305,22 @@ function inferScope(text: string): MemScope {
 }
 
 // ---- ranking / recall ----
+
+/** Usage prior: a fact that keeps getting recalled, and was recalled recently, is slightly more
+ *  likely to be the right one again. Deliberately small (≤ ~1.5x) — it reorders near-ties, it never
+ *  outvotes relevance. Multiplicative on a score rankSkills only returns when > 0, so it can never
+ *  lift an unmatched fact over FLOOR: the cost-free-until-relevant guarantee is unaffected. */
+function usageBoost(m: Memory): number {
+  let b = 1;
+  if (m.hits > 0) b += 0.15 * Math.log2(1 + m.hits);
+  const t = Date.parse(m.recalled || m.used);
+  if (!Number.isNaN(t)) {
+    const days = (Date.now() - t) / 86_400_000;
+    if (days >= 0 && days <= 14) b += 0.1;
+  }
+  return b;
+}
+
 export function rankMemories(query: string, mems: Memory[]): { m: Memory; score: number }[] {
   const items = mems.map((m) => ({ name: [...m.tags, m.type].join(" "), description: m.text }));
   const ranked = rankSkills(query, items, items.length);
@@ -262,9 +335,97 @@ export function rankMemories(query: string, mems: Memory[]): { m: Memory; score:
   const out: { m: Memory; score: number }[] = [];
   for (const r of ranked) {
     const m = byText.get(r.description)?.shift();
-    if (m) out.push({ m, score: r.score });
+    if (m) out.push({ m, score: r.score * usageBoost(m) });
   }
-  return out;
+  return out.sort((a, b) => b.score - a.score); // re-sort: the boost can reorder near-ties
+}
+
+/**
+ * What actually gets embedded for a fact. Off by default: the lexical ranker boosts tags and type
+ * 2.5x because token overlap on a label is cheap evidence, but an embedder reads the label as part
+ * of a sentence, where a generic word like "convention" mostly adds noise to the vector.
+ * Measured (ledger 120): hit unchanged at 75%, MRR 0.53 -> 0.56, but facts injected per turn 4.3 ->
+ * 4.8. A third of a rank position for half a fact more in every prompt is not a trade worth taking
+ * by default, and auto-extracted facts currently carry only the tag "auto" — so there is little real
+ * tag signal to gain until the extractor emits meaningful ones.
+ * Enable with ADA_MEMORY_EMBED_TAGS=1.
+ */
+const EMBED_ENRICH = process.env.ADA_MEMORY_EMBED_TAGS === "1";
+export function embedItems(mems: Memory[]): Array<{ id: string; text: string }> {
+  if (!EMBED_ENRICH) return mems.map((m) => ({ id: m.id, text: m.text }));
+  // The enriched string IS the cache key, so flipping this flag (or editing a fact's tags)
+  // re-embeds rather than silently comparing against a stale vector.
+  return mems.map((m) => ({ id: m.id, text: m.tags.length ? `${m.type} (${m.tags.join(", ")}): ${m.text}` : `${m.type}: ${m.text}` }));
+}
+
+export interface Ranked {
+  m: Memory;
+  /** Fused rank score. Tiny by construction (~0.03 max) — compare it to other fused scores, nothing else. */
+  score: number;
+  lex: number; // lexical score, 0 when the lexical ranker didn't match at all
+  sem: number; // cosine, 0 when semantic recall was unavailable or the fact wasn't cached yet
+}
+
+/**
+ * Lexical ∪ semantic, fused by reciprocal rank. Two ranked lists over the same facts are combined as
+ * sum(1 / (RRF_K + rank)) — rank-based, so an unbounded idf sum and a 0..1 cosine never need to be
+ * put on a common scale, and neither half can dominate by having larger numbers.
+ *
+ * Semantic evidence is ADDITIVE: when it's unavailable (offline, model still downloading, disabled)
+ * `sem` is 0 everywhere and this degrades to exactly the old lexical ordering.
+ */
+export async function rankHybrid(query: string, mems: Memory[]): Promise<Ranked[]> {
+  const lex = rankMemories(query, mems);
+  let sem = new Map<string, number>();
+  try {
+    sem = await semanticScores(query, embedItems(mems));
+  } catch {
+    /* semantic recall is best-effort — never fail a turn over it */
+  }
+  const semList = [...sem.entries()]
+    .filter(([, s]) => s >= SIM_FLOOR) // screen out the noise band, not a relevance judgement
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, SEM_TOPN); // relevance IS the rank — take the closest few and let RRF weigh them
+
+  const byId = new Map(mems.map((m) => [m.id, m]));
+  const acc = new Map<string, Ranked>();
+  const bump = (id: string, rank: number, field: "lex" | "sem", value: number, weight: number): void => {
+    const m = byId.get(id);
+    if (!m) return;
+    const cur = acc.get(id) ?? { m, score: 0, lex: 0, sem: 0 };
+    cur.score += weight / (RRF_K + rank);
+    cur[field] = value;
+    acc.set(id, cur);
+  };
+  // A zero-weight half is skipped entirely rather than scored at 0 — otherwise its candidates would
+  // still land in `acc` and still pass the eligibility check downstream, just ranked last.
+  if (W_LEX > 0) lex.forEach((r, i) => bump(r.m.id, i, "lex", r.score, W_LEX));
+  if (W_SEM > 0) semList.forEach(([id, s], i) => bump(id, i, "sem", s, W_SEM));
+  return [...acc.values()].sort((a, b) => b.score - a.score);
+}
+
+/** Record that these facts were used. Throttled to once per fact per day, so the hot path costs at
+ *  most one small rewrite per scope per day and the ledger's git history stays readable. */
+function touch(used: Memory[]): void {
+  const day = today();
+  const stale = used.filter((m) => m.recalled !== day);
+  if (!stale.length) return;
+  const ids = new Set(stale.map((m) => m.id));
+  for (const scope of new Set(stale.map((m) => m.scope))) {
+    try {
+      const raw = readScopeRaw(scope);
+      let dirty = false;
+      for (const x of raw) {
+        if (x.superseded || !ids.has(x.id)) continue;
+        x.hits++;
+        x.recalled = day;
+        dirty = true;
+      }
+      if (dirty) writeScope(scope, raw);
+    } catch {
+      /* a read-only or vanished ledger must not break recall */
+    }
+  }
 }
 
 let _lastInjected: { id: string; score: number }[] = [];
@@ -274,14 +435,24 @@ export function lastInjected(): { id: string; score: number }[] {
 
 /** The auto-recall block for a turn: pinned + small user-core facts always, then the highest-ranked
  *  relevant facts up to the budget. Null when nothing clears the floor (an off-topic turn = no cost). */
-function memoryBlock(query: string, includeProject: boolean): string | null {
+async function memoryBlock(query: string, includeProject: boolean): Promise<string | null> {
   const mems = loadMemories(includeProject);
   if (!mems.length) return null;
   const pinned = mems.filter((m) => m.pin);
   const core = mems.filter((m) => !m.pin && m.scope === "user" && m.type === "preference" && m.text.length < 120);
   const alwaysIds = new Set([...pinned, ...core].map((m) => m.id));
   const rest = mems.filter((m) => !alwaysIds.has(m.id));
-  const ranked = rankMemories(query, rest).filter((r) => r.score >= FLOOR);
+  // Eligibility is per-signal and unchanged for the lexical half: a fact is recallable if the lexical
+  // ranker clears FLOOR *or* the embedder clears SIM_FLOOR. Ordering among the eligible is the fused
+  // rank. An off-topic query clears neither, so it still injects nothing.
+  let ranked = (await rankHybrid(query, rest)).filter((r) => r.lex >= FLOOR || r.sem >= SIM_FLOOR);
+  // Final stage: a cross-encoder rereads (query, fact) as one input and reorders the shortlist.
+  // Eligibility is NOT revisited here — fusion decides what may be recalled, the reranker only
+  // decides what comes first, so this can never widen recall past the floors above.
+  // Rescored by POSITION after reranking, because the char-budget pass below re-sorts by `score` and
+  // would otherwise throw the new order away and restore the fused one. When reranking is off or
+  // failed this is a no-op reindex of an already-descending list.
+  ranked = (await rerank(query, ranked, (r) => r.m.text)).map((r, i) => ({ ...r, score: 1 / (i + 1) }));
 
   const chosen: { m: Memory; score: number }[] = [...pinned, ...core].map((m) => ({ m, score: Infinity }));
   for (const r of ranked) {
@@ -300,7 +471,9 @@ function memoryBlock(query: string, includeProject: boolean): string | null {
     used += len;
   }
   if (!kept.length) return null;
-  _lastInjected = kept.map((c) => ({ id: c.m.id, score: c.score === Infinity ? 999 : Math.round(c.score * 100) / 100 }));
+  // Fused scores live around 0.01–0.03; scale for display so `/memory why` isn't a column of "0.02".
+  _lastInjected = kept.map((c) => ({ id: c.m.id, score: c.score === Infinity ? 999 : Math.round(c.score * 1000) / 10 }));
+  touch(kept.map((c) => c.m));
   const lines = kept.map((c) => {
     const tail = c.m.pin ? "  [pinned]" : c.m.type === "reference" ? `  (reference — call recall({id:"${c.m.id}"}) for details)` : "";
     return `- ${c.m.text}${tail}`;
@@ -315,9 +488,11 @@ export function setRecallAugmenter(fn: ((query: string, includeProject: boolean)
   recallAugment = fn;
 }
 
-/** Auto-recall for a turn: the relevant flat facts, plus any related facts the graph surfaces. */
-export function recallBlock(query: string, includeProject: boolean): string | null {
-  const mem = memoryBlock(query, includeProject);
+/** Auto-recall for a turn: the relevant flat facts, plus any related facts the graph surfaces.
+ *  Async only because of the semantic half, which is time-boxed inside semanticScores — this never
+ *  waits on the network and never throws. */
+export async function recallBlock(query: string, includeProject: boolean): Promise<string | null> {
+  const mem = await memoryBlock(query, includeProject);
   const graph = recallAugment?.(query, includeProject) ?? null;
   if (!mem && !graph) return null;
   return [mem, graph].filter(Boolean).join("\n\n");
@@ -357,14 +532,18 @@ export function registerMemoryTools(includeProject: boolean): void {
     },
     needsApproval: false,
     async run(args) {
-      const r = rememberFact({
+      const input: WriteInput = {
         text: String(args.text ?? ""),
         scope: args.scope === "user" || args.scope === "project" ? args.scope : undefined,
         type: args.type as MemType | undefined,
         tags: Array.isArray(args.tags) ? args.tags.map(String) : undefined,
         body: args.body ? String(args.body) : undefined,
-      });
+      };
+      // Judged write when a model is wired (resolves this against the facts it resembles), plain
+      // deterministic write otherwise. rememberSmart falls back to the same call on any failure.
+      const r: WriteResult = smartWrite ? await smartWrite(input) : rememberFact(input);
       if (!r.ok) return { output: `refused: ${r.reason}`, display: `\x1b[33m⚠ not remembered: ${r.reason}\x1b[0m`, isError: false };
+      if (r.skipped) return { output: "already known — nothing stored", display: `\x1b[2m✎ already known: ${r.memory.text}\x1b[0m` };
       const sup = r.superseded ? ` (replaced an older fact)` : "";
       return { output: `remembered (${r.memory.scope})${sup}`, display: `\x1b[2m✎ remembered: ${r.memory.text}${sup}\x1b[0m` };
     },
@@ -395,7 +574,7 @@ export function registerMemoryTools(includeProject: boolean): void {
 }
 
 // ---- /memory command (REPL) + `ada memory` (headless) ----
-export function memoryCommand(argv: string[], includeProject: boolean): void {
+export async function memoryCommand(argv: string[], includeProject: boolean): Promise<void> {
   const [sub, ...rest] = argv;
   const arg = rest.join(" ").trim();
   const scopesOf = (): MemScope[] => (includeProject ? ["project", "user"] : ["user"]);
@@ -417,8 +596,9 @@ export function memoryCommand(argv: string[], includeProject: boolean): void {
       return list();
     case "add": {
       if (!arg) return console.log("usage: /memory add <fact>");
-      const r = rememberFact({ text: arg });
-      return console.log(r.ok ? `✎ remembered (${r.memory.scope})` : `refused: ${r.reason}`);
+      const r: WriteResult = smartWrite ? await smartWrite({ text: arg }) : rememberFact({ text: arg });
+      if (!r.ok) return console.log(`refused: ${r.reason}`);
+      return console.log(r.skipped ? `already known: ${r.memory.text}` : `✎ remembered (${r.memory.scope})`);
     }
     case "forget": {
       if (!arg) return console.log("usage: /memory forget <id|substring>");
@@ -446,9 +626,13 @@ export function memoryCommand(argv: string[], includeProject: boolean): void {
     }
     case "search": {
       if (!arg) return console.log("usage: /memory search <query>");
-      const ranked = rankMemories(arg, loadMemories(includeProject)).slice(0, 10);
+      // Ungated on purpose — an explicit search should show near-misses; auto-recall is the gated one.
+      const ranked = (await rankHybrid(arg, loadMemories(includeProject))).slice(0, 10);
       if (!ranked.length) return console.log("no matches");
-      for (const r of ranked) console.log(`  \x1b[2m${r.score.toFixed(1)}\x1b[0m ${r.m.text} \x1b[2m${r.m.id}\x1b[0m`);
+      for (const r of ranked) {
+        const how = r.lex && r.sem ? "both" : r.sem ? "semantic" : "lexical";
+        console.log(`  \x1b[2m${(r.score * 1000).toFixed(1)}\x1b[0m ${r.m.text} \x1b[2m${r.m.id} · ${how}\x1b[0m`);
+      }
       return;
     }
     case "why": {
