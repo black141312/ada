@@ -37,6 +37,7 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
+import { loadMemory, resetMemory, saveMemory, updateMemory } from "./game-memory.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SELF = resolve(HERE, "arcagi3.mjs");
@@ -222,6 +223,10 @@ budget runs out.
 How to approach it:
 - Take an action, then compare the new frame against the previous one. What moved? What changed
   colour? Which action caused it? That difference is your only source of truth.
+- After every action a MEMORY block is printed: it is derived mechanically from your own moves
+  (which button moves you where, where moves failed — likely walls, your world position, a stitched
+  map size, and the objects on screen). Trust it instead of re-deriving those facts, and build your
+  plans on it. "X failed at" a spot means a wall there, not that the button never works.
 - Write your working notes to notes.md as you go, and keep them current — hypotheses about the rules,
   what each action does, what seems to score. You will need them after many turns.
 - Feel free to write throwaway scripts to diff frames or find shapes if that is faster than eyeballing
@@ -426,6 +431,7 @@ async function play(argv) {
   }
 
   let act = null;
+  let memoryNote = "";
   if (word === "RESET") {
     s.obs = await arc("/api/cmd/RESET", {
       key,
@@ -433,6 +439,9 @@ async function play(argv) {
       body: { game_id: s.game_id, card_id: s.card_id, guid: s.obs.guid },
     });
     s.resets = (s.resets ?? 0) + 1;
+    // Fresh attempt: the map is stale, but what the buttons mean survives death.
+    saveMemory(dir, resetMemory(loadMemory(dir)));
+    memoryNote = "\nMEMORY: map cleared for the new attempt; learned buttons kept.";
   } else {
     if (s.used >= s.maxSteps) {
       console.log(
@@ -467,6 +476,10 @@ async function play(argv) {
     });
     changed = countChanged(before, latestGrid(s.obs.frame));
     s.used++;
+    // Interpret the frame relative to this move and remember it (map, walls, button meanings).
+    const mem = updateMemory(loadMemory(dir), `ACTION${act.id}`, before, latestGrid(s.obs.frame));
+    saveMemory(dir, mem.state);
+    memoryNote = `\n${mem.summary}`;
   }
 
   s.cookies = cookies.toJSON();
@@ -481,7 +494,7 @@ async function play(argv) {
     join(dir, "steps.jsonl"),
     `${JSON.stringify({ step: s.used, action: label, changed, state: s.obs.state, levels_completed: s.obs.levels_completed })}\n`,
   );
-  console.log(formatObs(s.obs, s.used, s.maxSteps));
+  console.log(formatObs(s.obs, s.used, s.maxSteps) + memoryNote);
 }
 
 // ---------- agent mode ----------
