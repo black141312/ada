@@ -282,5 +282,17 @@ console.log("game-memory v2 (navigator): ok");
   assert.ok(toTarget, `stride route exists: ${JSON.stringify(r)}`);
   assert.equal(toTarget.moves, 2, `two presses to touch the target: ${JSON.stringify(toTarget)}`);
   assert.match(toTarget.path, /ACTION4×2/, "stride path compressed to presses");
+
+  // an ITEM lying on the floor: with 5-cell hops there is no adjacent-without-overlap spot,
+  // so the route must be allowed to step ONTO it (the LS20 lock/key case)
+  const withItem = (ax, ay) => {
+    const g = stride(ax, ay);
+    for (let y = 11; y < 13; y++) for (let x = 21; x < 23; x++) g[y][x] = 13;
+    return g;
+  };
+  const r2 = routes(st, withItem(5, 5));
+  const toItem = r2.find((q) => q.target.color === 13);
+  assert.ok(toItem, `route onto a floor item exists: ${JSON.stringify(r2)}`);
+  assert.match(toItem.path, /ACTION/, "item path expressed in actions");
 }
 console.log("game-memory v3 (composite avatar + strides): ok");

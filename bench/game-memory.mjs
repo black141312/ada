@@ -211,36 +211,40 @@ export function routes(state, grid) {
   const W = grid[0]?.length ?? 0;
   const aw = av.w ?? 1;
   const ah = av.h ?? 1;
-  const fits = (x, y) => {
-    if (x < 0 || y < 0 || x + aw > W || y + ah > H) return false;
-    for (let yy = y; yy < y + ah; yy++)
-      for (let xx = x; xx < x + aw; xx++) {
-        const own = xx >= av.x && xx < av.x + aw && yy >= av.y && yy < av.y + ah;
-        if (state.walls[`${xx},${yy}`]) return false;
-        if (!own && !state.walkColors.includes(grid[yy][xx]) && grid[yy][xx] !== av.color) return false;
-      }
-    return true;
-  };
-  const dist = new Map([[`${av.x},${av.y}`, 0]]);
-  const prev = new Map();
-  const queue = [[av.x, av.y]];
-  while (queue.length) {
-    const [cx, cy] = queue.shift();
-    const d = dist.get(`${cx},${cy}`);
-    for (const [dx, dy] of edges) {
-      const k = `${cx + dx},${cy + dy}`;
-      if (dist.has(k) || !fits(cx + dx, cy + dy)) continue;
-      dist.set(k, d + 1);
-      prev.set(k, `${cx},${cy}`);
-      queue.push([cx + dx, cy + dy]);
-    }
-  }
   const targets = components(grid, bg).filter(
-    (c) => c.cells <= 200 && !(c.color === av.color && c.x0 >= av.x && c.x1 < av.x + aw && c.y0 >= av.y && c.y1 < av.y + ah),
+    (c) => c.cells <= 200 && !(c.x0 >= av.x && c.x1 < av.x + aw && c.y0 >= av.y && c.y1 < av.y + ah),
   );
   const touches = (x, y, t) => x + aw >= t.x0 && x <= t.x1 + 1 && y + ah >= t.y0 && y <= t.y1 + 1;
   const found = [];
   for (const t of targets) {
+    // Reaching an object usually means STEPPING ONTO it (keys, doors, pickups), so for this
+    // target's search its own cells count as walkable — for every other cell the avatar must
+    // have stood on that colour before.
+    const inT = (x, y) => x >= t.x0 && x <= t.x1 && y >= t.y0 && y <= t.y1;
+    const fits = (x, y) => {
+      if (x < 0 || y < 0 || x + aw > W || y + ah > H) return false;
+      for (let yy = y; yy < y + ah; yy++)
+        for (let xx = x; xx < x + aw; xx++) {
+          const own = xx >= av.x && xx < av.x + aw && yy >= av.y && yy < av.y + ah;
+          if (state.walls[`${xx},${yy}`]) return false;
+          if (!own && !inT(xx, yy) && !state.walkColors.includes(grid[yy][xx]) && grid[yy][xx] !== av.color) return false;
+        }
+      return true;
+    };
+    const dist = new Map([[`${av.x},${av.y}`, 0]]);
+    const prev = new Map();
+    const queue = [[av.x, av.y]];
+    while (queue.length) {
+      const [cx, cy] = queue.shift();
+      const d = dist.get(`${cx},${cy}`);
+      for (const [dx, dy] of edges) {
+        const k = `${cx + dx},${cy + dy}`;
+        if (dist.has(k) || !fits(cx + dx, cy + dy)) continue;
+        dist.set(k, d + 1);
+        prev.set(k, `${cx},${cy}`);
+        queue.push([cx + dx, cy + dy]);
+      }
+    }
     let best = null;
     for (const [k, d] of dist) {
       const [x, y] = k.split(",").map(Number);
