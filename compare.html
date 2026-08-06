@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Ada vs Claude Code — Model Comparison</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+  body { font-family: 'Segoe UI', system-ui, sans-serif; max-width: 1100px; margin: 2rem auto; background: #fafafa; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.1rem; margin: 1.5rem 0 .5rem; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+  .chart-box { background: #fff; border-radius: 10px; padding: 1.2rem; margin: 1rem 0; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  canvas { max-height: 420px; }
+  table { border-collapse: collapse; width: 100%; margin: .5rem 0; font-size: .92rem; }
+  th, td { border: 1px solid #e0e0e0; padding: 6px 10px; text-align: right; }
+  th { background: #f0f0f0; text-align: center; }
+  td:first-child { text-align: left; font-weight: 600; }
+  .good { color: #1a7a1a; }
+  .bad { color: #c0392b; }
+</style>
+</head>
+<body>
+
+<h1>Ada vs Claude Code — Benchmark Comparison</h1>
+
+<h2>Key Metrics</h2>
+<div class="chart-box"><canvas id="barChart"></canvas></div>
+
+<h2>Radar Profile</h2>
+<div class="chart-box"><canvas id="radarChart"></canvas></div>
+
+<h2>Cost &amp; Efficiency</h2>
+<div class="chart-box"><canvas id="scatterChart"></canvas></div>
+
+<h2>Raw Data</h2>
+<table id="dataTable"></table>
+
+<script>
+const labels = [
+  'Output Tokens', 'Cache Tokens', 'Cost ($)', 'Time (s)',
+  'Speed (tok/s)', 'Churn', 'Metric A', 'Metric B'
+];
+const ada    = [22070, 1393, 0.145, 27.2, 3.3, 2699, 14.0, 5.2];
+const claude = [95941,  758, 0.529, 24.2, 2.7,  952, 10.3, 10.9];
+
+// normalize each series to 0-1 for radar (higher=better unless noted)
+function norm(arr, invert=false) {
+  const mx = Math.max(...arr), mn = Math.min(...arr);
+  return arr.map(v => invert ? 1 - (v - mn) / (mx - mn || 1) : (v - mn) / (mx - mn || 1));
+}
+const adaNorm    = norm(ada,    [false,false,false,false,false,false,false,false]);
+const claudeNorm = norm(claude, [false,false,false,false,false,false,false,false]);
+// invert: Cost, Time, Churn should be lower=better → already handled by norm()
+// But for Radar we want "higher is better" so flip bad metrics by inverting their norm
+const invIndices = [2,3,5]; // Cost, Time, Churn
+invIndices.forEach(i => { adaNorm[i]    = 1 - adaNorm[i];    claudeNorm[i] = 1 - claudeNorm[i]; });
+
+const ctxBar = document.getElementById('barChart').getContext('2d');
+new Chart(ctxBar, {
+  type: 'bar',
+  data: {
+    labels,
+    datasets: [
+      { label: 'Ada (no brain)',  data: ada,    backgroundColor: 'rgba(66,133,244,0.7)', borderColor: 'rgba(66,133,244,1)', borderWidth: 1 },
+      { label: 'Claude Code',     data: claude, backgroundColor: 'rgba(234,67,53,0.7)', borderColor: 'rgba(234,67,53,1)', borderWidth: 1 }
+    ]
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { position: 'top' } },
+    scales: {
+      y: { beginAtZero: true, ticks: { callback: v => v >= 1000 ? (v/1000).toFixed(0)+'k' : v } }
+    }
+  }
+});
+
+const ctxRadar = document.getElementById('radarChart').getContext('2d');
+new Chart(ctxRadar, {
+  type: 'radar',
+  data: {
+    labels,
+    datasets: [
+      { label: 'Ada (no brain)',  data: adaNorm,    backgroundColor: 'rgba(66,133,244,0.25)', borderColor: 'rgba(66,133,244,1)', pointBackgroundColor: 'rgba(66,133,244,1)' },
+      { label: 'Claude Code',     data: claudeNorm, backgroundColor: 'rgba(234,67,53,0.25)', borderColor: 'rgba(234,67,53,1)', pointBackgroundColor: 'rgba(234,67,53,1)' }
+    ]
+  },
+  options: {
+    responsive: true,
+    scales: { r: { beginAtZero: true, max: 1, ticks: { stepSize: .25 } } },
+    plugins: { legend: { position: 'top' } }
+  }
+});
+
+// Scatter: Cost vs Time (lower = better → quadrant top-left wins)
+const ctxScatter = document.getElementById('scatterChart').getContext('2d');
+new Chart(ctxScatter, {
+  type: 'scatter',
+  data: {
+    datasets: [
+      { label: 'Ada (no brain)',  data: [{ x: ada[3], y: ada[2] }],     backgroundColor: 'rgba(66,133,244,0.8)', borderColor: 'rgba(66,133,244,1)', pointRadius: 10 },
+      { label: 'Claude Code',     data: [{ x: claude[3], y: claude[2] }], backgroundColor: 'rgba(234,67,53,0.8)', borderColor: 'rgba(234,67,53,1)', pointRadius: 10 }
+    ]
+  },
+  options: {
+    responsive: true,
+    scales: {
+      x: { title: { display: true, text: 'Time (s) — lower is better' }, beginAtZero: true },
+      y: { title: { display: true, text: 'Cost ($) — lower is better' }, beginAtZero: true }
+    },
+    plugins: { legend: { position: 'top' } }
+  }
+});
+
+// Table
+const rows = [
+  ['Metric','Ada (no brain)','Claude Code','Winner'],
+  ['Output Tokens','22,070','95,941','Claude (more output)'],
+  ['Cache Tokens','1,393','758','Ada (more cache hit)'],
+  ['Cost','$0.145','$0.529','Ada (cheaper)'],
+  ['Time','27.2 s','24.2 s','Claude (faster)'],
+  ['Speed (tok/s)','3.3','2.7','Ada (faster throughput)'],
+  ['Churn','2,699','952','Claude (lower churn)'],
+  ['Metric A','14.0','10.3','Ada'],
+  ['Metric B','5.2','10.9','Claude'],
+];
+const tbody = document.getElementById('dataTable');
+rows.forEach((r,i) => {
+  const tr = tbody.insertRow();
+  r.forEach((c,j) => {
+    const td = tr.insertCell();
+    td.innerHTML = c;
+    if (j === 3) td.style.fontWeight = '600';
+    if (i === 0) { td.style.textAlign = 'center'; td.style.background = '#eee'; }
+  });
+});
+</script>
+</body>
+</html>

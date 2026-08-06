@@ -54,8 +54,31 @@ function truncate(s: string): string {
   return clip(s);
 }
 
+/** One choice offered by ask_user. `description` is the line under the label that says what picking
+ *  it actually means; it is optional to the model, so it is often "". */
+export type AskOption = { label: string; description: string };
+
+/**
+ * Options arrive from the model as bare strings or as {label, description} — the schema allows both
+ * because a one-word choice has nothing to explain, and models emit strings regardless of what the
+ * schema says. Normalise here so no front-end has to care which it got.
+ *
+ * Anything without a label is dropped rather than rendered as an empty row you cannot pick.
+ */
+export function askOptions(raw: unknown): AskOption[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out = raw
+    .map((o) =>
+      o && typeof o === "object"
+        ? { label: String((o as Record<string, unknown>).label ?? ""), description: String((o as Record<string, unknown>).description ?? "") }
+        : { label: String(o), description: "" },
+    )
+    .filter((o) => o.label);
+  return out.length ? out : undefined;
+}
+
 // The front-end (CLI/TUI) installs an asker so the ask_user tool can prompt the user mid-task.
-type Asker = (question: string, options?: string[]) => Promise<string>;
+type Asker = (question: string, options?: AskOption[]) => Promise<string>;
 let asker: Asker | null = null;
 export function setAsker(fn: Asker | null): void {
   asker = fn;
@@ -1020,17 +1043,34 @@ export const tools: Tool[] = [
   },
   {
     name: "ask_user",
-    description: "Ask the user a clarifying question and wait for their answer. Use only when you're genuinely blocked or a decision is the user's to make — not for routine choices. Optionally provide a list of options.",
+    description:
+      "Ask the user a clarifying question and wait for their answer. Use only when you're genuinely blocked or a decision is the user's to make — not for routine choices. Optionally provide a list of options; give each one a short `description` saying what choosing it means, so the user can decide without asking you what the labels mean. A bare string is fine for a choice that needs no explanation.",
     parameters: {
       type: "object",
-      properties: { question: { type: "string" }, options: { type: "array", items: { type: "string" } } },
+      properties: {
+        question: { type: "string" },
+        options: {
+          type: "array",
+          items: {
+            anyOf: [
+              { type: "string" },
+              {
+                type: "object",
+                properties: { label: { type: "string" }, description: { type: "string" } },
+                required: ["label"],
+                additionalProperties: false,
+              },
+            ],
+          },
+        },
+      },
       required: ["question"],
       additionalProperties: false,
     },
     needsApproval: false,
     async run(args) {
       if (!asker) return { output: "(no interactive session — cannot ask the user; proceed with your best judgment)", isError: true };
-      const options = Array.isArray(args.options) ? (args.options as unknown[]).map(String) : undefined;
+      const options = askOptions(args.options);
       try {
         const answer = (await asker(String(args.question ?? ""), options)).trim();
         return { output: answer ? `User answered: ${answer}` : "(user gave no answer)" };

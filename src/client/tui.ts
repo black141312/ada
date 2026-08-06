@@ -8,6 +8,7 @@
 //   confirm — an approval prompt awaiting y / a / n
 
 import { stdin, stdout } from "node:process";
+import type { AskOption } from "./tools.ts";
 
 const GOLD = "\x1b[38;5;214m"; // ada accent (xterm 214)
 const DIM = "\x1b[2m";
@@ -80,15 +81,17 @@ export class Tui {
   }
 
   /** Ask the user a question mid-turn (for the ask_user tool); returns their answer. */
-  async ask(question: string, options?: string[]): Promise<string> {
+  async ask(question: string, options?: AskOption[]): Promise<string> {
     this.stopThinking();
     stdout.write(`\x1b[36m? ${question}\x1b[0m\n`);
-    if (options?.length) stdout.write(`${options.map((o, i) => `  ${i + 1}. ${o}`).join("\n")}\n`);
+    // The description is dimmed on the same line: it explains the choice, it isn't the choice.
+    if (options?.length)
+      stdout.write(`${options.map((o, i) => `  ${i + 1}. ${o.label}${o.description ? `\x1b[2m — ${o.description}\x1b[0m` : ""}`).join("\n")}\n`);
     const ans = ((await this.readLine()) ?? "").trim();
     this.mode = "turn";
     if (options?.length) {
       const n = Number(ans);
-      if (Number.isInteger(n) && n >= 1 && n <= options.length) return options[n - 1]!;
+      if (Number.isInteger(n) && n >= 1 && n <= options.length) return options[n - 1]!.label;
     }
     return ans;
   }

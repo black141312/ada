@@ -18,7 +18,7 @@ import { confidentSkill, rankSkills } from "./client/skill-router.ts";
 import { getDiagnostics } from "./client/lsp.ts";
 import { snapshot } from "./client/snapshot.ts";
 import { renderJobs, startJob } from "./client/background.ts";
-import { formatFile, htmlToText, isDestructive, registerTool, setAsker, toolByName } from "./client/tools.ts";
+import { askOptions, formatFile, htmlToText, isDestructive, registerTool, setAsker, toolByName } from "./client/tools.ts";
 import * as checkpoint from "./client/checkpoint.ts";
 import { renderTodos, setTodos } from "./client/todos.ts";
 import { deleteCredential, getCredential, setCredential } from "./server/credentials.ts";
@@ -286,9 +286,16 @@ async function main(): Promise<void> {
 
   // --- ask_user via a stub asker ---
   const askTool = toolByName.get("ask_user")!;
-  setAsker(async (_q, opts) => (opts ? opts[0]! : "the-answer"));
+  setAsker(async (_q, opts) => (opts ? `${opts[0]!.label}|${opts[0]!.description}` : "the-answer"));
   assert.ok(/the-answer/.test((await askTool.run({ question: "?" })).output), "ask_user returns the answer");
   assert.ok(/picked-A/.test((await askTool.run({ question: "?", options: ["picked-A", "B"] })).output), "ask_user with options");
+  // Options may carry a description, and a bare string still has to survive alongside them.
+  assert.ok(
+    /picked-A\|what it means/.test((await askTool.run({ question: "?", options: [{ label: "picked-A", description: "what it means" }, "B"] })).output),
+    "ask_user options carry descriptions",
+  );
+  assert.equal(askOptions(["a", { label: "b", description: "d" }, { description: "no label" }, 3])?.length, 3, "askOptions drops entries with no label");
+  assert.equal(askOptions([]), undefined, "askOptions treats an empty list as no options");
   setAsker(null);
   assert.equal((await askTool.run({ question: "?" })).isError, true, "ask_user errors when no asker is installed");
 
