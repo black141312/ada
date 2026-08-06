@@ -13,6 +13,8 @@ import { recordUsage, usageSince } from "./usage.ts";
 import { billingWebhookImplemented, checkEntitlement, effectivePlan, isFreeModel, PLANS, planFor, periodStart, setPlan, type PlanName } from "./plans.ts";
 import { checkoutUrl, createCheckout, getCheckout, setCheckoutPlan } from "./billing.ts";
 import { createKelviqCheckout, getKelviqCatalog, handleKelviqWebhook, kelviqEnabled, verifyKelviqSignature, type KelviqEvent } from "./kelviq.ts";
+import { computeAnalytics } from "./analytics.ts";
+import { ANALYTICS_PAGE } from "./analytics-page.ts";
 
 /** The anonymous free-tier pseudo-identity — no account, so nothing to meter or bill. */
 const isAnonymous = (who: Identity): boolean => who.user === "anon" && String(who.role) === "free";
@@ -563,6 +565,12 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       res.writeHead(200, { "content-type": "text/html" });
       return res.end(DEVICE_PAGE);
     }
+    // Analytics dashboard shell. PRE-AUTH on purpose: the page is an empty instrument panel that
+    // holds no data — it asks for the admin key and calls the (gated) API below with it.
+    if (req.method === "GET" && url.pathname === "/admin/analytics") {
+      res.writeHead(200, { "content-type": "text/html" });
+      return res.end(ANALYTICS_PAGE);
+    }
 
     let who = await identify(req);
     if (who === "corrupt") return json(res, 503, { error: { message: "auth store unreadable — refusing all requests (fail-closed). Fix ~/.ada/server/users.json." } });
@@ -618,6 +626,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       const s = await createCheckout(who.user, plan as PlanName);
       appendAudit({ ts: Date.now(), user: who.user, event: "checkout_started", detail: plan });
       return json(res, 200, { url: checkoutUrl(s.id), expiresAt: s.expiresAt, plan });
+    }
+    // Admin: the analytics aggregate — usage, funnel, revenue, and computed improvement areas.
+    // Same gate as plan administration; on a dev-open backend the operator IS the only user.
+    if (req.method === "GET" && url.pathname === "/v1/admin/analytics") {
+      const admin = who.role === "admin" || (adminUsers()?.includes(who.user) ?? false) || !locked();
+      if (!admin) return json(res, 403, { error: { message: "admin only" } });
+      const days = Math.min(365, Math.max(1, Number(url.searchParams.get("days")) || 30));
+      try {
+        return json(res, 200, await computeAnalytics(days));
+      } catch (e) {
+        return json(res, 500, { error: { message: e instanceof Error ? e.message : String(e) } });
+      }
     }
     // Admin: set a plan. Payment webhooks will call setPlan() directly; until then this is how a
     // subscription becomes real. Admin identity comes from env, never from the table it edits.
