@@ -157,7 +157,15 @@ export interface Entitlement {
   limit: number;
 }
 
-const isFreeModel = (id: string) => /:free$/i.test(id);
+/** Free tier covers `:free`-suffixed models (zero upstream cost) plus any IDs the operator lists
+ *  in ADA_FREE_MODELS (comma-separated). Read per call so a restart isn't needed mid-test. */
+export function isFreeModel(id: string): boolean {
+  if (/:free$/i.test(id)) return true;
+  const extra = process.env.ADA_FREE_MODELS;
+  if (!extra) return false;
+  const want = id.toLowerCase();
+  return extra.split(",").some((m) => m.trim().toLowerCase() === want);
+}
 
 /** The whole gate: may this account run this model right now? */
 export async function checkEntitlement(user: string, model: string): Promise<Entitlement> {
@@ -172,7 +180,7 @@ export async function checkEntitlement(user: string, model: string): Promise<Ent
       ...base,
       ok: false,
       status: 403,
-      message: `${def.label} plan covers \`:free\` models only. Upgrade to use ${model}.`,
+      message: `${def.label} plan covers free-tier models only. Upgrade to use ${model}.`,
     };
   }
   if (used >= def.monthlyTokens) {

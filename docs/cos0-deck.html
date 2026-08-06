@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cos0 — a coding agent built from zero</title>
+<style>
+  :root {
+    --bg: #070b12;
+    --bg-2: #0c1220;
+    --ink: #e8eef7;
+    --muted: #93a1b8;
+    --accent: #5eead4;
+    --accent-2: #7dd3fc;
+    --line: #1e2a3d;
+    --good: #4ade80;
+    --sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  .deck {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+  }
+  .slide {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: clamp(14px, 2.4vh, 26px);
+    padding: clamp(32px, 7vw, 110px);
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      opacity 0.28s ease,
+      visibility 0.28s;
+  }
+  .slide.on {
+    opacity: 1;
+    visibility: visible;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .slide { transition: none; }
+  }
+  h1 {
+    font-size: clamp(40px, 7vw, 92px);
+    line-height: 1.02;
+    margin: 0;
+    letter-spacing: -0.03em;
+    text-wrap: balance;
+  }
+  h2 {
+    font-size: clamp(26px, 4vw, 48px);
+    line-height: 1.08;
+    margin: 0;
+    letter-spacing: -0.02em;
+    text-wrap: balance;
+  }
+  p, li {
+    font-size: clamp(15px, 1.7vw, 22px);
+    line-height: 1.5;
+    max-width: 62ch;
+    color: var(--muted);
+  }
+  ul { margin: 0; padding-left: 1.15em; display: grid; gap: clamp(6px, 1.2vh, 12px); }
+  li::marker { color: var(--accent); }
+  .kicker {
+    font: 600 clamp(11px, 1.1vw, 14px) var(--mono);
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .mono { font-family: var(--mono); }
+  .muted { color: var(--muted); }
+  .accent { color: var(--accent); }
+  .big { font-size: clamp(28px, 5vw, 64px); font-weight: 700; letter-spacing: -0.02em; line-height: 1.05; }
+  .grid2 {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr));
+    gap: clamp(12px, 2vw, 22px);
+    max-width: 1000px;
+  }
+  .tile {
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: clamp(14px, 2.2vh, 24px) clamp(16px, 2.2vw, 26px);
+  }
+  .tile .t { font: 700 clamp(13px, 1.2vw, 16px) var(--mono); color: var(--accent-2); margin-bottom: 6px; }
+  .tile p { font-size: clamp(13px, 1.25vw, 17px); margin: 0; }
+  /* architecture diagram */
+  .pipe {
+    display: flex;
+    align-items: stretch;
+    gap: clamp(8px, 1.4vw, 18px);
+    max-width: 1080px;
+  }
+  .pipe .node {
+    flex: 1;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: clamp(12px, 2vh, 22px) clamp(14px, 1.6vw, 22px);
+  }
+  .pipe .node b { font-size: clamp(13px, 1.3vw, 17px); }
+  .pipe .node ul { display: grid; gap: 4px; padding-left: 1em; margin-top: 8px; }
+  .pipe .node li { font-size: clamp(11px, 1.05vw, 14px); }
+  .pipe .wire {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    gap: 4px;
+    color: var(--muted);
+    font: 500 clamp(9px, 0.9vw, 12px) var(--mono);
+    white-space: nowrap;
+    padding: 0 2px;
+  }
+  .pipe .wire .arr { color: var(--accent); font-size: clamp(16px, 2vw, 26px); }
+  .kpis { display: grid; grid-template-columns: 1fr 1fr; gap: clamp(12px, 2vw, 24px); max-width: 920px; }
+  .kpi {
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    padding: clamp(18px, 3vh, 34px) clamp(18px, 2.6vw, 34px);
+  }
+  .kpi .num { font-size: clamp(34px, 5.6vw, 74px); font-weight: 750; letter-spacing: -0.03em; line-height: 1; }
+  .kpi .lab { margin-top: 10px; color: var(--muted); font-size: clamp(13px, 1.3vw, 17px); }
+  .vs { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .vs .old { color: var(--muted); text-decoration: line-through; text-decoration-color: #f8717166; }
+  .foot {
+    position: absolute;
+    left: clamp(32px, 7vw, 110px);
+    bottom: clamp(14px, 2.4vw, 28px);
+    font: 500 clamp(10px, 1vw, 13px) var(--mono);
+    color: var(--muted);
+  }
+  .hint {
+    position: absolute;
+    right: clamp(16px, 3vw, 36px);
+    bottom: clamp(14px, 2.4vw, 28px);
+    font: 500 clamp(10px, 1vw, 13px) var(--mono);
+    color: var(--muted);
+    opacity: 0.7;
+  }
+  .bar {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    height: 3px;
+    background: #ffffff12;
+  }
+  .bar span {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+    transition: width 0.28s ease;
+  }
+  .count {
+    position: fixed;
+    right: clamp(16px, 3vw, 36px);
+    bottom: clamp(14px, 2.4vw, 28px);
+    font: 12px var(--mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+  }
+  @media print {
+    .deck { height: auto; overflow: visible; }
+    .slide {
+      position: static;
+      opacity: 1;
+      visibility: visible;
+      height: 100vh;
+      break-after: page;
+    }
+    .bar, .count, .hint, .foot { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="deck">
+
+  <!-- 1 · title -->
+  <section class="slide on">
+    <div class="kicker">cos0 · ada-agent v0.15.0</div>
+    <h1>cos0 — a coding agent<br>built from <span class="accent">zero</span>.</h1>
+    <p>A terminal client in the spirit of pi / Codex / Cursor. Holds every provider key on one
+    backend, speaks one wire format, and normalizes the whole model zoo back to it.</p>
+    <p class="mono accent">cos 0 = 1 — every provider reduces to one protocol.</p>
+    <div class="foot">MIT · Node ≥ 18 · no build step</div>
+    <div class="hint">→ to advance</div>
+  </section>
+
+  <!-- 2 · thesis -->
+  <section class="slide">
+    <div class="kicker">The thesis</div>
+    <h2>One wire format. Every model, every provider.</h2>
+    <ul>
+      <li>The client talks <b class="mono accent">only</b> OpenAI Chat Completions to the backend.</li>
+      <li>The backend routes each request by <b>model id</b> and normalizes every provider back to that format.</li>
+      <li>Keys, auth, rate limits and billing live in <b>one control point</b> — the server.</li>
+      <li>The client carries nothing but a single ada key. Same shape as Cursor.</li>
+    </ul>
+  </section>
+
+  <!-- 3 · architecture -->
+  <section class="slide">
+    <div class="kicker">Architecture</div>
+    <h2>Two programs, one protocol.</h2>
+    <div class="pipe">
+      <div class="node">
+        <b>ada client</b>
+        <ul>
+          <li>agentic loop</li>
+          <li>tools · sessions</li>
+          <li>TUI + approval</li>
+        </ul>
+      </div>
+      <div class="wire"><span class="arr">→</span>HTTP / SSE<span class="arr">←</span></div>
+      <div class="node">
+        <b>ada backend</b>
+        <ul>
+          <li>auth (client key)</li>
+          <li>router: id → provider</li>
+          <li>adapter per wire format</li>
+        </ul>
+      </div>
+      <div class="wire"><span class="arr">→</span>upstreams<span class="arr">←</span></div>
+      <div class="node">
+        <b>providers</b>
+        <ul>
+          <li>OpenAI · Anthropic</li>
+          <li>Gemini · Mistral · Grok</li>
+          <li>Qwen · Cloudflare · Ollama · OpenRouter</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4 · adapter economics -->
+  <section class="slide">
+    <div class="kicker">Adapters keyed by wire format — not provider</div>
+    <h2>New model? Zero code. New provider? Two lines.</h2>
+    <div class="grid2">
+      <div class="tile"><div class="t">new model</div><p><span class="big accent">0</span> code — routing is by id, nothing to add.</p></div>
+      <div class="tile"><div class="t">OpenAI-compatible provider</div><p><span class="big accent">2</span> lines — base URL + key env in <span class="mono">config.ts</span>.</p></div>
+      <div class="tile"><div class="t">brand-new wire format</div><p><span class="big accent">1</span> adapter + one registry line. Only Anthropic needs it today.</p></div>
+      <div class="tile"><div class="t">vendor SDKs</div><p>loaded lazily — <span class="mono">@anthropic-ai/sdk</span> never loads unless a Claude request arrives.</p></div>
+    </div>
+  </section>
+
+  <!-- 5 · agent loop -->
+  <section class="slide">
+    <div class="kicker">The engine</div>
+    <h2>Stream → call tools → feed back → repeat, until done.</h2>
+    <ul>
+      <li>Each turn streams the model's reply; tool calls are gated by the permission mode, run, and appended as <span class="mono">tool</span> turns.</li>
+      <li><span class="mono">read/write/edit_file</span> · <span class="mono">apply_patch</span> · <span class="mono">bash</span> in a real PTY · <span class="mono">grep/glob</span> · <span class="mono">web</span> · <span class="mono">lsp_diagnostics</span> · <span class="mono">ask_user</span></li>
+      <li>Auto-format on edit (prettier / gofmt / ruff / shfmt) in trusted projects.</li>
+      <li>Ollama leaked a tool call as JSON text? Detected and run anyway.</li>
+    </ul>
+  </section>
+
+  <!-- 6 · permission modes -->
+  <section class="slide">
+    <div class="kicker">Safety</div>
+    <h2>Three modes. Every approval in plain words.</h2>
+    <div class="grid2">
+      <div class="tile"><div class="t">/ask · default</div><p>Each gated tool prompts — “ada wants to run a shell command…” — and one key answers: <span class="mono">[y]es · [a]uto · [p]lan · [n]o</span>.</p></div>
+      <div class="tile"><div class="t">/plan · read-only</div><p>ada plans but won't edit. <span class="mono">/run</span> approves and executes.</p></div>
+      <div class="tile"><div class="t">/auto · free run</div><p>Tools run without asking; destructive <span class="mono">bash</span> still confirms.</p></div>
+      <div class="tile"><div class="t">protected paths</div><p>Undo reverts the agent's edits; snapshots capture the whole tree.</p></div>
+    </div>
+  </section>
+
+  <!-- 7 · skills -->
+  <section class="slide">
+    <div class="kicker">Skills</div>
+    <h2>~285 skills that actually fire.</h2>
+    <ul>
+      <li>Bundled <span class="mono">SKILL.md</span> instructions across ~30 categories — loaded only when a task needs them.</li>
+      <li>A relevance router ranks every request: a clear match is <b>auto-applied</b> (<span class="mono">↳ skill: commit</span>); ambiguous ones are suggested.</li>
+      <li>Browse with <span class="mono">list_skills</span>, rank with <span class="mono">find_skill</span>, load with <span class="mono">use_skill</span>.</li>
+      <li>Add your own under <span class="mono">.ada/skills/&lt;name&gt;/</span> — front-matter is all it takes. Project overrides global overrides built-in.</li>
+    </ul>
+  </section>
+
+  <!-- 8 · nothing lost -->
+  <section class="slide">
+    <div class="kicker">Trust</div>
+    <h2>Nothing is ever lost.</h2>
+    <div class="grid2">
+      <div class="tile"><div class="t">sessions</div><p>Every turn persisted as append-only JSONL; <span class="mono">--continue</span> / <span class="mono">--resume</span> picks up where you left off.</p></div>
+      <div class="tile"><div class="t">undo</div><p><span class="mono">/undo</span> reverts the agent's edits; checkpoints make it surgical.</p></div>
+      <div class="tile"><div class="t">snapshots</div><p><span class="mono">/snapshot</span> + <span class="mono">/restore</span> capture the whole workspace tree.</p></div>
+      <div class="tile"><div class="t">compaction</div><p>Old turns are summarized automatically as context grows — <span class="mono">/compact</span> forces it, <span class="mono">/context</span> shows the estimate.</p></div>
+    </div>
+  </section>
+
+  <!-- 9 · benchmark -->
+  <section class="slide">
+    <div class="kicker">Measured against Claude Code</div>
+    <h2>Half the tokens. A third less spent.</h2>
+    <div class="kpis">
+      <div class="kpi">
+        <div class="num">444<span class="muted">k</span> <span class="vs"><span class="old" style="font-size:0.55em">893k</span></span></div>
+        <div class="lab">tokens vs Claude Code — same machine, same model (Opus 4.7), same prompts, matched worktrees.</div>
+      </div>
+      <div class="kpi">
+        <div class="num">$3.05 <span class="vs"><span class="old" style="font-size:0.55em">$4.68</span></span></div>
+        <div class="lab">cost across five repo tasks — cheaper on <b class="accent">4 of 5</b>. Full write-up in docs/product-report.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 10 · swe-bench -->
+  <section class="slide">
+    <div class="kicker">Benchmarks</div>
+    <h2>Runs SWE-bench Verified for real.</h2>
+    <ul>
+      <li>Generates patches for actual GitHub issues — one isolated repo clone per task.</li>
+      <li>Emits official-format <span class="mono">predictions.jsonl</span> scored by the official <span class="mono">swebench</span> Docker harness.</li>
+      <li><span class="mono">node bench/swebench.mjs --dataset … --model … --out runs/x</span></li>
+      <li>Offline checks too: <span class="mono">npm run selfcheck</span> — tools, sessions, routing, parsers, TUI.</li>
+    </ul>
+  </section>
+
+  <!-- 11 · enterprise -->
+  <section class="slide">
+    <div class="kicker">Enterprise control plane</div>
+    <h2>Your org, one backend.</h2>
+    <div class="grid2">
+      <div class="tile"><div class="t">seats &amp; policy</div><p>Per-user seat keys; server-enforced model allowlist + tool rules pushed to every client.</p></div>
+      <div class="tile"><div class="t">metering &amp; audit</div><p>Per-user usage metering and an append-only audit log. File-backed, self-hosted in your network.</p></div>
+      <div class="tile"><div class="t">OIDC SSO</div><p>Okta, Entra, Auth0, Keycloak, Google Workspace. JIT-provisioned seats; offboarding is immediate.</p></div>
+      <div class="tile"><div class="t">fail-closed</div><p>Stdlib-only RS256/JWKS verification, no new dependency — a bad token is a denied request.</p></div>
+    </div>
+  </section>
+
+  <!-- 12 · deploy -->
+  <section class="slide">
+    <div class="kicker">Deploy</div>
+    <h2>Ship it anywhere.</h2>
+    <ul>
+      <li><span class="mono">docker compose up</span> runs the backend; clients point at it with <span class="mono">ADA_BACKEND_URL</span>.</li>
+      <li>Cloudflare Workers AI (<span class="mono">@cf/*</span>) or an AI Gateway — <b>zero code change</b>.</li>
+      <li>No build step: TypeScript runs straight through <span class="mono">tsx</span>; one native dep (<span class="mono">node-pty</span>).</li>
+      <li>Sign in with GitHub or Google (RFC 8628 device flow) — zero client config, no password ever reaches ada.</li>
+    </ul>
+  </section>
+
+  <!-- 13 · extend -->
+  <section class="slide">
+    <div class="kicker">Extensible</div>
+    <h2>Built to be built on.</h2>
+    <div class="grid2">
+      <div class="tile"><div class="t">MCP connectors</div><p>stdio and HTTP servers — filesystem, github, postgres, slack, sentry… tools appear as <span class="mono">server__tool</span>.</p></div>
+      <div class="tile"><div class="t">HTTP API + SDK</div><p><span class="mono">ada serve</span> — one-shot and Cursor-style streaming sessions with approval gating; typed SDK included.</p></div>
+      <div class="tile"><div class="t">ACP bridge</div><p><span class="mono">ada acp</span> plugs the agent into editors; <span class="mono">ada share</span> publishes a session view.</p></div>
+      <div class="tile"><div class="t">agents &amp; strategies</div><p>Named agents, subagents, worktrees, and orchestrators: <span class="mono">react · single · plan · multi · toolsmith</span>.</p></div>
+    </div>
+  </section>
+
+  <!-- 14 · close -->
+  <section class="slide">
+    <div class="kicker">cos0 · the takeaway</div>
+    <h2>cos 0 = <span class="accent">1</span></h2>
+    <p class="big">One wire format. One control point. One key per client.</p>
+    <ul>
+      <li>A new model is <b>zero code</b>; a new OpenAI-compatible provider is <b>two lines</b>.</li>
+      <li>Keys stay on the server; ~285 skills stay on tap; nothing you do is ever lost.</li>
+      <li>Measured leaner than Claude Code — fewer tokens, less money, same model.</li>
+      <li class="mono" style="list-style:none; margin-left:-1.15em;"><span class="accent">→</span> npm i -g ada-agent &nbsp;·&nbsp; clone &amp; npm start &nbsp;·&nbsp; docs/ for the details</li>
+    </ul>
+    <div class="foot">cos0 — built from zero, MIT © 2026 Aditya</div>
+  </section>
+
+</div>
+
+<div class="bar"><span id="bar"></span></div>
+<div class="count" id="count"></div>
+
+<script>
+  const slides = [...document.querySelectorAll(".slide")];
+  let i = 0;
+  function go(n) {
+    i = Math.max(0, Math.min(slides.length - 1, n));
+    slides.forEach((s, k) => {
+      s.classList.toggle("on", k === i);
+      s.setAttribute("aria-hidden", k === i ? "false" : "true");
+    });
+    count.textContent =
+      String(i + 1).padStart(2, "0") +
+      " / " +
+      String(slides.length).padStart(2, "0");
+    bar.style.width = ((i + 1) / slides.length) * 100 + "%";
+    location.hash = i + 1;
+  }
+  addEventListener("keydown", (e) => {
+    const k = e.key;
+    if (k === "ArrowRight" || k === "PageDown" || k === " ") {
+      e.preventDefault();
+      go(i + 1);
+    } else if (k === "ArrowLeft" || k === "PageUp") {
+      e.preventDefault();
+      go(i - 1);
+    } else if (k === "Home") {
+      e.preventDefault();
+      go(0);
+    } else if (k === "End") {
+      e.preventDefault();
+      go(slides.length - 1);
+    }
+  });
+  addEventListener("click", (e) => {
+    if (!e.target.closest("a,button,input")) go(i + 1);
+  });
+  addEventListener("hashchange", () =>
+    go((parseInt(location.hash.slice(1), 10) || 1) - 1),
+  );
+  go((parseInt(location.hash.slice(1), 10) || 1) - 1);
+</script>
+
+</body>
+</html>

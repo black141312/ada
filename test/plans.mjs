@@ -33,6 +33,13 @@ assert.equal(denied.status, 403, "a plan restriction is 403, not 402 — it isn'
 const allowed = await checkEntitlement("newcomer", "meta-llama/llama-3.3-70b-instruct:free");
 assert.equal(allowed.ok, true, "free must be able to run :free models");
 
+// --- ADA_FREE_MODELS adds specific models to the free tier -------------------
+process.env.ADA_FREE_MODELS = "deepseek/deepseek-v4-flash-0731";
+assert.equal((await checkEntitlement("newcomer", "deepseek/deepseek-v4-flash-0731")).ok, true, "a listed model must be free-tier usable");
+assert.equal((await checkEntitlement("newcomer", "DeepSeek/DeepSeek-V4-Flash-0731")).ok, true, "the list must match case-insensitively");
+assert.equal((await checkEntitlement("newcomer", "anthropic/claude-opus-5")).status, 403, "unlisted paid models must stay locked");
+delete process.env.ADA_FREE_MODELS;
+
 // --- paid unlocks the catalogue ---------------------------------------------
 await setPlan("payer", "pro");
 const pro = await checkEntitlement("payer", "anthropic/claude-opus-5");

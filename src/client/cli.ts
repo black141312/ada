@@ -1643,18 +1643,21 @@ async function main(): Promise<void> {
   setAsker(async (question, options) => {
     if (turn && stdin.isTTY) rawOff(rl, turn.onData);
     try {
+      // The selector takes one line per row, so the description rides on the label behind a dash —
+      // dropping it would hide the very thing that makes the choice decidable.
+      const rows = options?.map((o) => (o.description ? `${o.label} — ${o.description}` : o.label));
       // Multiple-choice → arrow-key selector; free-text → a plain line.
-      if (options?.length && stdin.isTTY) {
-        const i = await select(rl, `\x1b[36m? ${question}\x1b[0m`, options);
-        return i == null ? "" : options[i]!;
+      if (options?.length && rows && stdin.isTTY) {
+        const i = await select(rl, `\x1b[36m? ${question}\x1b[0m`, rows);
+        return i == null ? "" : options[i]!.label;
       }
       let prompt = `\x1b[36m? ${question}\x1b[0m`;
-      if (options?.length) prompt += `\n${options.map((o, i) => `  ${i + 1}. ${o}`).join("\n")}\n› `;
+      if (rows?.length) prompt += `\n${rows.map((o, i) => `  ${i + 1}. ${o}`).join("\n")}\n› `;
       else prompt += " ";
       const ans = (await rl.question(prompt)).trim();
       if (options?.length) {
         const n = Number(ans);
-        if (Number.isInteger(n) && n >= 1 && n <= options.length) return options[n - 1]!;
+        if (Number.isInteger(n) && n >= 1 && n <= options.length) return options[n - 1]!.label;
       }
       return ans;
     } finally {

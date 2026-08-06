@@ -10,7 +10,7 @@ import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, creat
 import { adminUsers, verifyIdentity } from "./identity.ts";
 import { addAllowed, isAllowedUser, listAllowed, removeAllowed } from "./allowlist.ts";
 import { recordUsage, usageSince } from "./usage.ts";
-import { billingWebhookImplemented, checkEntitlement, effectivePlan, PLANS, planFor, periodStart, setPlan, type PlanName } from "./plans.ts";
+import { billingWebhookImplemented, checkEntitlement, effectivePlan, isFreeModel, PLANS, planFor, periodStart, setPlan, type PlanName } from "./plans.ts";
 import { checkoutUrl, createCheckout, getCheckout, setCheckoutPlan } from "./billing.ts";
 import { createKelviqCheckout, getKelviqCatalog, handleKelviqWebhook, kelviqEnabled, verifyKelviqSignature, type KelviqEvent } from "./kelviq.ts";
 
@@ -115,20 +115,23 @@ function json(res: ServerResponse, status: number, obj: unknown): void {
   res.end(JSON.stringify(obj));
 }
 
-// Freemium: with ADA_FREE_TIER=1, unauthenticated requests may use `:free` models only (they cost
-// nothing upstream). Signed-in users get the full catalog. Off by default — locked stays locked.
+// Freemium: with ADA_FREE_TIER=1, unauthenticated requests may use free-tier models only (`:free`
+// suffix, plus any listed in ADA_FREE_MODELS). Signed-in users get the full catalog. Off by
+// default — locked stays locked.
 function freeTierEnabled(): boolean {
   return process.env.ADA_FREE_TIER === "1" || process.env.ADA_FREE_TIER === "true";
 }
-const isFreeModel = (id: string) => /:free$/i.test(id);
 
 async function handleModels(res: ServerResponse, freeOnly = false): Promise<void> {
-  const data: Array<{ id: string; object: "model"; owned_by: string }> = [];
+  const data: Array<{ id: string; object: "model"; owned_by: string; free?: true }> = [];
   for (const p of configuredProviders()) {
     const ids = await adapterFor(p).listModels(p);
     for (const id of ids) {
-      if (freeOnly && !isFreeModel(id)) continue;
-      data.push({ id, object: "model", owned_by: p });
+      const free = isFreeModel(id);
+      if (freeOnly && !free) continue;
+      // `free` tells clients what the free tier covers — ADA_FREE_MODELS entries have no `:free`
+      // suffix, so a client guessing from the id would mark them locked.
+      data.push(free ? { id, object: "model", owned_by: p, free } : { id, object: "model", owned_by: p });
     }
   }
   json(res, 200, { object: "list", data });
@@ -145,9 +148,9 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
 
   const model = String(body.model ?? "");
   if (!model) return json(res, 400, { error: { message: "missing 'model'" } });
-  // Anonymous free tier may only touch `:free` models — everything else needs sign-in.
+  // Anonymous free tier may only touch free-tier models — everything else needs sign-in.
   if (who.user === "anon" && String(who.role) === "free" && !isFreeModel(model)) {
-    return json(res, 403, { error: { message: `sign in to use ${model} — without an account only :free models are available` } });
+    return json(res, 403, { error: { message: `sign in to use ${model} — without an account only free-tier models are available` } });
   }
 
   // Org policy: model allowlist (enterprise). Enforced server-side so a modified client can't skip it.

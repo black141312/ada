@@ -11,6 +11,7 @@ import TextInput from "ink-text-input";
 import React, { type JSX, useEffect, useRef, useState } from "react";
 import type { Agent } from "./agent.ts";
 import { setAsker } from "./tools.ts";
+import type { AskOption } from "./tools.ts";
 
 const GOLD = "#ffaf00"; // ada accent (xterm 214)
 const WORDS = ["Cogitating", "Pondering", "Noodling", "Percolating", "Ruminating", "Tinkering", "Untangling", "Brewing", "Mulling", "Crunching"];
@@ -71,7 +72,7 @@ function AdaApp({ agent, model }: { agent: Agent; model: string }): JSX.Element 
   const [running, setRunning] = useState(false);
   const [tokens, setTokens] = useState(agent.contextTokens());
   const [confirm, setConfirm] = useState<{ risk: string; detail: string; danger: boolean; resolve: (d: "yes" | "all" | "no") => void } | null>(null);
-  const [asking, setAsking] = useState<{ options?: string[]; resolve: (s: string) => void } | null>(null);
+  const [asking, setAsking] = useState<{ options?: AskOption[]; resolve: (s: string) => void } | null>(null);
   const [word, setWord] = useState(WORDS[0]!);
   const [secs, setSecs] = useState(0);
   const [spin, setSpin] = useState(0);
@@ -97,7 +98,10 @@ function AdaApp({ agent, model }: { agent: Agent; model: string }): JSX.Element 
   setAsker(
     (question, options) =>
       new Promise((resolve) => {
-        push("ask", options?.length ? `${question}\n${options.map((o, i) => `  ${i + 1}. ${o}`).join("\n")}` : question);
+        push(
+          "ask",
+          options?.length ? `${question}\n${options.map((o, i) => `  ${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ""}`).join("\n")}` : question,
+        );
         setAsking({ options, resolve });
       }),
   );
@@ -157,7 +161,7 @@ function AdaApp({ agent, model }: { agent: Agent; model: string }): JSX.Element 
       setAsking(null);
       const n = Number(text);
       const opts = asking.options;
-      asking.resolve(opts?.length && Number.isInteger(n) && n >= 1 && n <= opts.length ? opts[n - 1]! : text);
+      asking.resolve(opts?.length && Number.isInteger(n) && n >= 1 && n <= opts.length ? opts[n - 1]!.label : text);
       return;
     }
     if (!text) return;

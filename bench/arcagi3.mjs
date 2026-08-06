@@ -691,6 +691,12 @@ async function playAsModel(gameId, f, key, cardId, cookies) {
     if (f.rules) {
       const fresh = parseRules(reply);
       if (fresh.length) rules = fresh;
+      // The rule list IS the artifact of this mode — a count in the step log says nothing about
+      // whether the model built a real model of the game or just kept restating noise.
+      appendFileSync(
+        join(dir, "rules.md"),
+        `\n## move ${step}\n${rules.join("\n")}\n`,
+      );
     }
     const act = parseAction(reply, obs.available_actions, step);
     const label =
