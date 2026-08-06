@@ -1,10 +1,8 @@
 // Drive a real browser so the agent can look at what it just built: navigate, screenshot, read the
-// rendered text, read the console. Speaks the Chrome DevTools Protocol directly over the debug port
-// — node has fetch and WebSocket built in, so this costs no dependency (puppeteer/playwright would
-// each add >100MB and a bundled browser to an app that already ships an Electron one).
-//
-// ponytail: one page, no tabs, no input events. Enough to answer "does it render and is the console
-// clean?", which is the question that actually blocks a UI change. Add clicks when a task needs them.
+// rendered text, read the console — and now act on it: read the accessibility tree, then click,
+// type, press keys, and scroll by ref. Speaks the Chrome DevTools Protocol directly over the debug
+// port — node has fetch and WebSocket built in, so this costs no dependency (puppeteer/playwright
+// would each add >100MB and a bundled browser to an app that already ships an Electron one).
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -68,13 +66,64 @@ interface Target {
   webSocketDebuggerUrl?: string;
 }
 
-async function pageTarget(): Promise<Target> {
+/** Last tab this tool selected (via tab_new/tab_select). Acting defaults to it while it lives. */
+let selectedTabId: string | null = null;
+
+/** ref_N → backendDOMNodeId per tab, with the URL the refs were read from. */
+const refState = new Map<string, { url: string; refs: Map<string, number> }>();
+
+async function listPages(): Promise<Target[]> {
   const list = (await (await fetch(`${ORIGIN}/json/list`)).json()) as Target[];
-  const page = list.find((t) => t.type === "page" && t.webSocketDebuggerUrl);
-  if (page) return page;
+  return list.filter((t) => t.type === "page" && t.webSocketDebuggerUrl);
+}
+
+async function resolveTarget(tab?: string): Promise<Target> {
+  const pages = await listPages();
+  if (tab) {
+    const t = pages.find((p) => p.id === tab);
+    if (!t) throw new Error(`no such tab: ${tab} — list with \`tabs\``);
+    return t;
+  }
+  const sel = selectedTabId ? pages.find((p) => p.id === selectedTabId) : undefined;
+  if (sel) return sel;
+  if (pages[0]) return pages[0];
   const made = (await (await fetch(`${ORIGIN}/json/new?about:blank`, { method: "PUT" })).json()) as Target;
   if (!made.webSocketDebuggerUrl) throw new Error("could not open a page target");
   return made;
+}
+
+/** A tab list is something a model reads; origins only — titles are page-authored text. */
+function originOf(url: string): string {
+  try {
+    const u = new URL(url);
+    return u.origin === "null" ? u.protocol : u.origin;
+  } catch {
+    return "(unknown)";
+  }
+}
+
+export async function tabAction(action: "tabs" | "tab_new" | "tab_select" | "tab_close", tab?: string): Promise<string> {
+  await ensureBrowser();
+  if (action === "tabs") {
+    const pages = await listPages();
+    return pages.map((p) => `${p.id}${p.id === selectedTabId ? " *" : ""}  ${originOf(p.url)}`).join("\n") || "(no tabs)";
+  }
+  if (action === "tab_new") {
+    const made = (await (await fetch(`${ORIGIN}/json/new?about:blank`, { method: "PUT" })).json()) as Target;
+    selectedTabId = made.id;
+    return `opened tab ${made.id}`;
+  }
+  if (!tab) throw new Error(`${action} needs a tab id — list with \`tabs\``);
+  if (!(await listPages()).some((p) => p.id === tab)) throw new Error(`no such tab: ${tab} — list with \`tabs\``);
+  if (action === "tab_select") {
+    await fetch(`${ORIGIN}/json/activate/${tab}`);
+    selectedTabId = tab;
+    return `selected tab ${tab}`;
+  }
+  await fetch(`${ORIGIN}/json/close/${tab}`);
+  refState.delete(tab);
+  if (selectedTabId === tab) selectedTabId = null;
+  return `closed tab ${tab}`;
 }
 
 type Json = Record<string, unknown>;
@@ -142,15 +191,101 @@ class Cdp {
   }
 }
 
+// ---- accessibility tree → refs ----
+
+export interface AxNode {
+  nodeId: string;
+  ignored?: boolean;
+  role?: { value?: string };
+  name?: { value?: string };
+  value?: { value?: unknown };
+  childIds?: string[];
+  parentId?: string;
+  backendDOMNodeId?: number;
+}
+
+const INTERACTIVE = new Set(["button", "link", "textbox", "searchbox", "checkbox", "radio", "combobox", "listbox", "option", "tab", "menuitem", "slider", "switch"]);
+
+/** Serialize Accessibility.getFullAXTree output to an indented outline; interactive nodes get
+ *  ref_N tags mapping to their backendDOMNodeId. Pure — unit-tested offline in selfcheck. */
+export function formatAxTree(nodes: AxNode[]): { text: string; refs: Map<string, number> } {
+  const byId = new Map(nodes.map((n) => [n.nodeId, n]));
+  const refs = new Map<string, number>();
+  const lines: string[] = [];
+  const walk = (n: AxNode, depth: number): void => {
+    let d = depth;
+    if (!n.ignored) {
+      const role = n.role?.value ?? "";
+      const name = String(n.name?.value ?? "").trim();
+      const val = n.value?.value;
+      // unnamed layout wrappers add depth, not information — flatten them
+      const boring = (role === "generic" || role === "none" || role === "InlineTextBox") && !name;
+      if (!boring) {
+        let line = `${"  ".repeat(depth)}${role || "node"}${name ? ` "${name}"` : ""}`;
+        if (val !== undefined && val !== "") line += ` = ${JSON.stringify(String(val))}`;
+        if (INTERACTIVE.has(role) && n.backendDOMNodeId !== undefined) {
+          const ref = `ref_${refs.size + 1}`;
+          refs.set(ref, n.backendDOMNodeId);
+          line += ` [${ref}]`;
+        }
+        lines.push(line);
+        d = depth + 1;
+      }
+    }
+    for (const c of n.childIds ?? []) {
+      const k = byId.get(c);
+      if (k) walk(k, d);
+    }
+  };
+  for (const r of nodes.filter((n) => !n.parentId || !byId.has(n.parentId))) walk(r, 0);
+  return { text: lines.join("\n"), refs };
+}
+
+/** CDP key event parameters for the supported `press` keys, by lowercase name. */
+const KEYS: Record<string, { key: string; code: string; keyCode: number; text?: string }> = {
+  enter: { key: "Enter", code: "Enter", keyCode: 13, text: "\r" },
+  tab: { key: "Tab", code: "Tab", keyCode: 9 },
+  escape: { key: "Escape", code: "Escape", keyCode: 27 },
+  backspace: { key: "Backspace", code: "Backspace", keyCode: 8 },
+  arrowup: { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
+  arrowdown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
+  arrowleft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
+  arrowright: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
+};
+
+/** Send a keyDown/keyUp pair for one of the supported `press` keys. */
+async function pressKey(cdp: Cdp, name: string): Promise<void> {
+  const k = KEYS[name.toLowerCase()];
+  if (!k) throw new Error(`unsupported key: ${name || "(none)"}. Supported: ${Object.values(KEYS).map((v) => v.key).join(", ")}`);
+  const base = { key: k.key, code: k.code, windowsVirtualKeyCode: k.keyCode, nativeVirtualKeyCode: k.keyCode };
+  await cdp.send("Input.dispatchKeyEvent", { type: "keyDown", ...base, ...(k.text ? { text: k.text } : {}) });
+  await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+}
+
 export interface BrowserResult {
   text: string;
   screenshot?: Buffer;
 }
 
+export type BrowserVerb = "open" | "screenshot" | "text" | "console" | "read" | "click" | "type" | "press" | "scroll";
+
+export interface BrowserOpts {
+  url?: string;
+  width?: number;
+  height?: number;
+  tab?: string;
+  ref?: string;
+  text?: string;
+  key?: string;
+  direction?: "up" | "down" | "left" | "right";
+  amount?: number;
+}
+
 /** Run one browser action. `url` navigates first when given; otherwise acts on the current page. */
-export async function browserAction(action: "open" | "screenshot" | "text" | "console", url?: string, width = 1280, height = 800): Promise<BrowserResult> {
+export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {}): Promise<BrowserResult> {
+  const { url, width = 1280, height = 800 } = opts;
   await ensureBrowser();
-  const target = await pageTarget();
+  const target = await resolveTarget(opts.tab);
   const cdp = await Cdp.open(target.webSocketDebuggerUrl!);
   try {
     await cdp.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
@@ -171,9 +306,88 @@ export async function browserAction(action: "open" | "screenshot" | "text" | "co
         await new Promise((res) => setTimeout(res, 250));
       }
       await new Promise((res) => setTimeout(res, 400)); // let a framework paint its first frame
+      refState.delete(target.id); // navigating invalidates any refs read from the old page
     }
     const where = (await cdp.send("Runtime.evaluate", { expression: "location.href", returnByValue: true })) as { result?: { value?: string } };
     const here = where.result?.value ?? "(unknown url)";
+
+    // acting verbs — read builds the ref map; the rest act by ref and check staleness first
+    const needRef = (): number => {
+      const st = refState.get(target.id);
+      if (!st) throw new Error("no refs for this tab — `read` first");
+      if (st.url !== here) throw new Error("page changed since `read` — `read` again");
+      const id = st.refs.get(String(opts.ref ?? ""));
+      if (id === undefined) throw new Error(`unknown ref: ${String(opts.ref ?? "(none)")} — \`read\` first`);
+      return id;
+    };
+    const domReady = async (): Promise<void> => {
+      await cdp.send("DOM.enable").catch(() => {});
+      await cdp.send("DOM.getDocument", { depth: 0 });
+    };
+    const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 300)); // let handlers run and paint
+
+    if (action === "read") {
+      await cdp.send("Accessibility.enable").catch(() => {});
+      const ax = (await cdp.send("Accessibility.getFullAXTree")) as { nodes?: AxNode[] };
+      const { text, refs } = formatAxTree(ax.nodes ?? []);
+      refState.set(target.id, { url: here, refs });
+      return { text: `${here}\n\n${text || "(empty accessibility tree)"}` };
+    }
+    if (action === "click") {
+      const backendNodeId = needRef();
+      await domReady();
+      await cdp.send("DOM.scrollIntoViewIfNeeded", { backendNodeId }).catch(() => {
+        throw new Error("element is not visible — `read` again");
+      });
+      const q = (await cdp.send("DOM.getContentQuads", { backendNodeId }).catch(() => ({}))) as { quads?: number[][] };
+      const quad = q.quads?.[0];
+      if (!quad || quad.length < 8) throw new Error("element is not visible — `read` again");
+      const x = (quad[0]! + quad[2]! + quad[4]! + quad[6]!) / 4;
+      const y = (quad[1]! + quad[3]! + quad[5]! + quad[7]!) / 4;
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+      await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+      await settle();
+      return { text: `clicked ${opts.ref} on ${here}` };
+    }
+    if (action === "type") {
+      const backendNodeId = needRef();
+      await domReady();
+      await cdp.send("DOM.scrollIntoViewIfNeeded", { backendNodeId }).catch(() => {
+        throw new Error("element is not visible — `read` again");
+      });
+      await cdp.send("DOM.focus", { backendNodeId }).catch(() => {
+        throw new Error("element is not visible — `read` again");
+      });
+      // select existing content so insertText replaces it (selection APIs aren't trust-gated)
+      await cdp.send("Runtime.evaluate", { expression: "{const e=document.activeElement; if(e&&typeof e.select==='function')e.select(); else if(e&&e.isContentEditable)document.execCommand('selectAll');}" });
+      const text = String(opts.text ?? "");
+      if (text) await cdp.send("Input.insertText", { text });
+      else await pressKey(cdp, "backspace"); // empty text = clear the field
+      return { text: `typed into ${opts.ref} on ${here}` };
+    }
+    if (action === "press") {
+      await pressKey(cdp, String(opts.key ?? ""));
+      await settle();
+      return { text: `pressed ${opts.key} on ${here}` };
+    }
+    if (action === "scroll") {
+      if (opts.ref) {
+        const backendNodeId = needRef();
+        await domReady();
+        await cdp.send("DOM.scrollIntoViewIfNeeded", { backendNodeId }).catch(() => {
+          throw new Error("element is not visible — `read` again");
+        });
+        return { text: `scrolled ${opts.ref} into view on ${here}` };
+      }
+      const dir = String(opts.direction ?? "down");
+      const amount = Number(opts.amount) || 600;
+      const dx = dir === "left" ? -amount : dir === "right" ? amount : 0;
+      const dy = dir === "up" ? -amount : dir === "down" ? amount : 0;
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseWheel", x: width / 2, y: height / 2, deltaX: dx, deltaY: dy });
+      await settle();
+      return { text: `scrolled ${dir} ${amount}px on ${here}` };
+    }
 
     if (action === "screenshot") {
       const shot = (await cdp.send("Page.captureScreenshot", { format: "png" })) as { data?: string };

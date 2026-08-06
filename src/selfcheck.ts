@@ -58,6 +58,21 @@ async function main(): Promise<void> {
   r = await tool("bash").run({ command: "echo hi" });
   assert.ok(r.output.includes("hi"), r.output);
 
+  // --- browser: a11y tree serializer (pure, no browser needed) ---
+  const { formatAxTree } = await import("./client/browser.ts");
+  const ax = formatAxTree([
+    { nodeId: "1", role: { value: "RootWebArea" }, name: { value: "T" }, childIds: ["2", "3", "4"] },
+    { nodeId: "2", parentId: "1", role: { value: "button" }, name: { value: "Do thing" }, backendDOMNodeId: 10 },
+    { nodeId: "3", parentId: "1", role: { value: "textbox" }, name: { value: "Name" }, value: { value: "bob" }, backendDOMNodeId: 11 },
+    { nodeId: "4", parentId: "1", ignored: true, childIds: ["5"] },
+    { nodeId: "5", parentId: "4", role: { value: "StaticText" }, name: { value: "hi" } },
+  ]);
+  assert.ok(ax.text.includes('button "Do thing" [ref_1]'), ax.text);
+  assert.ok(ax.text.includes('textbox "Name" = "bob" [ref_2]'), ax.text);
+  assert.ok(ax.text.includes('StaticText "hi"'), ax.text); // ignored wrapper skipped, child kept
+  assert.equal(ax.refs.get("ref_1"), 10);
+  assert.equal(ax.refs.get("ref_2"), 11);
+
   // grep / ls / glob
   await tool("write_file").run({ path: join(dir, "hello.txt"), content: "alpha\nNEEDLE here\nbeta" });
   const g = await tool("grep").run({ path: dir, pattern: "NEEDLE" });
@@ -291,6 +306,11 @@ async function main(): Promise<void> {
   assert.ok(permPhrase("bash", true).startsWith("⚠"), "destructive bash phrase is flagged");
   assert.equal(permPhrase("write_file", false), "create or modify files on disk", "write phrase");
   assert.ok(permPhrase("merchant__x", false).includes("connector"), "MCP phrase mentions the connector");
+
+  // --- browser approval rendering ---
+  assert.equal(describeCall("browser", { action: "click", ref: "ref_2" }).detail, "click ref_2");
+  assert.ok(permPhrase("browser", true).toLowerCase().includes("enter"), "press-Enter phrase should warn about submitting");
+  assert.ok(!permPhrase("browser", false).startsWith("run the"), "browser needs its own perm phrase");
 
   // --- baked offline catalog seeds pricing/limits (no network) ---
   {

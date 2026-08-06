@@ -57,6 +57,7 @@
     "typecheck": "tsc --noEmit",
     "typecheck:worker": "tsc -p src/worker/tsconfig.json --noEmit",
     "selfcheck": "tsx src/selfcheck.ts",
+    "check:browser": "tsx src/browsercheck.ts",
     "bench:memory": "tsx bench/memory.ts",
     "bench:extraction": "tsx bench/extraction.ts",
     "bench:swebench": "node bench/swebench.mjs",
