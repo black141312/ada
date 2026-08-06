@@ -68,13 +68,64 @@ interface Target {
   webSocketDebuggerUrl?: string;
 }
 
-async function pageTarget(): Promise<Target> {
+/** Last tab this tool selected (via tab_new/tab_select). Acting defaults to it while it lives. */
+let selectedTabId: string | null = null;
+
+/** ref_N → backendDOMNodeId per tab, with the URL the refs were read from. */
+const refState = new Map<string, { url: string; refs: Map<string, number> }>();
+
+async function listPages(): Promise<Target[]> {
   const list = (await (await fetch(`${ORIGIN}/json/list`)).json()) as Target[];
-  const page = list.find((t) => t.type === "page" && t.webSocketDebuggerUrl);
-  if (page) return page;
+  return list.filter((t) => t.type === "page" && t.webSocketDebuggerUrl);
+}
+
+async function resolveTarget(tab?: string): Promise<Target> {
+  const pages = await listPages();
+  if (tab) {
+    const t = pages.find((p) => p.id === tab);
+    if (!t) throw new Error(`no such tab: ${tab} — list with \`tabs\``);
+    return t;
+  }
+  const sel = selectedTabId ? pages.find((p) => p.id === selectedTabId) : undefined;
+  if (sel) return sel;
+  if (pages[0]) return pages[0];
   const made = (await (await fetch(`${ORIGIN}/json/new?about:blank`, { method: "PUT" })).json()) as Target;
   if (!made.webSocketDebuggerUrl) throw new Error("could not open a page target");
   return made;
+}
+
+/** A tab list is something a model reads; origins only — titles are page-authored text. */
+function originOf(url: string): string {
+  try {
+    const u = new URL(url);
+    return u.origin === "null" ? u.protocol : u.origin;
+  } catch {
+    return "(unknown)";
+  }
+}
+
+export async function tabAction(action: "tabs" | "tab_new" | "tab_select" | "tab_close", tab?: string): Promise<string> {
+  await ensureBrowser();
+  if (action === "tabs") {
+    const pages = await listPages();
+    return pages.map((p) => `${p.id}${p.id === selectedTabId ? " *" : ""}  ${originOf(p.url)}`).join("\n") || "(no tabs)";
+  }
+  if (action === "tab_new") {
+    const made = (await (await fetch(`${ORIGIN}/json/new?about:blank`, { method: "PUT" })).json()) as Target;
+    selectedTabId = made.id;
+    return `opened tab ${made.id}`;
+  }
+  if (!tab) throw new Error(`${action} needs a tab id — list with \`tabs\``);
+  if (!(await listPages()).some((p) => p.id === tab)) throw new Error(`no such tab: ${tab} — list with \`tabs\``);
+  if (action === "tab_select") {
+    await fetch(`${ORIGIN}/json/activate/${tab}`);
+    selectedTabId = tab;
+    return `selected tab ${tab}`;
+  }
+  await fetch(`${ORIGIN}/json/close/${tab}`);
+  refState.delete(tab);
+  if (selectedTabId === tab) selectedTabId = null;
+  return `closed tab ${tab}`;
 }
 
 type Json = Record<string, unknown>;
@@ -212,7 +263,7 @@ export interface BrowserResult {
 /** Run one browser action. `url` navigates first when given; otherwise acts on the current page. */
 export async function browserAction(action: "open" | "screenshot" | "text" | "console", url?: string, width = 1280, height = 800): Promise<BrowserResult> {
   await ensureBrowser();
-  const target = await pageTarget();
+  const target = await resolveTarget();
   const cdp = await Cdp.open(target.webSocketDebuggerUrl!);
   try {
     await cdp.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
