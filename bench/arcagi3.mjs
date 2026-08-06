@@ -37,7 +37,7 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
-import { loadMemory, resetMemory, saveMemory, updateMemory } from "./game-memory.mjs";
+import { loadMemory, relocateAvatar, resetMemory, saveMemory, summarize, updateMemory } from "./game-memory.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SELF = resolve(HERE, "arcagi3.mjs");
@@ -182,8 +182,10 @@ export function countChanged(a, b) {
   return n;
 }
 
-// What ada sees in its bash output after every action.
-export function formatObs(obs, used, max) {
+// What ada sees in its bash output after every action. `showGrid: false` swaps the 4kB frame
+// for one line — a 50-action agent run resends its whole transcript every turn, so the frame
+// rides along quadratically; MEMORY already says what changed, and `play` alone re-shows it.
+export function formatObs(obs, used, max, showGrid = true) {
   const acts = (obs.available_actions ?? [])
     .map((n) => (n === 6 ? "ACTION6 <x> <y>" : `ACTION${n}`))
     .join(", ");
@@ -192,11 +194,12 @@ export function formatObs(obs, used, max) {
     obs.state === "WIN"
       ? "\nWIN — this game is solved. Stop here."
       : obs.state === "GAME_OVER"
-        ? `\nGAME_OVER — run \`play RESET\` to start over (costs no actions), or stop.`
+        ? `\nGAME_OVER — run \`play RESET\` to start over (first 3 resets are free, then 1 action each), or stop.`
         : left <= 0
           ? "\nBUDGET EXHAUSTED — no actions left. Stop here."
           : "";
-  return `${renderGrid(latestGrid(obs.frame))}
+  const frame = showGrid ? renderGrid(latestGrid(obs.frame)) : "(frame omitted — small change; the MEMORY block below says what moved. Run `play` alone for the full grid.)";
+  return `${frame}
 
 state ${obs.state} · level ${obs.levels_completed ?? 0}/${obs.win_levels ?? "?"} · actions ${used}/${max} (${left} left)
 legal actions: ${acts || "(none reported)"}${banner}`;
@@ -211,7 +214,7 @@ Drive the game with this command (run it from the current directory):
   node ${SELF_CMD} play              # print the current frame without acting
   node ${SELF_CMD} play ACTION3      # take a simple action
   node ${SELF_CMD} play ACTION6 12 34  # click cell x=12 y=34 (x and y are 0-63)
-  node ${SELF_CMD} play RESET        # start the level over after a GAME_OVER; costs no actions
+  node ${SELF_CMD} play RESET        # start the level over after a GAME_OVER; first 3 free, then 1 action each
 
 Each call prints the frame as a grid of hex digits 0-f, one character per cell, one line per row —
 each digit is a colour. It also prints the game state, the level you are on, how many actions you
@@ -439,9 +442,18 @@ async function play(argv) {
       body: { game_id: s.game_id, card_id: s.card_id, guid: s.obs.guid },
     });
     s.resets = (s.resets ?? 0) + 1;
-    // Fresh attempt: the map is stale, but what the buttons mean survives death.
-    saveMemory(dir, resetMemory(loadMemory(dir)));
-    memoryNote = "\nMEMORY: map cleared for the new attempt; learned buttons kept.";
+    // The first resets are for learning; after that they price as a move. Every failed run so
+    // far ended with a model dithering through free resets instead of committing to a plan.
+    if (s.resets > 3) s.used++;
+    // Same level restarts: geometry and button meanings survive; only the position is stale —
+    // and the sprite can usually be re-found in the fresh frame by its remembered identity.
+    const mem = resetMemory(loadMemory(dir));
+    const relocated = relocateAvatar(mem, latestGrid(s.obs.frame));
+    saveMemory(dir, mem);
+    const cost = s.resets > 3 ? " — this reset cost 1 action" : "";
+    memoryNote = relocated
+      ? `\n${summarize(mem, latestGrid(s.obs.frame), `RESET${cost}: back at the start, map kept`)}`
+      : `\nMEMORY: new attempt${cost}; walls, buttons and effects kept; position re-learns on your next move.`;
   } else {
     if (s.used >= s.maxSteps) {
       console.log(
@@ -494,7 +506,9 @@ async function play(argv) {
     join(dir, "steps.jsonl"),
     `${JSON.stringify({ step: s.used, action: label, changed, state: s.obs.state, levels_completed: s.obs.levels_completed })}\n`,
   );
-  console.log(formatObs(s.obs, s.used, s.maxSteps) + memoryNote);
+  // Small in-place changes don't earn a 4kB frame reprint; level changes and scene shifts do.
+  const showGrid = !act || changed === undefined || changed > 300;
+  console.log(formatObs(s.obs, s.used, s.maxSteps, showGrid) + memoryNote);
 }
 
 // ---------- agent mode ----------

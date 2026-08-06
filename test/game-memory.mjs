@@ -194,13 +194,33 @@ function maze(ax, ay, extra) {
   assert.equal(st.effects?.length, 1, `effect logged: ${JSON.stringify(st.effects)}`);
   assert.match(st.effects[0], /color 7/, "effect names the touched object");
 
-  // reset keeps effects and walkable colours, clears positions
+  // reset keeps level geometry and knowledge; only the sprite's position goes stale
   const fresh = resetMemory(st);
   assert.equal(fresh.effects.length, 1, "effects survive reset");
   assert.ok(fresh.walkColors.includes(5), "walkable colours survive reset");
-  assert.equal(fresh.avatar, null, "avatar cleared");
-  assert.deepEqual(fresh.walk, {}, "walk map cleared");
-  assert.deepEqual(fresh.walls, {}, "walls cleared");
+  assert.equal(fresh.avatar, null, "avatar position cleared");
+  assert.ok(fresh.avatarId, "avatar identity kept for relocation");
+  assert.ok(Object.keys(fresh.walk).length > 0, "walk map survives reset — same level restarts");
+
+  // relocation: the remembered sprite is found again in a fresh frame, so routes work immediately
+  const { relocateAvatar } = await import("../bench/game-memory.mjs");
+  assert.equal(relocateAvatar(fresh, maze(2, 2)), true, "sprite re-found after reset");
+  assert.deepEqual({ x: fresh.avatar.x, y: fresh.avatar.y }, { x: 2, y: 2 }, "relocated to start position");
+}
+
+// ---- self-effects: a multi-colour sprite's own halves are not "touched objects" ----
+{
+  function duo(ax, ay, extra) {
+    const g = Array.from({ length: 16 }, (_, y) => Array.from({ length: 16 }, (_, x) =>
+      x === 0 || y === 0 || x === 15 || y === 15 ? 3 : 4));
+    g[ay][ax] = 12; // top half of the sprite
+    g[ay + 1][ax] = 9; // bottom half
+    if (extra) for (const [x, y, c] of extra) g[y][x] = c;
+    return g;
+  }
+  // move with a distant unexplained change, nothing adjacent: must NOT log an effect
+  const r = updateMemory(newMemory(), "ACTION4", duo(5, 5), duo(6, 5, [[2, 13, 8]]));
+  assert.equal(r.state.effects.length, 0, `own sprite half must not read as a touched object: ${JSON.stringify(r.state.effects)}`);
 }
 
 console.log("game-memory v2 (navigator): ok");

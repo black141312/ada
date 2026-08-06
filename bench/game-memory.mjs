@@ -21,7 +21,8 @@ export function newMemory() {
     moves: {}, // action → { "dx,dy" → count } — what each button empirically does
     blocked: {}, // action → ["x,y" ...] — positions where that action did nothing
     log: [], // last 30 one-line events, newest last
-    avatar: null, // {color, cells, x, y} — the component that moves when you press a button
+    avatar: null, // {color, cells, x, y, w, h, parts} — the component that moves when you press a button
+    avatarId: null, // {parts, w, h, color, cells} — the sprite's identity, kept across RESET so it can be re-found
     walk: {}, // "x,y" → 1 — screen cells the avatar has stood on this attempt
     walls: {}, // "x,y" → 1 — screen cells a move bounced off
     walkColors: [], // colors the avatar has been seen standing on (the floor)
@@ -161,9 +162,31 @@ export function trackMover(before, after) {
     to: { x: Math.min(...xs), y: Math.min(...ys) },
     w: Math.max(...xs) - Math.min(...xs) + 1,
     h: Math.max(...ys) - Math.min(...ys) + 1,
+    parts: parts.map((p) => ({ color: p.g.color, cells: p.g.cells })),
     fromCells: parts.flatMap((p) => cellsOf(before, p.g)),
     toCells,
   };
+}
+
+/** After a RESET the sprite is back at its start position. Re-find it by its remembered
+ *  identity so routes work immediately instead of waiting for the next move. */
+export function relocateAvatar(state, grid) {
+  const id = state.avatarId;
+  if (!id?.parts?.length) return false;
+  const comps = components(grid, mostCommonColor(grid));
+  const found = [];
+  for (const part of id.parts) {
+    const hits = comps.filter((c) => c.color === part.color && c.cells === part.cells);
+    if (hits.length !== 1) return false; // ambiguous or missing — wait for a move instead
+    found.push(hits[0]);
+  }
+  const x = Math.min(...found.map((c) => c.x0));
+  const y = Math.min(...found.map((c) => c.y0));
+  const w = Math.max(...found.map((c) => c.x1)) - x + 1;
+  const h = Math.max(...found.map((c) => c.y1)) - y + 1;
+  if (w !== id.w || h !== id.h) return false; // parts found but not assembled as the sprite
+  state.avatar = { color: id.color, cells: id.cells, x, y, w, h, parts: id.parts };
+  return true;
 }
 
 /** dir "dx,dy" → the action whose majority meaning matches it, from learned moves. */
@@ -293,7 +316,8 @@ export function updateMemory(state, action, before, after) {
       const mdy = mover.to.y - mover.from.y;
       const key = `${mdx},${mdy}`;
       (state.moves[action] ??= {})[key] = ((state.moves[action] ?? {})[key] ?? 0) + 1;
-      state.avatar = { color: mover.color, cells: mover.cells, x: mover.to.x, y: mover.to.y, w: mover.w ?? 1, h: mover.h ?? 1 };
+      state.avatar = { color: mover.color, cells: mover.cells, x: mover.to.x, y: mover.to.y, w: mover.w ?? 1, h: mover.h ?? 1, parts: mover.parts };
+      state.avatarId = { parts: mover.parts, w: mover.w ?? 1, h: mover.h ?? 1, color: mover.color, cells: mover.cells };
       for (const [x, y] of mover.fromCells) {
         state.walk[`${x},${y}`] = 1;
         const floor = after[y]?.[x];
@@ -326,11 +350,14 @@ function recordEffect(state, before, after, mover) {
   const real = extra.filter(([x, y]) => (state.changeFreq[`${x},${y}`] ?? 0) < 3); // ≥3 = HUD chrome
   if (!real.length) return "";
   const bg = mostCommonColor(after);
+  // The mover's own footprint: a multi-colour sprite's other halves are itself, not neighbours.
+  const tx1 = mover.to.x + (mover.w ?? 1) - 1;
+  const ty1 = mover.to.y + (mover.h ?? 1) - 1;
   // Cell-level adjacency, smallest component first — a maze's wall ring spans the whole
   // screen by bounding box and would otherwise claim every effect.
   const near = components(after, bg)
     .filter((c) => c.cells <= 200) // a maze's whole wall network is scenery, not a "thing you touched"
-    .filter((c) => !(c.color === mover.color && c.x0 === mover.to.x && c.y0 === mover.to.y))
+    .filter((c) => !(c.x0 >= mover.to.x && c.x1 <= tx1 && c.y0 >= mover.to.y && c.y1 <= ty1))
     .sort((p, q) => p.cells - q.cells)
     .find((c) =>
       cellsOf(after, c).some(([x, y]) =>
@@ -393,13 +420,18 @@ export function summarize(state, grid, event) {
     .join("\n");
 }
 
-/** New level attempt: positions are stale, physics and knowledge are not. */
+/** New attempt at the SAME level: the sprite's position is stale, but the level's geometry —
+ *  walls, floors, what the buttons mean, what touching things did — is not. Only clear what
+ *  a restart actually invalidates. */
 export function resetMemory(state) {
   const fresh = newMemory();
   fresh.moves = structuredClone(state.moves ?? {});
   fresh.blocked = structuredClone(state.blocked ?? {});
   fresh.effects = structuredClone(state.effects ?? []);
   fresh.walkColors = structuredClone(state.walkColors ?? []);
+  fresh.walls = structuredClone(state.walls ?? {});
+  fresh.walk = structuredClone(state.walk ?? {});
+  fresh.avatarId = state.avatarId ? structuredClone(state.avatarId) : null;
   return fresh;
 }
 
