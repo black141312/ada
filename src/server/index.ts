@@ -9,7 +9,7 @@ import { PORT, PROVIDERS, clientKeys, configuredProviders, isConfigured, provide
 import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, createSeat, disableSeat, disableSeatByExternalId, enterpriseMode, extractLastUsage, identifySeat, listSeats, loadPolicy, modelAllowed, savePolicy, upsertSeatForSSO, usageSummary, validatePolicy } from "./enterprise.ts";
 import { adminUsers, verifyIdentity } from "./identity.ts";
 import { addAllowed, isAllowedUser, listAllowed, removeAllowed } from "./allowlist.ts";
-import { recordUsage, usageSince } from "./usage.ts";
+import { billableUsageSince, recordUsage } from "./usage.ts";
 import { billingWebhookImplemented, checkEntitlement, effectivePlan, isFreeModel, PLANS, planFor, periodStart, setPlan, type PlanName } from "./plans.ts";
 import { checkoutUrl, createCheckout, getCheckout, setCheckoutPlan } from "./billing.ts";
 import { createKelviqCheckout, getKelviqCatalog, handleKelviqWebhook, kelviqEnabled, verifyKelviqSignature, type KelviqEvent } from "./kelviq.ts";
@@ -585,7 +585,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       if (isAnonymous(who)) return json(res, 200, { plan: "free", status: "active", used: 0, limit: PLANS.free.monthlyTokens, models: PLANS.free.models });
       const up = await planFor(who.user);
       const since = periodStart(up);
-      const used = await usageSince(who.user, since).then((u) => u.promptTokens + u.completionTokens).catch(() => 0);
+      // Billable only: free-tier model tokens cost nothing upstream and don't count against quota.
+      const used = await billableUsageSince(who.user, since).then((u) => u.promptTokens + u.completionTokens).catch(() => 0);
       // God mode mirrors checkEntitlement: env-listed admins are unmetered, and the UI should say so
       // rather than show "free — upgrade" to an account the gate will never stop.
       if (adminUsers()?.includes(who.user)) {

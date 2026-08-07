@@ -12,7 +12,7 @@ import type { Pool } from "pg";
 import type Database from "better-sqlite3";
 import { authDatabase, usingPostgres } from "./auth.js";
 import { adminUsers } from "./identity.js";
-import { usageSince } from "./usage.js";
+import { billableUsageSince } from "./usage.js";
 
 export type PlanName = "free" | "pro" | "team";
 export type PlanStatus = "active" | "past_due" | "canceled" | "banned";
@@ -182,7 +182,7 @@ export async function checkEntitlement(user: string, model: string): Promise<Ent
   // database, so it cannot be self-granted through any API. Usage is still recorded and reported —
   // unlimited spend should still be visible spend.
   if (adminUsers()?.includes(user)) {
-    const used = await usageSince(user, periodStart(DEFAULT_PLAN(user))).then((u) => u.promptTokens + u.completionTokens).catch(() => 0);
+    const used = await billableUsageSince(user, periodStart(DEFAULT_PLAN(user))).then((u) => u.promptTokens + u.completionTokens).catch(() => 0);
     return { ok: true, plan: "team", used, limit: Number.MAX_SAFE_INTEGER };
   }
   const up = await planFor(user);
@@ -193,7 +193,7 @@ export async function checkEntitlement(user: string, model: string): Promise<Ent
   }
   const def = effectivePlan(up);
   const since = periodStart(up);
-  const used = await usageSince(user, since).then((u) => u.promptTokens + u.completionTokens).catch(() => 0);
+  const used = await billableUsageSince(user, since).then((u) => u.promptTokens + u.completionTokens).catch(() => 0);
   // A per-user override beats the plan's cap — how an admin grants one account more (or less)
   // without inventing a plan for it.
   const limit = up.maxTokens ?? def.monthlyTokens;
