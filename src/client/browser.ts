@@ -251,14 +251,29 @@ const KEYS: Record<string, { key: string; code: string; keyCode: number; text?: 
   arrowdown: { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
   arrowleft: { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
   arrowright: { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
+  space: { key: " ", code: "Space", keyCode: 32, text: " " },
 };
 
-/** Send a keyDown/keyUp pair for one of the supported `press` keys. */
-async function pressKey(cdp: Cdp, name: string): Promise<void> {
+/** Resolve a `press` name — named key, or any single printable character (games want WASD,
+ *  digits, space). Pure — unit-tested offline in test/game-keys.mjs. */
+export function keyParams(name: string): { key: string; code: string; keyCode: number; text?: string } {
   const k = KEYS[name.toLowerCase()];
-  if (!k) throw new Error(`unsupported key: ${name || "(none)"}. Supported: ${Object.values(KEYS).map((v) => v.key).join(", ")}`);
+  if (k) return k;
+  if (name.length === 1 && name >= " " && name <= "~") {
+    const up = name.toUpperCase();
+    const code = name === " " ? "Space" : /[a-z]/i.test(name) ? `Key${up}` : /[0-9]/.test(name) ? `Digit${name}` : "";
+    return { key: name, code, keyCode: name === " " ? 32 : up.charCodeAt(0), text: name };
+  }
+  throw new Error(`unsupported key: ${name || "(none)"}. Supported: any single character, or ${Object.values(KEYS).map((v) => v.key).join(", ")}`);
+}
+
+/** Send keyDown/keyUp for a `press` key, optionally holding between the two (games read held keys). */
+async function pressKey(cdp: Cdp, name: string, hold = 0): Promise<void> {
+  const k = keyParams(name);
   const base = { key: k.key, code: k.code, windowsVirtualKeyCode: k.keyCode, nativeVirtualKeyCode: k.keyCode };
   await cdp.send("Input.dispatchKeyEvent", { type: "keyDown", ...base, ...(k.text ? { text: k.text } : {}) });
+  const ms = Math.min(Math.max(Number(hold) || 0, 0), 2000);
+  if (ms) await new Promise((r) => setTimeout(r, ms));
   await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
 }
 
@@ -275,6 +290,9 @@ export interface BrowserOpts {
   height?: number;
   tab?: string;
   ref?: string;
+  x?: number;
+  y?: number;
+  hold?: number;
   text?: string;
   key?: string;
   direction?: "up" | "down" | "left" | "right";
@@ -334,6 +352,16 @@ export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {})
       return { text: `${here}\n\n${text || "(empty accessibility tree)"}` };
     }
     if (action === "click") {
+      if (opts.x !== undefined && opts.y !== undefined) {
+        // canvas/games have no DOM refs — click straight at viewport coordinates
+        const x = Number(opts.x);
+        const y = Number(opts.y);
+        await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+        await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+        await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+        await settle();
+        return { text: `clicked (${x}, ${y}) on ${here}` };
+      }
       const backendNodeId = needRef();
       await domReady();
       await cdp.send("DOM.scrollIntoViewIfNeeded", { backendNodeId }).catch(() => {
@@ -367,7 +395,7 @@ export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {})
       return { text: `typed into ${opts.ref} on ${here}` };
     }
     if (action === "press") {
-      await pressKey(cdp, String(opts.key ?? ""));
+      await pressKey(cdp, String(opts.key ?? ""), Number(opts.hold) || 0);
       await settle();
       return { text: `pressed ${opts.key} on ${here}` };
     }
