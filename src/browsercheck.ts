@@ -7,7 +7,11 @@ import { browserAction, tabAction } from "./client/browser.ts";
 const page = `<!doctype html><title>check</title>
 <button onclick="document.getElementById('out').textContent='clicked'">Do thing</button>
 <input aria-label="Name">
-<div id="out"></div>`;
+<div id="out"></div>
+<script>
+  addEventListener("mousedown", (e) => { document.getElementById("out").textContent = e.clientX + "," + e.clientY; });
+  addEventListener("keydown", (e) => { document.getElementById("out").textContent = "key=" + e.key; });
+</script>`;
 
 async function main(): Promise<void> {
   const srv = createServer((_, res) => {
@@ -41,6 +45,18 @@ async function main(): Promise<void> {
       (e) => String(e),
     );
     assert.ok(/`read`/.test(stale), `stale ref should demand a read, got: ${stale || "(no error)"}`);
+
+    // coordinate click + character keys reach the page as real input events
+    await browserAction("open", { url });
+    await browserAction("click", { x: 200, y: 150 });
+    r = await browserAction("read", {});
+    assert.ok(r.text.includes("200,150"), `coordinate click did not land:\n${r.text}`);
+    await browserAction("press", { key: "w" });
+    r = await browserAction("read", {});
+    assert.ok(r.text.includes("key=w"), `character key did not land:\n${r.text}`);
+    await browserAction("press", { key: "space", hold: 300 }); // held key must not throw
+    const shot = await browserAction("screenshot", {});
+    assert.ok(shot.screenshot && shot.screenshot.length > 1024, "screenshot too small to be a real PNG");
 
     // tabs: list shows origins, new adds one, close removes it
     const before = (await tabAction("tabs")).split("\n").length;

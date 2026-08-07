@@ -134,6 +134,30 @@ export function verifyKelviqSignature(h: { id?: string; timestamp?: string; sign
   return false;
 }
 
+export interface KelviqSubscription {
+  status: string;
+  amount: number;
+  currency: string;
+  recurrence: string; // e.g. "1 month" / "1 year"
+  planIdentifier: string;
+}
+
+/** All subscriptions in the workspace — the analytics dashboard's revenue truth. */
+export async function listKelviqSubscriptions(): Promise<KelviqSubscription[]> {
+  if (!kelviqEnabled()) return [];
+  const r = await api("/subscriptions/?page_size=200");
+  const body = (await r.json()) as {
+    results?: Array<{ status?: string; amount?: string | number; currency?: string; recurrence?: string; plan?: { identifier?: string } }>;
+  };
+  return (body.results ?? []).map((s) => ({
+    status: s.status ?? "unknown",
+    amount: Number(s.amount ?? 0) || 0,
+    currency: s.currency ?? "USD",
+    recurrence: s.recurrence ?? "1 month",
+    planIdentifier: s.plan?.identifier ?? "",
+  }));
+}
+
 export interface KelviqEvent {
   id?: string;
   type?: string;
