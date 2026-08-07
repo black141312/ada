@@ -160,7 +160,7 @@ export function parseJudgment(raw: string, fallbackText: string, offered: Set<st
   return { action, targets, text };
 }
 
-async function ask(client: OpenAI, model: string, system: string, user: string): Promise<string> {
+export async function ask(client: OpenAI, model: string, system: string, user: string): Promise<string> {
   // Streamed like compaction.ts: every provider adapter supports it, non-streaming does not.
   const stream = await client.chat.completions.create(
     { model, stream: true, messages: [{ role: "system", content: system }, { role: "user", content: user }] },
@@ -201,46 +201,6 @@ export async function learnFromTranscript(client: OpenAI, model: string, message
     if (r.ok && !r.skipped) stored.push(r.memory.text);
   }
   return stored;
-}
-
-// ---- query expansion (HyDE) ----
-
-const HYDE_SYSTEM = `Rewrite a question as the one-sentence note that would answer it, as it might appear in a team's handbook.
-
-Do not answer from your own knowledge and do not hedge — invent a plausible, concrete statement. It exists only to be compared against real notes, so wording matters and truth does not.
-
-"how do I containerize the app" -> "The project uses Docker for local development and builds."
-"who gets paged at night" -> "On-call alerts are routed to the duty engineer."
-
-Output only the sentence.`;
-
-/**
- * Turn a question into a hypothetical answer, so the embedder compares statement-to-statement.
- * Bi-encoders are weakest exactly where our probes live: a short conversational question against a
- * short declarative fact. HyDE closes that gap by moving the query into the same shape as the corpus.
- * Returns "" on any failure — the caller falls back to the raw query.
- *
- * NOT wired into recall — reachable only from `bench/memory.ts --hyde`. It measured as the single
- * biggest quality win available (ledger 120: hit 75% -> 80-90%, MRR 0.53 -> 0.72-0.82), and it is
- * still not shipped, for three reasons:
- *   1. It costs a BLOCKING model call before every turn's recall. Extraction is fire-and-forget every
- *      6 turns; this would be on the hot path of all of them.
- *   2. It breaks the cost-free-until-relevant guarantee — 3-4 of 8 off-topic probes started injecting
- *      facts, because inventing a confident answer for "what is the capital of Portugal" produces a
- *      sentence that genuinely resembles some unrelated note. Raising the floor to 0.56 did not fix it.
- *   3. The expansion is sampled, so the same config scored 80% on one run and 90% on the next. Any
- *      future tuning needs repeated runs, not the single-shot comparisons used elsewhere here.
- * Wiring it would mean a setQueryExpander hook alongside setSmartWriter, and a floor re-calibrated
- * for expanded queries.
- */
-export async function expandQuery(client: OpenAI, model: string, query: string): Promise<string> {
-  if (query.trim().length < 8) return "";
-  try {
-    const out = (await ask(client, model, HYDE_SYSTEM, query)).trim().replace(/\s+/g, " ").replace(/^["']|["']$/g, "");
-    return out.length > 8 && out.length < 300 ? out : "";
-  } catch {
-    return "";
-  }
 }
 
 // ---- pass 2: judged write ----
