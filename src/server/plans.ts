@@ -11,10 +11,11 @@
 import type { Pool } from "pg";
 import type Database from "better-sqlite3";
 import { authDatabase, usingPostgres } from "./auth.js";
+import { adminUsers } from "./identity.js";
 import { usageSince } from "./usage.js";
 
 export type PlanName = "free" | "pro" | "team";
-export type PlanStatus = "active" | "past_due" | "canceled";
+export type PlanStatus = "active" | "past_due" | "canceled" | "banned";
 
 export interface PlanDef {
   /** `free` restricts to `:free` models, which cost nothing upstream. `all` is the full catalogue. */
@@ -41,6 +42,9 @@ export interface UserPlan {
   /** Access is good until this ms timestamp. NULL MEANS NEVER EXPIRES — a plan granted by hand
    *  should not die because nobody wrote a date. Only a payment provider sets a real one. */
   paidThrough: number | null;
+  /** Per-user monthly token cap. Null = use the plan's cap. Set by an admin to raise (or shrink)
+   *  one account's allowance without inventing a plan for it. */
+  maxTokens: number | null;
 }
 
 const pg = () => authDatabase as Pool;
@@ -57,18 +61,22 @@ function ensure(): Promise<void> {
       status text not null default 'active',
       period_start bigint,
       paid_through bigint,
+      max_tokens bigint,
       updated_at bigint not null
     )`;
     if (usingPostgres) {
       await pg().query(ddl);
       // `create table if not exists` does nothing to a table that already exists, so an installation
-      // that predates paid_through would silently never get the column.
+      // that predates these columns would silently never get them.
       await pg().query("alter table user_plans add column if not exists paid_through bigint");
+      await pg().query("alter table user_plans add column if not exists max_tokens bigint");
     } else {
       lite().exec(ddl.replace(/bigint/g, "integer"));
       // SQLite has no `add column if not exists`; adding a column twice is an error, so ask first.
       const cols = lite().prepare("pragma table_info(user_plans)").all() as Array<{ name: string }>;
-      if (!cols.some((c) => c.name === "paid_through")) lite().exec("alter table user_plans add column paid_through integer");
+      for (const col of ["paid_through", "max_tokens"]) {
+        if (!cols.some((c) => c.name === col)) lite().exec(`alter table user_plans add column ${col} integer`);
+      }
     }
   })();
   return ready;
@@ -81,7 +89,7 @@ export function invalidatePlanCache(user?: string): void {
   else cache.clear();
 }
 
-const DEFAULT_PLAN = (user: string): UserPlan => ({ user, plan: "free", status: "active", periodStart: null, paidThrough: null });
+const DEFAULT_PLAN = (user: string): UserPlan => ({ user, plan: "free", status: "active", periodStart: null, paidThrough: null, maxTokens: null });
 
 /** The plan for an account. No row means free — signing up is enough to be a free user, so a
  *  missing row is a normal state, not an error. A DB failure also yields free rather than throwing:
@@ -89,12 +97,12 @@ const DEFAULT_PLAN = (user: string): UserPlan => ({ user, plan: "free", status: 
 export async function planFor(user: string): Promise<UserPlan> {
   const hit = cache.get(user);
   if (hit && hit.exp > Date.now()) return hit.plan;
-  let row: { plan?: string; status?: string; period_start?: number | string | null; paid_through?: number | string | null } | undefined;
+  let row: { plan?: string; status?: string; period_start?: number | string | null; paid_through?: number | string | null; max_tokens?: number | string | null } | undefined;
   try {
     await ensure();
     row = usingPostgres
-      ? ((await pg().query("select plan, status, period_start, paid_through from user_plans where user_id = $1", [user])).rows[0] as typeof row)
-      : (lite().prepare("select plan, status, period_start, paid_through from user_plans where user_id = ?").get(user) as typeof row);
+      ? ((await pg().query("select plan, status, period_start, paid_through, max_tokens from user_plans where user_id = $1", [user])).rows[0] as typeof row)
+      : (lite().prepare("select plan, status, period_start, paid_through, max_tokens from user_plans where user_id = ?").get(user) as typeof row);
   } catch (e) {
     console.error("[ada] plan lookup failed:", e instanceof Error ? e.message : e);
     return DEFAULT_PLAN(user);
@@ -106,6 +114,7 @@ export async function planFor(user: string): Promise<UserPlan> {
     status: (row?.status ?? "active") as PlanStatus,
     periodStart: row?.period_start != null ? Number(row.period_start) : null,
     paidThrough: row?.paid_through != null ? Number(row.paid_through) : null,
+    maxTokens: row?.max_tokens != null ? Number(row.max_tokens) : null,
   };
   cache.set(user, { plan, exp: Date.now() + TTL });
   return plan;
@@ -169,11 +178,26 @@ export function isFreeModel(id: string): boolean {
 
 /** The whole gate: may this account run this model right now? */
 export async function checkEntitlement(user: string, model: string): Promise<Entitlement> {
+  // God mode: env-listed admins are never metered or model-gated. The list lives in env, not the
+  // database, so it cannot be self-granted through any API. Usage is still recorded and reported —
+  // unlimited spend should still be visible spend.
+  if (adminUsers()?.includes(user)) {
+    const used = await usageSince(user, periodStart(DEFAULT_PLAN(user))).then((u) => u.promptTokens + u.completionTokens).catch(() => 0);
+    return { ok: true, plan: "team", used, limit: Number.MAX_SAFE_INTEGER };
+  }
   const up = await planFor(user);
+  // Banned beats everything except god mode (above): no models, not even free ones. 403, not 402 —
+  // there is nothing the user can pay to fix.
+  if (up.status === "banned") {
+    return { ok: false, status: 403, message: "This account is suspended.", plan: up.plan, used: 0, limit: 0 };
+  }
   const def = effectivePlan(up);
   const since = periodStart(up);
   const used = await usageSince(user, since).then((u) => u.promptTokens + u.completionTokens).catch(() => 0);
-  const base = { plan: def.name, used, limit: def.monthlyTokens };
+  // A per-user override beats the plan's cap — how an admin grants one account more (or less)
+  // without inventing a plan for it.
+  const limit = up.maxTokens ?? def.monthlyTokens;
+  const base = { plan: def.name, used, limit };
 
   if (def.models === "free" && !isFreeModel(model)) {
     return {
@@ -183,12 +207,12 @@ export async function checkEntitlement(user: string, model: string): Promise<Ent
       message: `${def.label} plan covers free-tier models only. Upgrade to use ${model}.`,
     };
   }
-  if (used >= def.monthlyTokens) {
+  if (used >= limit) {
     return {
       ...base,
       ok: false,
       status: 402,
-      message: `${def.label} plan quota reached — ${used.toLocaleString()} of ${def.monthlyTokens.toLocaleString()} tokens this period. Resets ${new Date(since).toISOString().slice(0, 10)} + 1 month.`,
+      message: `${def.label} plan quota reached — ${used.toLocaleString()} of ${limit.toLocaleString()} tokens this period. Resets ${new Date(since).toISOString().slice(0, 10)} + 1 month.`,
     };
   }
   return { ...base, ok: true };
@@ -220,23 +244,27 @@ export async function setPlan(
   status: PlanStatus = "active",
   anchorNow = true,
   paidThrough: number | null = null,
+  /** undefined = leave any existing override alone (so payment webhooks can't wipe an admin-set
+   *  cap); null = clear the override; a number = set it. */
+  maxTokens: number | null | undefined = undefined,
 ): Promise<void> {
   await ensure();
   const now = Date.now();
   const start = anchorNow && plan !== "free" ? now : null;
+  const setMax = maxTokens === undefined ? "" : "max_tokens = excluded.max_tokens, ";
   if (usingPostgres) {
     await pg().query(
-      `insert into user_plans (user_id, plan, status, period_start, paid_through, updated_at) values ($1,$2,$3,$4,$5,$6)
-       on conflict (user_id) do update set plan = excluded.plan, status = excluded.status, period_start = excluded.period_start, paid_through = excluded.paid_through, updated_at = excluded.updated_at`,
-      [user, plan, status, start, paidThrough, now],
+      `insert into user_plans (user_id, plan, status, period_start, paid_through, max_tokens, updated_at) values ($1,$2,$3,$4,$5,$6,$7)
+       on conflict (user_id) do update set plan = excluded.plan, status = excluded.status, period_start = excluded.period_start, paid_through = excluded.paid_through, ${setMax}updated_at = excluded.updated_at`,
+      [user, plan, status, start, paidThrough, maxTokens ?? null, now],
     );
   } else {
     lite()
       .prepare(
-        `insert into user_plans (user_id, plan, status, period_start, paid_through, updated_at) values (?,?,?,?,?,?)
-         on conflict (user_id) do update set plan = excluded.plan, status = excluded.status, period_start = excluded.period_start, paid_through = excluded.paid_through, updated_at = excluded.updated_at`,
+        `insert into user_plans (user_id, plan, status, period_start, paid_through, max_tokens, updated_at) values (?,?,?,?,?,?,?)
+         on conflict (user_id) do update set plan = excluded.plan, status = excluded.status, period_start = excluded.period_start, paid_through = excluded.paid_through, ${setMax}updated_at = excluded.updated_at`,
       )
-      .run(user, plan, status, start, paidThrough, now);
+      .run(user, plan, status, start, paidThrough, maxTokens ?? null, now);
   }
   invalidatePlanCache(user);
 }

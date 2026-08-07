@@ -81,6 +81,38 @@ if (raw) {
   assert.equal((await planFor("weird")).plan, "free", "an unrecognised plan name must degrade to free, not unlock");
 }
 
+// --- ban ---------------------------------------------------------------------
+// Banned means nothing runs, not even free models, and it's 403 — money can't fix it.
+await setPlan("outlaw", "pro", "banned");
+const banned = await checkEntitlement("outlaw", "some/model:free");
+assert.equal(banned.ok, false, "a banned account must not run anything");
+assert.equal(banned.status, 403, "banned is 403, not a quota problem");
+
+// --- per-user token override -------------------------------------------------
+// An admin can raise one account's cap past its plan without inventing a plan for it.
+await setPlan("vip", "pro", "active", true, null, PLANS.pro.monthlyTokens * 10);
+await recordUsage({ ts: Date.now(), user: "vip", model: "anthropic/claude-opus-5", provider: "anthropic", promptTokens: PLANS.pro.monthlyTokens + 1, completionTokens: 0 });
+const vip = await checkEntitlement("vip", "anthropic/claude-opus-5");
+assert.equal(vip.ok, true, "an override must beat the plan's cap");
+assert.equal(vip.limit, PLANS.pro.monthlyTokens * 10, "the reported limit is the override");
+// A later setPlan that says nothing about maxTokens must not wipe the override (webhooks call this).
+await setPlan("vip", "pro", "active");
+assert.equal((await checkEntitlement("vip", "anthropic/claude-opus-5")).limit, PLANS.pro.monthlyTokens * 10, "an unrelated setPlan must not wipe the override");
+// Explicit null clears it.
+await setPlan("vip", "pro", "active", true, null, null);
+assert.equal((await checkEntitlement("vip", "anthropic/claude-opus-5")).limit, PLANS.pro.monthlyTokens, "null must clear the override");
+
+// --- god mode ----------------------------------------------------------------
+// Env-listed admins are never metered or model-gated, even with no plan row and spend past any cap.
+process.env.ADA_ADMIN_USERS = "boss";
+await recordUsage({ ts: Date.now(), user: "boss", model: "anthropic/claude-opus-5", provider: "anthropic", promptTokens: PLANS.team.monthlyTokens * 2, completionTokens: 0 });
+const god = await checkEntitlement("boss", "anthropic/claude-opus-5");
+assert.equal(god.ok, true, "an env-listed admin must never be blocked");
+assert.equal(god.limit, Number.MAX_SAFE_INTEGER, "god mode reports an effectively-unlimited cap");
+assert.ok(god.used > 0, "god mode still reports spend — unlimited must stay visible");
+assert.equal((await checkEntitlement("payer", "anthropic/claude-opus-5")).ok, false, "god mode must not leak to non-admins");
+delete process.env.ADA_ADMIN_USERS;
+
 // --- billing period ---------------------------------------------------------
 // No anchor → calendar month, so a free account's window is predictable.
 const cal = periodStart({ user: "x", plan: "free", status: "active", periodStart: null }, Date.UTC(2026, 6, 29, 12));
