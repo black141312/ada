@@ -81,6 +81,18 @@ if (raw) {
   assert.equal((await planFor("weird")).plan, "free", "an unrecognised plan name must degrade to free, not unlock");
 }
 
+// --- free-model tokens don't count against quota ------------------------------
+// Quota caps upstream spend; :free models have none, so they must not eat the allowance.
+await setPlan("freeloader", "pro");
+await recordUsage({ ts: Date.now(), user: "freeloader", model: "meta-llama/llama-3.3-70b-instruct:free", provider: "openrouter", promptTokens: PLANS.pro.monthlyTokens * 3, completionTokens: 0 });
+const freeSpend = await checkEntitlement("freeloader", "anthropic/claude-opus-5");
+assert.equal(freeSpend.ok, true, "free-model tokens must not consume the paid quota");
+assert.equal(freeSpend.used, 0, "used must count billable tokens only");
+process.env.ADA_FREE_MODELS = "deepseek/deepseek-v4-flash-0731";
+await recordUsage({ ts: Date.now(), user: "freeloader", model: "deepseek/deepseek-v4-flash-0731", provider: "openrouter", promptTokens: 999, completionTokens: 0 });
+assert.equal((await checkEntitlement("freeloader", "anthropic/claude-opus-5")).used, 0, "ADA_FREE_MODELS entries must not count either");
+delete process.env.ADA_FREE_MODELS;
+
 // --- ban ---------------------------------------------------------------------
 // Banned means nothing runs, not even free models, and it's 403 — money can't fix it.
 await setPlan("outlaw", "pro", "banned");

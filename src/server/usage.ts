@@ -99,6 +99,25 @@ export async function usageSince(user: string, sinceMs: number): Promise<UsageTo
   return { promptTokens: Number(row?.p ?? 0), completionTokens: Number(row?.c ?? 0), requests: Number(row?.n ?? 0) };
 }
 
+/** Like usageSince, but only tokens that cost money upstream. Free-tier models (`:free` suffix,
+ *  plus anything in ADA_FREE_MODELS) are excluded — a quota exists to cap upstream spend, and free
+ *  models have none, so chatting on them must not eat the paid allowance. */
+export async function billableUsageSince(user: string, sinceMs: number): Promise<UsageTotal> {
+  await ensure();
+  const extraFree = (process.env.ADA_FREE_MODELS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  let sql =
+    "select coalesce(sum(prompt_tokens),0) as p, coalesce(sum(completion_tokens),0) as c, count(*) as n from usage_events where user_id = $1 and ts >= $2 and lower(model) not like '%:free'";
+  const params: unknown[] = [user, sinceMs];
+  for (const m of extraFree) {
+    params.push(m);
+    sql += ` and lower(model) <> $${params.length}`;
+  }
+  const row = usingPostgres
+    ? ((await pg().query(sql, params)).rows[0] as { p: string; c: string; n: string })
+    : (lite().prepare(sql.replace(/\$\d+/g, "?")).get(...params) as { p: number; c: number; n: number });
+  return { promptTokens: Number(row?.p ?? 0), completionTokens: Number(row?.c ?? 0), requests: Number(row?.n ?? 0) };
+}
+
 /** Per-model breakdown for an account over a window — for a usage page, and for costing a period
  *  once a price table exists (cost needs the model, which is why it's stored per row). */
 export async function usageByModel(user: string, sinceMs: number): Promise<Array<UsageTotal & { model: string }>> {
