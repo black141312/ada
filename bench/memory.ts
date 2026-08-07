@@ -173,12 +173,50 @@ async function runArm(arm: "lexical" | "hybrid", size: number, dir: string): Pro
   return s;
 }
 
+// ---- HyDE (bench-only) ----
+// Turn a question into a hypothetical answer, so the embedder compares statement-to-statement.
+// Bi-encoders are weakest exactly where our probes live: a short conversational question against a
+// short declarative fact. HyDE closes that gap by moving the query into the same shape as the corpus.
+//
+// NOT wired into recall — lives here, reachable only via --hyde. It measured as the single biggest
+// quality win available (ledger 120: hit 75% -> 80-90%, MRR 0.53 -> 0.72-0.82), and it is still not
+// shipped, for three reasons:
+//   1. It costs a BLOCKING model call before every turn's recall. Extraction is fire-and-forget every
+//      6 turns; this would be on the hot path of all of them.
+//   2. It breaks the cost-free-until-relevant guarantee — 3-4 of 8 off-topic probes started injecting
+//      facts, because inventing a confident answer for "what is the capital of Portugal" produces a
+//      sentence that genuinely resembles some unrelated note. Raising the floor to 0.56 did not fix it.
+//   3. The expansion is sampled, so the same config scored 80% on one run and 90% on the next. Any
+//      future tuning needs repeated runs, not the single-shot comparisons used elsewhere here.
+// Shipping it would mean a setQueryExpander hook alongside setSmartWriter, and a floor re-calibrated
+// for expanded queries.
+
+const HYDE_SYSTEM = `Rewrite a question as the one-sentence note that would answer it, as it might appear in a team's handbook.
+
+Do not answer from your own knowledge and do not hedge — invent a plausible, concrete statement. It exists only to be compared against real notes, so wording matters and truth does not.
+
+"how do I containerize the app" -> "The project uses Docker for local development and builds."
+"who gets paged at night" -> "On-call alerts are routed to the duty engineer."
+
+Output only the sentence.`;
+
+/** Returns "" on any failure — the caller falls back to the raw query. */
+async function expandQuery(client: import("openai").default, model: string, query: string): Promise<string> {
+  if (query.trim().length < 8) return "";
+  const { ask } = await import("../src/client/memory-llm.ts");
+  try {
+    const out = (await ask(client, model, HYDE_SYSTEM, query)).trim().replace(/\s+/g, " ").replace(/^["']|["']$/g, "");
+    return out.length > 8 && out.length < 300 ? out : "";
+  } catch {
+    return "";
+  }
+}
+
 /** probe -> "probe + hypothetical answer", precomputed once and shared across every arm and size. */
 let hydeCache: Map<string, string> | null = null;
 async function hydeMap(): Promise<Map<string, string>> {
   if (hydeCache) return hydeCache;
   const { default: OpenAI } = await import("openai");
-  const { expandQuery } = await import("../src/client/memory-llm.ts");
   const client = new OpenAI({ baseURL: process.env.ADA_BACKEND_URL ?? "http://localhost:8787/v1", apiKey: process.env.ADA_CLIENT_KEY ?? "dev", maxRetries: 1 });
   const model = process.env.ADA_MEMORY_HYDE_MODEL ?? "deepseek/deepseek-v4-flash-0731";
   hydeCache = new Map();
