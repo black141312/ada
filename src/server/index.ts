@@ -9,7 +9,7 @@ import { PORT, PROVIDERS, clientKeys, configuredProviders, isConfigured, provide
 import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, createSeat, disableSeat, disableSeatByExternalId, enterpriseMode, extractLastUsage, identifySeat, listSeats, loadPolicy, modelAllowed, savePolicy, upsertSeatForSSO, usageSummary, validatePolicy } from "./enterprise.ts";
 import { adminUsers, verifyIdentity } from "./identity.ts";
 import { addAllowed, isAllowedUser, listAllowed, removeAllowed } from "./allowlist.ts";
-import { recordUsage, usageSince } from "./usage.ts";
+import { billableUsageSince, recordUsage } from "./usage.ts";
 import { billingWebhookImplemented, checkEntitlement, effectivePlan, isFreeModel, PLANS, planFor, periodStart, setPlan, type PlanName } from "./plans.ts";
 import { checkoutUrl, createCheckout, getCheckout, setCheckoutPlan } from "./billing.ts";
 import { createKelviqCheckout, getKelviqCatalog, handleKelviqWebhook, kelviqEnabled, verifyKelviqSignature, type KelviqEvent } from "./kelviq.ts";
@@ -585,18 +585,25 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       if (isAnonymous(who)) return json(res, 200, { plan: "free", status: "active", used: 0, limit: PLANS.free.monthlyTokens, models: PLANS.free.models });
       const up = await planFor(who.user);
       const since = periodStart(up);
-      const used = await usageSince(who.user, since).then((u) => u.promptTokens + u.completionTokens).catch(() => 0);
+      // Billable only: free-tier model tokens cost nothing upstream and don't count against quota.
+      const used = await billableUsageSince(who.user, since).then((u) => u.promptTokens + u.completionTokens).catch(() => 0);
+      // God mode mirrors checkEntitlement: env-listed admins are unmetered, and the UI should say so
+      // rather than show "free — upgrade" to an account the gate will never stop.
+      if (adminUsers()?.includes(who.user)) {
+        return json(res, 200, { plan: "team", subscribed: up.plan, status: "active", models: "all", used, limit: Number.MAX_SAFE_INTEGER, remaining: Number.MAX_SAFE_INTEGER, periodStart: since, paidThrough: null, god: true });
+      }
       // effectivePlan, not a second copy of the rule: this endpoint had its own
       // `status === "active" ? plan : "free"` and would have kept reporting a lapsed plan as live.
       const def = effectivePlan(up);
+      const limit = up.maxTokens ?? def.monthlyTokens; // per-user override beats the plan's cap
       return json(res, 200, {
         plan: def.name, // what they actually GET — a lapsed pro is a free account
         subscribed: up.plan, // what they signed up for, so the UI can say "expired" rather than lie
         status: up.status,
         models: def.models,
         used,
-        limit: def.monthlyTokens,
-        remaining: Math.max(0, def.monthlyTokens - used),
+        limit,
+        remaining: Math.max(0, limit - used),
         periodStart: since,
         paidThrough: up.paidThrough,
       });
@@ -624,7 +631,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     if (req.method === "POST" && url.pathname === "/v1/plans") {
       const admin = who.role === "admin" || (adminUsers()?.includes(who.user) ?? false);
       if (!admin) return json(res, 403, { error: { message: "admin only" } });
-      let b: { user?: string; plan?: string; status?: string };
+      let b: { user?: string; plan?: string; status?: string; maxTokens?: number | null };
       try {
         b = JSON.parse(await readBody(req));
       } catch {
@@ -632,9 +639,21 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       }
       if (!b.user || !b.plan) return json(res, 400, { error: { message: "need { user, plan }" } });
       if (!(b.plan in PLANS)) return json(res, 400, { error: { message: `unknown plan '${b.plan}' (${Object.keys(PLANS).join(", ")})` } });
-      await setPlan(b.user, b.plan as PlanName, (b.status as "active" | "past_due" | "canceled") ?? "active");
-      appendAudit({ ts: Date.now(), user: who.user, event: "plan_set", detail: `${b.user} -> ${b.plan}` });
-      return json(res, 200, { ok: true, user: b.user, plan: b.plan });
+      const status = (b.status ?? "active") as import("./plans.ts").PlanStatus;
+      if (!["active", "past_due", "canceled", "banned"].includes(status)) {
+        return json(res, 400, { error: { message: `unknown status '${status}' (active, past_due, canceled, banned)` } });
+      }
+      // maxTokens: absent = leave any override alone, null = clear it, a positive number = set it.
+      let maxTokens: number | null | undefined;
+      if ("maxTokens" in b) {
+        maxTokens = b.maxTokens === null ? null : Number(b.maxTokens);
+        if (maxTokens !== null && (!Number.isFinite(maxTokens) || maxTokens <= 0)) {
+          return json(res, 400, { error: { message: "maxTokens must be a positive number, or null to clear" } });
+        }
+      }
+      await setPlan(b.user, b.plan as PlanName, status, true, null, maxTokens);
+      appendAudit({ ts: Date.now(), user: who.user, event: "plan_set", detail: `${b.user} -> ${b.plan}/${status}${maxTokens !== undefined ? ` max=${maxTokens}` : ""}` });
+      return json(res, 200, { ok: true, user: b.user, plan: b.plan, status, ...(maxTokens !== undefined ? { maxTokens } : {}) });
     }
     if (req.method === "GET" && url.pathname === "/v1/models") {
       return await handleModels(res, isAnon);
