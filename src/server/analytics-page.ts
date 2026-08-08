@@ -41,8 +41,8 @@ export const ANALYTICS_PAGE = `<!doctype html>
   svg text { font:10.5px var(--mono); fill:var(--dim); }
   .bars .row { display:grid; grid-template-columns:minmax(90px,1fr) 3fr 70px; gap:10px; align-items:center; font-size:12.5px; padding:4px 0; }
   .bars .name { color:var(--ink2); font-family:var(--mono); font-size:11.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .bars .track { height:14px; border-radius:4px; background:var(--panel2); overflow:hidden; }
-  .bars .fill { height:100%; border-radius:4px 0 0 4px; background:var(--s1); min-width:2px; }
+  .bars .track { display:block; height:14px; border-radius:4px; background:var(--panel2); overflow:hidden; }
+  .bars .fill { display:block; height:100%; border-radius:4px 0 0 4px; background:var(--s1); min-width:2px; }
   .bars .val { text-align:right; color:var(--ink2); font-family:var(--mono); font-size:11px; }
   table { width:100%; border-collapse:collapse; font-size:12.5px; }
   th { text-align:left; font:500 10.5px var(--mono); letter-spacing:.08em; text-transform:uppercase; color:var(--dim); padding:6px 8px; border-bottom:1px solid var(--line); }
@@ -73,8 +73,8 @@ let days = 30;
 
 function gate(msg) {
   $('main').innerHTML = '<div class="gate"><p class="mk" style="color:var(--s1);font-family:var(--mono)">&gt;&thinsp;&lt; analytics</p>' +
-    '<p style="color:var(--ink2)">Enter the admin key to view the dashboard.</p>' +
-    '<input id="key" type="password" placeholder="admin key" value="">' +
+    '<p style="color:var(--ink2)">Enter the analytics password (or an admin key) to view the dashboard.</p>' +
+    '<input id="key" type="password" placeholder="analytics password" value="">' +
     '<p class="err">' + esc(msg || '') + '</p><button id="go">View analytics</button></div>';
   $('go').onclick = () => { localStorage.setItem('ada.adminKey', $('key').value.trim()); load(); };
   $('key').onkeydown = (e) => { if (e.key === 'Enter') $('go').onclick(); };
