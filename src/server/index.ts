@@ -4,6 +4,7 @@
 
 import { createServer, type Server } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import type { ProviderName } from "../shared/types.ts";
 import { PORT, PROVIDERS, clientKeys, configuredProviders, isConfigured, providerKey, providerStatus } from "./config.ts";
 import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, createSeat, disableSeat, disableSeatByExternalId, enterpriseMode, extractLastUsage, identifySeat, listSeats, loadPolicy, modelAllowed, savePolicy, upsertSeatForSSO, usageSummary, validatePolicy } from "./enterprise.ts";
@@ -566,10 +567,29 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       return res.end(DEVICE_PAGE);
     }
     // Analytics dashboard shell. PRE-AUTH on purpose: the page is an empty instrument panel that
-    // holds no data — it asks for the admin key and calls the (gated) API below with it.
+    // holds no data — it asks for a credential and calls the (gated) API below with it.
     if (req.method === "GET" && url.pathname === "/admin/analytics") {
       res.writeHead(200, { "content-type": "text/html" });
       return res.end(ANALYTICS_PAGE);
+    }
+    // Analytics via shared password. ADA_ANALYTICS_PASSWORD grants the dashboard WITHOUT an admin
+    // account — for operators who want to hand a viewer credential to someone (or themselves)
+    // before the admin list is set up. The password lives in the deployment env, never in source;
+    // unset ⇒ this path is off and only the authenticated admin route below serves the data.
+    if (req.method === "GET" && url.pathname === "/v1/admin/analytics" && process.env.ADA_ANALYTICS_PASSWORD) {
+      const h = req.headers["authorization"];
+      const token = typeof h === "string" && h.startsWith("Bearer ") ? h.slice(7) : "";
+      const want = Buffer.from(process.env.ADA_ANALYTICS_PASSWORD);
+      const got = Buffer.from(token);
+      if (got.length === want.length && timingSafeEqual(got, want)) {
+        const days = Math.min(365, Math.max(1, Number(url.searchParams.get("days")) || 30));
+        try {
+          return json(res, 200, await computeAnalytics(days));
+        } catch (e) {
+          return json(res, 500, { error: { message: e instanceof Error ? e.message : String(e) } });
+        }
+      }
+      // fall through: a non-matching token may still be a real admin identity
     }
 
     let who = await identify(req);
