@@ -921,6 +921,21 @@ async function main(): Promise<void> {
     assert.equal(seen, undefined, "and undefined when the caller has no session — a terminal agent");
   }
 
+  // --- a job remembers which chat started it -------------------------------------------------
+  {
+    const { startJob, listJobs, reviveJobs } = await import("./client/background.ts");
+    const withId = startJob("attributed job", async () => "done", "sess-xyz");
+    const without = startJob("terminal job", async () => "done");
+    await new Promise((r) => setTimeout(r, 30));
+    const all = listJobs();
+    assert.equal(all.find((j) => j.id === withId)?.sessionId, "sess-xyz", "a job records the session that started it");
+    assert.equal(all.find((j) => j.id === without)?.sessionId, undefined, "a job with no session is still valid — a terminal agent has none");
+
+    // The field has to survive a restart, or attribution silently resets to unscoped.
+    const revived = reviveJobs([{ id: "j99", task: "t", status: "done", result: "r", started: 1, ended: 2, sessionId: "sess-xyz" }]);
+    assert.equal(revived.jobs[0]!.sessionId, "sess-xyz", "reviveJobs carries sessionId across a restart");
+  }
+
   // --- agent-server helpers: SSE framing, id uniqueness, approval correlation (no live model needed) ---
   {
     const { sseFrame, newId, ApprovalRegistry } = await import("./client/agent-server.ts");

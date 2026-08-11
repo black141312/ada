@@ -22,6 +22,9 @@ export interface Job {
   result?: string;
   started: number;
   ended?: number;
+  /** The serve session whose chat started this job. Absent for a job started from a terminal, which
+   *  belongs to no chat and is only ever listed in the app's unscoped view. */
+  sessionId?: string;
 }
 
 /** The target size `prune()` trims finished jobs down to on save — a job log is a convenience, not
@@ -59,10 +62,10 @@ export function reviveJobs(raw: unknown, markRunningInterrupted = true): { jobs:
     const n = Number(j.id.replace(/^j/, ""));
     if (Number.isFinite(n) && n > nextSeq) nextSeq = n;
     if (j.status === "running" && markRunningInterrupted) {
-      jobs.push({ id: j.id, task: j.task, status: "error", result: "interrupted — ada serve restarted", started: j.started, ended: Date.now() });
+      jobs.push({ id: j.id, task: j.task, status: "error", result: "interrupted — ada serve restarted", started: j.started, ended: Date.now(), sessionId: j.sessionId });
     } else {
       const status: Job["status"] = j.status === "running" ? "running" : j.status === "error" ? "error" : "done";
-      jobs.push({ id: j.id, task: j.task, status, result: j.result, started: j.started, ended: j.ended });
+      jobs.push({ id: j.id, task: j.task, status, result: j.result, started: j.started, ended: j.ended, sessionId: j.sessionId });
     }
   }
   return { jobs, nextSeq };
@@ -102,8 +105,12 @@ function load(): void {
 function capJobs(list: Job[]): Job[] {
   const all = [...list].sort((a, b) => b.started - a.started);
   const running = all.filter((j) => j.status === "running");
-  const finished = all.filter((j) => j.status !== "running").slice(0, Math.max(0, CAP - running.length));
-  return [...running, ...finished];
+  // Jobs with sessionId (attributed to a chat) should never be pruned — if a chat's job is lost,
+  // that chat's Background jobs section shows nothing explaining why, which is worse than
+  // pruning an unattributed job or keeping one past the cap to preserve attributed results.
+  const attributed = all.filter((j) => j.sessionId && j.status !== "running");
+  const unattributed_finished = all.filter((j) => !j.sessionId && j.status !== "running").slice(0, Math.max(0, CAP - running.length - attributed.length));
+  return [...running, ...attributed, ...unattributed_finished];
 }
 
 function prune(): void {
@@ -148,10 +155,10 @@ export function listJobs(): Job[] {
 }
 
 /** Start `run()` in the background; returns a job id immediately. */
-export function startJob(task: string, run: () => Promise<string>): string {
+export function startJob(task: string, run: () => Promise<string>, sessionId?: string): string {
   load();
   const id = `j${++seq}`;
-  const job: Job = { id, task, status: "running", started: Date.now() };
+  const job: Job = { id, task, status: "running", started: Date.now(), sessionId };
   jobs.set(id, job);
   save();
   run().then(
@@ -224,14 +231,17 @@ export function registerSubagentTools(opts: SubagentOpts): void {
       "Start a self-contained subtask in the background and return its job id immediately — don't wait for it. Use for long, independent work. Check results with /jobs in the terminal, or the Background jobs section in the app.",
     parameters: TASK_PARAMS,
     needsApproval: false,
-    async run(args) {
+    async run(args, ctx) {
       const task = String(args.task ?? "");
       // Mirrors spawn_agent's guard above: an empty reply stored as "" reads as unset to the app
       // (`if (j.result)`), leaving the row silently non-expandable with nothing explaining why.
-      const id = startJob(task, () =>
-        sub(true)
-          .send(task, { quiet: true, delegated: true })
-          .then((text) => text || "(sub-agent returned no text)"),
+      const id = startJob(
+        task,
+        () =>
+          sub(true)
+            .send(task, { quiet: true, delegated: true })
+            .then((text) => text || "(sub-agent returned no text)"),
+        ctx?.sessionId,
       );
       return { output: `Started background job ${id}. Check results with /jobs in the terminal, or the Background jobs section in the app (don't wait on it).` };
     },
