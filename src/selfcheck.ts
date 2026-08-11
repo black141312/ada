@@ -936,6 +936,14 @@ async function main(): Promise<void> {
     assert.equal(revived.jobs[0]!.sessionId, "sess-xyz", "reviveJobs carries sessionId across a restart");
   }
 
+  // A burst of running jobs must not squeeze the finished log to nothing — that destroyed results
+  // on the next save, which is the whole thing persistence protects against.
+  {
+    const { listJobs } = await import("./client/background.ts");
+    const finishedKept = listJobs().filter((j) => j.status !== "running").length;
+    assert.ok(finishedKept > 0, "finished jobs survive even when running jobs outnumber the cap");
+  }
+
   // --- agent-server helpers: SSE framing, id uniqueness, approval correlation (no live model needed) ---
   {
     const { sseFrame, newId, ApprovalRegistry } = await import("./client/agent-server.ts");

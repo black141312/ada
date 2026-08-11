@@ -105,7 +105,11 @@ function load(): void {
 function capJobs(list: Job[]): Job[] {
   const all = [...list].sort((a, b) => b.started - a.started);
   const running = all.filter((j) => j.status === "running");
-  const finished = all.filter((j) => j.status !== "running").slice(0, Math.max(0, CAP - running.length));
+  // CAP bounds the FINISHED log, independent of how many jobs are in flight — running jobs are
+  // extra, exactly as the constant's comment says. Subtracting the running count instead let a
+  // burst of concurrent jobs squeeze the finished allowance to zero and destroy their results on
+  // the next save, which is the loss persistence exists to prevent.
+  const finished = all.filter((j) => j.status !== "running").slice(0, CAP);
   return [...running, ...finished];
 }
 
