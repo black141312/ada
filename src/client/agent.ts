@@ -7,7 +7,7 @@ import type OpenAI from "openai";
 import { loadBrain } from "./brain.ts";
 import { compact, estimateTokens, isContextOverflowError } from "./compaction.ts";
 import { MarkdownStreamer } from "./render.ts";
-import { type Tool, type ToolResult, isDestructive, toolByName, tools } from "./tools.ts";
+import { type Tool, type ToolCtx, type ToolResult, isDestructive, toolByName, tools } from "./tools.ts";
 import { afterTool, beforeTool, transformInput } from "./hooks.ts";
 import { configuredServers } from "./mcp.ts";
 import { contextOf, priceOf } from "./models-dev.ts";
@@ -605,9 +605,9 @@ export function permPhrase(name: string, destructive: boolean): string {
   return `run the ${name} tool`;
 }
 
-async function safeRun(tool: Tool, args: Record<string, unknown>): Promise<ToolResult> {
+async function safeRun(tool: Tool, args: Record<string, unknown>, ctx?: ToolCtx): Promise<ToolResult> {
   try {
-    return await tool.run(args);
+    return await tool.run(args, ctx);
   } catch (e) {
     return { output: String(e), isError: true };
   }
@@ -674,6 +674,7 @@ export class Agent {
   private turnsSinceLearn = 0; // turns since the last extraction pass (see maybeLearn)
   private learning = false; // one extraction pass in flight at a time
   private project: boolean; // cwd is trusted → load project skills/memory
+  private sessionId?: string;
 
   constructor(opts: {
     client: OpenAI;
@@ -687,6 +688,9 @@ export class Agent {
     history?: Msg[];
     /** Stop after this many prompt tokens. 0/undefined = no limit (the default for a real user). */
     tokenBudget?: number;
+    /** The serve session this agent belongs to, when it has one. Handed to tools so a job can record
+     *  which chat started it; undefined for the REPL and one-shot CLI, which belong to no chat. */
+    sessionId?: string;
   }) {
     this.client = opts.client;
     this.model = opts.model;
@@ -697,6 +701,7 @@ export class Agent {
     // 0 means "derive from the model" — resolved per call in compactLimit(), so setModel() moves it.
     this.compactAt = opts.compactAt || Number(process.env.ADA_COMPACT_AT) || 0;
     this.tokenBudget = opts.tokenBudget ?? (Number(process.env.ADA_TOKEN_BUDGET) || 0);
+    this.sessionId = opts.sessionId;
     this.apiTools = buildApiTools(); // snapshot the registry (incl. extension/skill/MCP tools) at construction
     this.project = opts.project ?? true;
     this.messages = [{ role: "system", content: systemPrompt(this.project) }, ...(opts.history ?? [])];
@@ -1135,7 +1140,7 @@ export class Agent {
     const runTool = async (tool: Tool, name: string, a: Record<string, unknown>): Promise<ToolResult> => {
       const pre = await beforeTool(name, a);
       if (pre.deny) return { output: pre.deny };
-      return afterTool(name, pre.args, await safeRun(tool, pre.args));
+      return afterTool(name, pre.args, await safeRun(tool, pre.args, { sessionId: this.sessionId }));
     };
 
     const results = new Array<ToolResult>(toolCalls.length);

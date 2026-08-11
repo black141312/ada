@@ -899,6 +899,28 @@ async function main(): Promise<void> {
     assert.equal(stillRunning.length, 55, "every running job survives a prune, even past the 50-job cap");
   }
 
+  // --- a tool learns which session called it -------------------------------------------------
+  {
+    const { registerTool, toolByName } = await import("./client/tools.ts");
+    let seen: string | undefined = "unset";
+    registerTool({
+      name: "selfcheck_ctx_echo",
+      description: "selfcheck only",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+      needsApproval: false,
+      async run(_args, ctx) {
+        seen = ctx?.sessionId;
+        return { output: "ok" };
+      },
+    });
+    // Called the way the agent calls it, rather than through a whole turn: the contract under test
+    // is "the ctx reaches run()", and a live model round trip would prove nothing extra.
+    await toolByName.get("selfcheck_ctx_echo")!.run({}, { sessionId: "sess-abc" });
+    assert.equal(seen, "sess-abc", "a tool receives the calling session's id");
+    await toolByName.get("selfcheck_ctx_echo")!.run({});
+    assert.equal(seen, undefined, "and undefined when the caller has no session — a terminal agent");
+  }
+
   // --- agent-server helpers: SSE framing, id uniqueness, approval correlation (no live model needed) ---
   {
     const { sseFrame, newId, ApprovalRegistry } = await import("./client/agent-server.ts");

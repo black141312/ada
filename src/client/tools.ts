@@ -29,6 +29,15 @@ export interface ToolResult {
   images?: string[]; // data URLs shown to the model alongside the text (e.g. a `look` screenshot)
 }
 
+/** What the calling agent knows about itself, handed to a tool at call time.
+ *
+ * An argument rather than a module-level "current session", deliberately: several chats stream at
+ * once now, so an ambient value would be whichever turn set it last, not the one asking. Optional
+ * because most tools neither need nor read it, and an agent outside a serve session has no id. */
+export interface ToolCtx {
+  sessionId?: string;
+}
+
 export interface Tool {
   name: string;
   description: string;
@@ -38,7 +47,7 @@ export interface Tool {
    *  wantsLazyTools in agent.ts). Every tool schema is resent on every request, so keeping the
    *  document/image generators out of a "hi" saves ~1k tokens a call. */
   lazy?: boolean;
-  run(args: Record<string, unknown>): Promise<ToolResult>;
+  run(args: Record<string, unknown>, ctx?: ToolCtx): Promise<ToolResult>;
 }
 
 /** Keep both ends, not just the head. For the output that actually overflows — `npm install`, a test

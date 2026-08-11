@@ -1090,11 +1090,13 @@ async function main(): Promise<void> {
     const makeSession = (m: string, resumeFile?: string): { id: string; rec: AgentSession } => {
       const session = resumeFile ? Session.open(resumeFile) : Session.create();
       const history = resumeFile ? (session.load() as unknown as Msg[]) : undefined;
+      const id = newId("sess");
       const rec: AgentSession = { agent: undefined as unknown as Agent, registry: new ApprovalRegistry(), questions: new QuestionRegistry(), emit: null, file: session.file, ctrl: null, steer: [], mode: "ask" };
       rec.agent = new Agent({
         client,
         model: m,
         session,
+        sessionId: id, // so a background_task started in this chat can record whose it is
         history,
         project: trusted,
         compactAt: settings.compactAt,
@@ -1110,7 +1112,6 @@ async function main(): Promise<void> {
           return promise;
         },
       });
-      const id = newId("sess");
       sessions.set(id, rec);
       return { id, rec };
     };
