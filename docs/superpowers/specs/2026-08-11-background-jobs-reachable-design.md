@@ -80,8 +80,9 @@ New export:
 export function listJobs(): Job[]
 ```
 
-`renderJobs()` stays, reimplemented as a formatter over `listJobs()`, so the CLI's `/jobs` output is
-unchanged and there is one source of truth.
+`renderJobs()` stays, reimplemented as a formatter over `listJobs()`, so there is one source of
+truth — though the switch changes the CLI's `/jobs` output order from insertion (oldest first) to
+`listJobs()`'s newest-first, which is the better order and is kept, not reverted.
 
 ### Engine: `src/client/cli.ts`
 

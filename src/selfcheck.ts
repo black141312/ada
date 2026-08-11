@@ -862,6 +862,34 @@ async function main(): Promise<void> {
     assert.equal(reviveJobs([{ nope: true }, { id: "j3", task: "ok", status: "done", started: 1 }]).jobs.length, 1, "junk entries are dropped, good ones kept");
     assert.equal(reviveJobs([{ nope: true }, { id: "j3", task: "ok", status: "done", started: 1 }]).nextSeq, 3, "and junk does not disturb the sequence");
 
+    // save() must merge with disk, not clobber it: a second `ada` in the same folder — the app's
+    // serve for the open project, say, beside a terminal `ada` — has its own Map and writes the same
+    // file. Blind overwrite means each one's save() erases whatever the other added since its own
+    // load(). A job this process never created should still be there after a save() of its own.
+    {
+      const jobsPath = join(process.cwd(), ".ada", "jobs.json");
+      const onDisk = existsSync(jobsPath) ? JSON.parse(readFileSync(jobsPath, "utf8")) : [];
+      const foreignId = "j_selfcheck_foreign";
+      // A recent `started` matters: capJobs keeps the *newest* finished jobs, and this file already
+      // has decades of prior selfcheck runs' entries in it — an old timestamp would make the foreign
+      // job look stale and get pruned for a reason that has nothing to do with the merge being tested.
+      const now = Date.now();
+      writeFileSync(
+        jobsPath,
+        JSON.stringify(
+          [...onDisk, { id: foreignId, task: "left by another ada in this folder", status: "done", result: "not ours", started: now, ended: now }],
+          null,
+          2,
+        ),
+      );
+      // Any startJob() triggers a save() as a side effect — that is the real code path, not a
+      // reach into internals.
+      startJob("triggers a save so the merge above actually runs", async () => "ok");
+      await new Promise((r) => setTimeout(r, 30));
+      const after = JSON.parse(readFileSync(jobsPath, "utf8"));
+      assert.ok(Array.isArray(after) && after.some((j: { id?: string }) => j.id === foreignId), "save() merges in a job it never created instead of overwriting the file with only its own");
+    }
+
     // Pruning ranks by start time, which would age out a job that is still running once enough newer
     // jobs pile up — losing the one result the whole file exists to keep. A running job must never
     // be dropped for being old, even past the 50-job cap; only finished jobs are ever trimmed.
