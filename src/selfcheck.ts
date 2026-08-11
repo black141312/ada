@@ -1164,6 +1164,29 @@ async function main(): Promise<void> {
     srv.close();
   }
 
+  // --- cancelling a running job --------------------------------------------------------------
+  {
+    const { startJob, cancelJob, listJobs, reviveJobs } = await import("./client/background.ts");
+    // A job that only settles when its signal fires, so the test controls exactly when it ends.
+    const id = startJob("cancel me", (signal) => new Promise<string>((_res, rej) => {
+      signal?.addEventListener("abort", () => rej(new Error("aborted")));
+    }));
+    const j = cancelJob(id);
+    assert.equal(j?.status, "cancelled", "cancelJob settles the job as cancelled");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(listJobs().find((x) => x.id === id)?.status, "cancelled", "and the rejection does not overwrite it with error");
+
+    assert.equal(cancelJob("j-nope"), null, "cancelling an unknown job is null, not a throw");
+    const settled = startJob("already done", async () => "fine");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(cancelJob(settled)?.status, "done", "cancelling a settled job is a no-op, not an error");
+
+    // Without this, a restart relabels a deliberate stop as a success — the coercion sends anything
+    // unrecognised to "done".
+    const revived = reviveJobs([{ id: "j98", task: "t", status: "cancelled", started: 1, ended: 2 }]);
+    assert.equal(revived.jobs[0]!.status, "cancelled", "reviveJobs preserves cancelled rather than coercing it to done");
+  }
+
   console.log("selfcheck OK");
   process.exit(0); // a spawned stub MCP subprocess can hold stdin open — exit cleanly
 }

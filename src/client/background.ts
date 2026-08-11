@@ -18,7 +18,7 @@ import { registerTool } from "./tools.ts";
 export interface Job {
   id: string;
   task: string;
-  status: "running" | "done" | "error";
+  status: "running" | "done" | "error" | "cancelled";
   result?: string;
   started: number;
   ended?: number;
@@ -64,7 +64,8 @@ export function reviveJobs(raw: unknown, markRunningInterrupted = true): { jobs:
     if (j.status === "running" && markRunningInterrupted) {
       jobs.push({ id: j.id, task: j.task, status: "error", result: "interrupted — ada serve restarted", started: j.started, ended: Date.now(), sessionId: j.sessionId });
     } else {
-      const status: Job["status"] = j.status === "running" ? "running" : j.status === "error" ? "error" : "done";
+      const status: Job["status"] =
+        j.status === "running" ? "running" : j.status === "error" ? "error" : j.status === "cancelled" ? "cancelled" : "done";
       jobs.push({ id: j.id, task: j.task, status, result: j.result, started: j.started, ended: j.ended, sessionId: j.sessionId });
     }
   }
@@ -74,6 +75,12 @@ export function reviveJobs(raw: unknown, markRunningInterrupted = true): { jobs:
 const jobs = new Map<string, Job>();
 let seq = 0;
 let loaded = false;
+
+/** Abort handles for jobs still running, keyed by job id.
+ *
+ * Deliberately NOT a field on `Job`: that record is serialised to .ada/jobs.json, and a controller
+ * means nothing once the process that owned it is gone. Dropped as soon as a job settles. */
+const aborts = new Map<string, AbortController>();
 
 /** Read the store once, on first use. A missing, unreadable or corrupt file is not an error: jobs
  *  fall back to memory-only, which is exactly how they behaved before they were persisted. */
@@ -158,27 +165,47 @@ export function listJobs(): Job[] {
 }
 
 /** Start `run()` in the background; returns a job id immediately. */
-export function startJob(task: string, run: () => Promise<string>, sessionId?: string): string {
+export function startJob(task: string, run: (signal?: AbortSignal) => Promise<string>, sessionId?: string): string {
   load();
   const id = `j${++seq}`;
   const job: Job = { id, task, status: "running", started: Date.now(), sessionId };
   jobs.set(id, job);
+  const ac = new AbortController();
+  aborts.set(id, ac);
   save();
-  run().then(
-    (r) => {
-      job.status = "done";
-      job.result = r;
-      job.ended = Date.now();
-      save();
-    },
-    (e) => {
-      job.status = "error";
-      job.result = e instanceof Error ? e.message : String(e);
-      job.ended = Date.now();
-      save();
-    },
+  const settle = (status: Job["status"], result: string): void => {
+    aborts.delete(id);
+    // cancelJob already wrote "cancelled"; the runner's own rejection arrives moments later and must
+    // not relabel a deliberate stop as a crash.
+    if (job.status !== "running") return;
+    job.status = status;
+    job.result = result;
+    job.ended = Date.now();
+    save();
+  };
+  run(ac.signal).then(
+    (r) => settle("done", r),
+    (e) => settle("error", e instanceof Error ? e.message : String(e)),
   );
   return id;
+}
+
+/** Stop a running job. Returns the job in its new state, or null if there is no such job.
+ *
+ * Cancelling something that already finished is a no-op success rather than an error: the user
+ * clicked a button that raced the job settling, which is not a failure worth reporting. */
+export function cancelJob(id: string): Job | null {
+  load();
+  const job = jobs.get(id);
+  if (!job) return null;
+  if (job.status !== "running") return job;
+  aborts.get(id)?.abort();
+  aborts.delete(id);
+  job.status = "cancelled";
+  job.result = job.result || "cancelled";
+  job.ended = Date.now();
+  save();
+  return job;
 }
 
 export interface SubagentOpts {
@@ -240,9 +267,13 @@ export function registerSubagentTools(opts: SubagentOpts): void {
       // (`if (j.result)`), leaving the row silently non-expandable with nothing explaining why.
       const id = startJob(
         task,
-        () =>
+        // Threads the job's abort signal into the sub-agent's own SendCtrl, which already checks it
+        // at each step — without this, cancelling the job would relabel it "cancelled" while the
+        // sub-agent kept running and spending tokens underneath, which is the exact failure this
+        // feature exists to fix.
+        (signal) =>
           sub(true)
-            .send(task, { quiet: true, delegated: true })
+            .send(task, { quiet: true, delegated: true, signal })
             .then((text) => text || "(sub-agent returned no text)"),
         ctx?.sessionId,
       );

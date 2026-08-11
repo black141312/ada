@@ -31,7 +31,7 @@ import { catalogText, prefetch } from "./models-dev.ts";
 import { ensureBackend, isLocalBackend } from "./autostart.ts";
 import { popularModels } from "./models.ts";
 import { route } from "../server/router.ts"; // pure model-id → provider mapping (static table, safe client-side)
-import { listJobs, registerSubagentTools, renderJobs } from "./background.ts";
+import { cancelJob, listJobs, registerSubagentTools, renderJobs } from "./background.ts";
 import { renderTodos } from "./todos.ts";
 import { track } from "./telemetry.ts";
 
@@ -1149,6 +1149,16 @@ async function main(): Promise<void> {
       // same list through /jobs; without this route the app started jobs it could never read back.
       if (req.method === "GET" && url.pathname === "/v1/jobs") {
         res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jobs: listJobs() }));
+        return;
+      }
+      const cancelJobMatch = req.method === "POST" && url.pathname.match(/^\/v1\/jobs\/([^/]+)\/cancel$/);
+      if (cancelJobMatch) {
+        const job = cancelJob(cancelJobMatch[1]!);
+        if (!job) {
+          res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: "no such job" }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ job }));
         return;
       }
       // Skills & MCP management — lets an IDE render settings pages off the same loaders the agent uses.
