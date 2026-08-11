@@ -105,12 +105,8 @@ function load(): void {
 function capJobs(list: Job[]): Job[] {
   const all = [...list].sort((a, b) => b.started - a.started);
   const running = all.filter((j) => j.status === "running");
-  // Jobs with sessionId (attributed to a chat) should never be pruned — if a chat's job is lost,
-  // that chat's Background jobs section shows nothing explaining why, which is worse than
-  // pruning an unattributed job or keeping one past the cap to preserve attributed results.
-  const attributed = all.filter((j) => j.sessionId && j.status !== "running");
-  const unattributed_finished = all.filter((j) => !j.sessionId && j.status !== "running").slice(0, Math.max(0, CAP - running.length - attributed.length));
-  return [...running, ...attributed, ...unattributed_finished];
+  const finished = all.filter((j) => j.status !== "running").slice(0, Math.max(0, CAP - running.length));
+  return [...running, ...finished];
 }
 
 function prune(): void {
