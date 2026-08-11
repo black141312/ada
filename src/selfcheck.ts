@@ -1199,6 +1199,17 @@ async function main(): Promise<void> {
     assert.equal(partial?.result, "half an answer", "but its partial text is kept — the spec promises this");
   }
 
+  // --- a nested job inherits the chat ---------------------------------------------------------
+  {
+    const { startJob, listJobs } = await import("./client/background.ts");
+    // Stands in for the nested call: a sub-agent carrying an inherited sessionId reaches exactly
+    // this path when its own background_task fires. The hop that cannot be exercised here is the
+    // live sub-agent turn; the hop that can is that an inherited id lands on the record.
+    const nested = startJob("nested job", async () => "done", "sess-parent");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(listJobs().find((j) => j.id === nested)?.sessionId, "sess-parent", "a job started with an inherited session id records it");
+  }
+
   console.log("selfcheck OK");
   process.exit(0); // a spawned stub MCP subprocess can hold stdin open — exit cleanly
 }

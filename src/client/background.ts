@@ -236,12 +236,16 @@ const TASK_PARAMS = {
 
 /** Register `spawn_agent` + `background_task`. Call before an Agent snapshots the tool registry. */
 export function registerSubagentTools(opts: SubagentOpts): void {
-  const sub = (autoApprove: boolean): Agent =>
+  const sub = (autoApprove: boolean, sessionId?: string): Agent =>
     new Agent({
       client: opts.client,
       model: subagentModel(opts.model), // settings.subagentModel / ADA_SUBAGENT_MODEL — see the note there
 
       session: Session.create(),
+      // The chat that started the chain, inherited so a background_task run BY this sub-agent still
+      // records whose it is. Without it a nested job is unattributed and vanishes from the app's
+      // per-chat view — present in the store, absent from the only place anyone looks.
+      sessionId,
       onApprove: opts.onApprove,
       autoApprove,
       reasoning: opts.reasoning,
@@ -254,9 +258,9 @@ export function registerSubagentTools(opts: SubagentOpts): void {
     description: "Delegate a self-contained subtask to a fresh ada sub-agent; returns its final summary. Use for isolated research or a chunk of work handled independently.",
     parameters: TASK_PARAMS,
     needsApproval: false,
-    async run(args) {
+    async run(args, ctx) {
       try {
-        const text = await sub(opts.autoApprove).send(String(args.task ?? ""), { quiet: true, delegated: true });
+        const text = await sub(opts.autoApprove, ctx?.sessionId).send(String(args.task ?? ""), { quiet: true, delegated: true });
         return { output: text || "(sub-agent returned no text)" };
       } catch (e) {
         return { output: String(e instanceof Error ? e.message : e), isError: true };
@@ -281,7 +285,7 @@ export function registerSubagentTools(opts: SubagentOpts): void {
         // sub-agent kept running and spending tokens underneath, which is the exact failure this
         // feature exists to fix.
         (signal) =>
-          sub(true)
+          sub(true, ctx?.sessionId)
             .send(task, { quiet: true, delegated: true, signal })
             .then((text) => text || "(sub-agent returned no text)"),
         ctx?.sessionId,
