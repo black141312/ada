@@ -934,12 +934,24 @@ async function main(): Promise<void> {
     // The field has to survive a restart, or attribution silently resets to unscoped.
     const revived = reviveJobs([{ id: "j99", task: "t", status: "done", result: "r", started: 1, ended: 2, sessionId: "sess-xyz" }]);
     assert.equal(revived.jobs[0]!.sessionId, "sess-xyz", "reviveJobs carries sessionId across a restart");
+
+    // The branch above is the easy one — status "done" never gets rewritten. The interrupted branch
+    // is the one a crash actually exercises, and it is also the one that rebuilds the job object
+    // field by field, so it is exactly where a forgotten sessionId would go unnoticed.
+    const revivedInterrupted = reviveJobs([{ id: "j98", task: "was running when serve died", status: "running", started: 1, sessionId: "sess-xyz" }]);
+    assert.equal(revivedInterrupted.jobs[0]!.status, "error", "a running job with a session still loads as interrupted");
+    assert.equal(revivedInterrupted.jobs[0]!.sessionId, "sess-xyz", "and the interrupted branch keeps its sessionId too");
   }
 
   // A burst of running jobs must not squeeze the finished log to nothing — that destroyed results
   // on the next save, which is the whole thing persistence protects against.
   {
     const { listJobs } = await import("./client/background.ts");
+    // The premise this block depends on — the 55 "long job" running jobs started earlier — lives in
+    // an unrelated block above. Assert it explicitly, so a future edit that shrinks or moves that
+    // loop makes this test fail loudly instead of passing without ever exercising the cap.
+    const runningCount = listJobs().filter((j) => j.status === "running").length;
+    assert.ok(runningCount > 50, "setup actually has more running jobs than the cap, or the assertion below proves nothing");
     const finishedKept = listJobs().filter((j) => j.status !== "running").length;
     assert.ok(finishedKept > 0, "finished jobs survive even when running jobs outnumber the cap");
   }

@@ -91,7 +91,9 @@ function load(): void {
   }
 }
 
-/** Keep every running job, then fill the rest of the window with the newest finished ones.
+/** Keep every running job, and cap the newest finished ones at CAP — the two draw from separate
+ * budgets, not one shared window split between them, so a burst of jobs still in flight can never
+ * shrink the room finished jobs get.
  *
  * Ranking by start time alone would age out a long job while it is still working — and with it the
  * result that was the entire point of persisting. A running job has no result yet, so dropping it
@@ -118,8 +120,9 @@ function prune(): void {
   for (const id of [...jobs.keys()]) if (!keep.has(id)) jobs.delete(id);
 }
 
-/** Whole-file write on every status change — three writes per job, of a file capped at 50 entries.
- *  A read-only checkout just keeps its jobs in memory. */
+/** Whole-file write on every status change — three writes per job, of a file capped at 50 finished
+ *  entries, plus however many jobs are still running on top of that. A read-only checkout just
+ *  keeps its jobs in memory. */
 function save(): void {
   try {
     prune();
