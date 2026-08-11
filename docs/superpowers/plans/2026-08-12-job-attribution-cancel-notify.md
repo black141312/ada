@@ -10,9 +10,9 @@
 
 ## Global Constraints
 
-- **Two repos.** Tasks 1–3 in `C:\Users\ADMIN\Desktop\ada\cos0`. Tasks 4–5 in `C:\Users\ADMIN\Desktop\ada\ada-app`. **Engine first** — the app reads fields the engine has to produce.
+- **Two repos.** Tasks 1–4 in `C:\Users\ADMIN\Desktop\ada\cos0`. Tasks 5–6 in `C:\Users\ADMIN\Desktop\ada\ada-app`. **Engine first** — the app reads fields the engine has to produce.
 - **No new dependencies** in either repo.
-- **No changes to `spawn_agent`, to fan-out, or to `subagentModel`.** Those work.
+- **No changes to fan-out or to `subagentModel`.** Those work. `spawn_agent` is touched in exactly one place, in Task 4, and only to forward a session id — its behaviour is unchanged.
 - **No cross-project job view, no persisted seen-state, no OS/toast notifications.** Out of scope.
 - **The abort handle is never persisted.** `Job` is serialised to `.ada/jobs.json`; an `AbortController` means nothing after a restart.
 - Comment style in both repos: explain **why**, not **what**, in full sentences. Deliberate simplifications carry a `ponytail:` prefix.
@@ -51,7 +51,7 @@ There are **two** session ids in play and they are different values:
 - **The app's chat id** — `sess.id`, e.g. `s1723…`. This is what `tasksFilterSess` holds and what `bgTasks` rows carry as `sessId`.
 - **The engine's serve-session id** — `newId("sess")`, stored by the app on the chat as `sess.adaSessionId`. **This is what a `Job` will carry.**
 
-So a job belongs to the filtered chat when `job.sessionId === <that chat>.adaSessionId`, never when it equals `tasksFilterSess`. Task 4 spells out the lookup. Comparing the wrong pair silently shows an always-empty section.
+So a job belongs to the filtered chat when `job.sessionId === <that chat>.adaSessionId`, never when it equals `tasksFilterSess`. Task 5 spells out the lookup. Comparing the wrong pair silently shows an always-empty section.
 
 ## File structure
 
@@ -518,7 +518,119 @@ git commit -m "jobs: cancel a running one, and say cancelled rather than error"
 
 ---
 
-### Task 4: Scope the section, and add a cancel control
+### Task 4: A nested job inherits the chat
+
+**Files:**
+- Modify: `cos0/src/client/background.ts` (the `sub()` factory and both tool registrations)
+- Test: `cos0/src/selfcheck.ts`
+
+**Interfaces:**
+- Consumes: `ToolCtx` from Task 1, `Job.sessionId` from Task 2.
+- Produces: nothing new. Task 5's filter simply sees more jobs attributed.
+
+**Why this exists.** `sub()` builds its `Agent` with no `sessionId`, so a `background_task` invoked
+*by* a delegated sub-agent records no chat. Once Task 5 filters the section per chat, those jobs
+appear nowhere but the unscoped view — which reads as a missing row rather than a category. The
+sub-agent already has everything needed to know better: `background_task`'s `run` receives
+`ctx?.sessionId`, so it can hand that to the sub-agent it spawns, and a nested job attributes to the
+chat that started the chain.
+
+`spawn_agent` gets the same treatment. It creates no job itself, but the sub-agent it spawns can
+call `background_task`, and that job should belong to the originating chat too.
+
+- [ ] **Step 1: Thread the id through `sub()`**
+
+In `cos0/src/client/background.ts`, `sub()` takes the id and passes it on:
+
+```ts
+  const sub = (autoApprove: boolean, sessionId?: string): Agent =>
+    new Agent({
+      client: opts.client,
+      model: subagentModel(opts.model), // settings.subagentModel / ADA_SUBAGENT_MODEL — see the note there
+
+      session: Session.create(),
+      // The chat that started the chain, inherited so a background_task run BY this sub-agent still
+      // records whose it is. Without it a nested job is unattributed and vanishes from the app's
+      // per-chat view — present in the store, absent from the only place anyone looks.
+      sessionId,
+      onApprove: opts.onApprove,
+      autoApprove,
+      reasoning: opts.reasoning,
+      project: opts.project,
+      compactAt: opts.compactAt,
+    });
+```
+
+- [ ] **Step 2: Both tools pass what they were given**
+
+`background_task`'s `run` already has `ctx`. Change its `sub(true)` call to `sub(true, ctx?.sessionId)`.
+
+`spawn_agent`'s `run` does not take `ctx` yet. Give it one and forward it the same way:
+
+```ts
+    async run(args, ctx) {
+      try {
+        const text = await sub(opts.autoApprove, ctx?.sessionId).send(String(args.task ?? ""), { quiet: true, delegated: true });
+        return { output: text || "(sub-agent returned no text)" };
+      } catch (e) {
+        return { output: String(e instanceof Error ? e.message : e), isError: true };
+      }
+    },
+```
+
+This is the one place in this plan that touches `spawn_agent`, and only to forward a parameter — its
+behaviour, its prompt and its return value are unchanged.
+
+- [ ] **Step 3: Assert what is actually assertable**
+
+A true nesting test needs a live model, which selfcheck does not have and should not gain. What *is*
+checkable without one is that a job started with an inherited id records it — the property the whole
+chain depends on. Append to `cos0/src/selfcheck.ts`:
+
+```ts
+  // --- a nested job inherits the chat ---------------------------------------------------------
+  {
+    const { startJob, listJobs } = await import("./client/background.ts");
+    // Stands in for the nested call: a sub-agent carrying an inherited sessionId reaches exactly
+    // this path when its own background_task fires. The hop that cannot be exercised here is the
+    // live sub-agent turn; the hop that can is that an inherited id lands on the record.
+    const nested = startJob("nested job", async () => "done", "sess-parent");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(listJobs().find((j) => j.id === nested)?.sessionId, "sess-parent", "a job started with an inherited session id records it");
+  }
+```
+
+**Do not write an assertion that fakes a sub-agent turn.** A test that constructs an `Agent` and
+asserts on its private field, or that stubs `send`, would pass while proving nothing about the
+wiring — and this plan has already had an assertion-that-asserts-nothing cause trouble. State the
+limit in your report instead: Steps 1 and 2 are verified by typecheck and inspection, not by a
+runtime test.
+
+- [ ] **Step 4: Run the sensors**
+
+```bash
+npm run typecheck
+```
+
+Expected: `0` errors. This is the real gate for this task — the parameter has to thread without a
+cast at every hop.
+
+```bash
+npm run selfcheck
+```
+
+Expected: `selfcheck OK`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/client/background.ts src/selfcheck.ts
+git commit -m "jobs: a nested job inherits the chat that started the chain"
+```
+
+---
+
+### Task 5: Scope the section, and add a cancel control
 
 **Files:**
 - Modify: `ada-app/electron/main.js` (beside the `agent:jobs` handler)
@@ -689,7 +801,7 @@ git commit -m "jobs: scope the panel section per chat, and let a running job be 
 
 ---
 
-### Task 5: Say when one finishes
+### Task 6: Say when one finishes
 
 **Files:**
 - Modify: `ada-app/src/app.js` (`renderChatTasksChip` ~783; `toggleTasksPanel` ~899)
