@@ -20,7 +20,7 @@ import { registerTool, setAsker } from "./tools.ts";
 import { addRemoteSkill, loadSkills, registerSkillTool } from "./skills.ts";
 import { memoryCommand, registerMemoryTools } from "./memory.ts";
 import { wireGraphMemory } from "./graph.ts";
-import { addConnector, addCustomServer, configuredServers, listConnectors, loadMcpServers, removeConnector } from "./mcp.ts";
+import { addConnector, addCustomServer, authNeeded, hasStoredAuth, lastLoginAt, lastLoginError, listConnectors, loadMcpServers, loginConnector, logoutConnector, needsOauthClient, removeConnector, setConnectorOauthClient } from "./mcp.ts";
 import { addExtension, selfUpdate } from "./pkg.ts";
 import { runTui } from "./tui-mode.ts";
 import { loadImage } from "./image.ts";
@@ -857,7 +857,8 @@ async function main(): Promise<void> {
         console.log(`  ${dot} ${c.name.padEnd(14)} ${c.description}${env}`);
       }
       console.log("\n  ada mcp add <name>   ·   ada mcp remove <name>");
-      console.log("  custom server: edit .ada/mcp.json — a { command,args } (stdio) or { url } (http) entry");
+      console.log("  custom server: edit ~/.ada/mcp.json — a { command,args } (stdio) or { url } (http) entry");
+      console.log("  connectors are global: connected once, used by every project and scheduled task");
       return;
     }
     if (action === "add") {
@@ -879,7 +880,7 @@ async function main(): Promise<void> {
         console.error("usage: ada mcp remove <name>");
         process.exit(1);
       }
-      console.log(removeConnector(name) ? `removed "${name}" from .ada/mcp.json` : `"${name}" was not configured`);
+      console.log(removeConnector(name) ? `removed "${name}" — gone from every project` : `"${name}" was not configured`);
       return;
     }
     console.error("usage: ada mcp [list | add <name> | remove <name>]");
@@ -964,6 +965,13 @@ async function main(): Promise<void> {
     const settings = loadSettings(trusted);
     await loadExtensions(trusted);
     registerSkillTool(loadSkills(trusted)); registerMemoryTools(trusted);
+    // Seal anything signed in before the app had a key. The tokens already on disk are exactly
+    // the ones most worth protecting, so leaving them plaintext would miss the point.
+    {
+      const { migrateStoreEncryption } = await import("./mcp-oauth.ts");
+      const r = migrateStoreEncryption();
+      if (r === "encrypted") console.error("ada: connector tokens re-saved encrypted");
+    }
     await loadMcpServers(trusted);
     const client = makeClient();
     await applyOrgPolicy(); // enterprise org rules apply to acp sessions too
@@ -1050,7 +1058,14 @@ async function main(): Promise<void> {
     const settings = loadSettings(trusted);
     await loadExtensions(trusted);
     registerSkillTool(loadSkills(trusted)); registerMemoryTools(trusted);
-    await loadMcpServers(trusted);
+    // Deliberately NOT awaited — same reasoning as the indexing note further down: /health means
+    // "the agent is up", and connectors are enrichment. Awaiting here let ONE third-party server
+    // stop `ada serve` from ever listening: a cold `npx` install takes longer than the IDE's 15s
+    // health window, and a server that hangs blocks forever. The IDE then reported the AGENT as
+    // unavailable — and because the Connectors screen needs a healthy agent to render, there was
+    // no way back in to remove the connector that caused it. Tools are assembled per request, so a
+    // server that finishes loading a moment later is picked up by the next turn.
+    void loadMcpServers(trusted).catch((e) => console.error(`mcp: ${e instanceof Error ? e.message : String(e)}`));
     const client = makeClient();
     await applyOrgPolicy(); // enterprise org rules apply to serve sessions too
     let model = (process.argv[3] && !process.argv[3].startsWith("--") ? process.argv[3] : "") || process.env.ADA_MODEL || settings.model || "";
@@ -1087,7 +1102,7 @@ async function main(): Promise<void> {
     const isEffort = (v: string): boolean => v === "low" || v === "medium" || v === "high" || v === "off";
     const effortOf = (v: string): "low" | "medium" | "high" | undefined => (v === "off" ? undefined : (v as "low" | "medium" | "high"));
 
-    const makeSession = (m: string, resumeFile?: string): { id: string; rec: AgentSession } => {
+    const makeSession = (m: string, resumeFile?: string, tokenBudget = 0): { id: string; rec: AgentSession } => {
       const session = resumeFile ? Session.open(resumeFile) : Session.create();
       const history = resumeFile ? (session.load() as unknown as Msg[]) : undefined;
       const rec: AgentSession = { agent: undefined as unknown as Agent, registry: new ApprovalRegistry(), questions: new QuestionRegistry(), emit: null, file: session.file, ctrl: null, steer: [], mode: "ask" };
@@ -1102,6 +1117,7 @@ async function main(): Promise<void> {
         // agent except the one the desktop app uses, so effort was always off there. `settings`, not
         // `flags` — serve runs long before the interactive flag parsing exists.
         reasoning: settings.reasoning,
+        tokenBudget,
         autoApprove: false,
         onApprove: async (toolName, summary): Promise<ApprovalDecision> => {
           if (!rec.emit) return "no"; // no open stream to ask through — fail closed, don't silently run
@@ -1157,12 +1173,78 @@ async function main(): Promise<void> {
         return;
       }
       if (req.method === "GET" && url.pathname === "/v1/mcp") {
-        const catalog = listConnectors();
-        const custom = configuredServers().filter((n) => !catalog.some((c) => c.name === n))
-          .map((name) => ({ name, description: "custom server", configured: true, needsEnv: [] as string[] }));
-        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ connectors: [...catalog, ...custom] }));
+        // Asking the backend whether it can sign users in is a network call, so this branch is its
+        // own async scope rather than making the whole request handler async.
+        void (async () => {
+        // listConnectors() reports custom servers itself now — the extra pass that used to append
+        // them here matched nothing and only looked like it was still doing something.
+        const needs = authNeeded();
+        const wantClient = new Set(await needsOauthClient());
+        const withAuth = listConnectors().map((c) => {
+          const signedIn = hasStoredAuth(c.name);
+          // Derived, not just observed. The 401 probe runs during a background load, so waiting for
+          // it meant a connector you had just added read as "Connected" until something happened to
+          // refresh — and the Sign in button you needed was the thing that was missing. A remote
+          // server with no token and no Authorization header wants a sign-in; that is knowable
+          // immediately, and a needless one fails with a clear message rather than a wrong status.
+          const wantsLogin = c.type === "remote" && !signedIn && !c.missingEnv.includes("Authorization") ? !c.needsHeader.length : false;
+          // A connector waiting on a client id must not read as ready to sign in — the button
+          // would open a flow that cannot start.
+          const needsClient = wantClient.has(c.name);
+          // `needs` is what a 401 told us at load time, and nothing re-probes the instant a sign-in
+          // finishes — so it stays true for a connector that has JUST signed in successfully. The
+          // row renders needsLogin before signedIn, so that stale entry showed "Sign in" over a
+          // working connection until something happened to reload. Holding a token settles it.
+          return { ...c, needsLogin: !needsClient && !signedIn && (c.name in needs || (c.configured && wantsLogin)), signedIn, needsOauthClient: needsClient, loginError: lastLoginError(c.name), loginAt: lastLoginAt(c.name) };
+        });
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ connectors: withAuth }));
+        })();
         return;
       }
+      // Sign in to a REMOTE connector: the MCP authorization flow (discovery → dynamic client
+      // registration → PKCE → browser consent). Returns the consent URL so the IDE can open it,
+      // and completes in the background when the loopback redirect lands.
+      const mcpLoginName = url.pathname.match(/^\/v1\/mcp\/([\w.-]+)\/login$/)?.[1];
+      if (mcpLoginName && req.method === "POST") {
+        void loginConnector(mcpLoginName).then((r) => {
+          if (!r.ok || !r.url) {
+            res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ ok: false, error: r.error }));
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, url: r.url }));
+          // The browser half outlives this response; reloading afterwards picks up the new token.
+          void r.finish?.().then((done) => {
+            if (done.ok) void loadMcpServers(trusted);
+            else console.error(`mcp ${mcpLoginName}: sign-in failed — ${done.error}`);
+          });
+        });
+        return;
+      }
+      // Hand a connector the OAuth client id it cannot register for itself.
+      const mcpClientName = url.pathname.match(/^\/v1\/mcp\/([\w.-]+)\/oauth-client$/)?.[1];
+      if (mcpClientName && req.method === "POST") {
+        let body = "";
+        req.on("data", (c) => (body += c));
+        req.on("end", () => {
+          try {
+            const j = JSON.parse(body || "{}") as { client_id?: string };
+            res
+              .writeHead(200, { "content-type": "application/json" })
+              .end(JSON.stringify(setConnectorOauthClient(mcpClientName, { client_id: j.client_id ?? "" })));
+          } catch (e) {
+            res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }));
+          }
+        });
+        return;
+      }
+      const mcpLogoutName = url.pathname.match(/^\/v1\/mcp\/([\w.-]+)\/logout$/)?.[1];
+      if (mcpLogoutName && req.method === "POST") {
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: logoutConnector(mcpLogoutName) }));
+        return;
+      }
+      // There is deliberately no route for setting connector credentials: connectors are OAuth or
+      // nothing. A custom stdio server that genuinely needs an env var takes it by hand-editing
+      // .ada/mcp.json — a config decision, not a login.
       const mcpName = url.pathname.match(/^\/v1\/mcp\/([\w.-]+)$/)?.[1];
       if (mcpName && (req.method === "POST" || req.method === "DELETE")) {
         if (req.method === "DELETE") {
@@ -1189,10 +1271,15 @@ async function main(): Promise<void> {
           let m = model;
           let resume: string | undefined;
           let effort: "low" | "medium" | "high" | undefined;
+          let budget = 0; // 0 = uncapped, which is right for a turn somebody is sitting in front of
           try {
-            const j = JSON.parse(body || "{}") as { model?: string; resume?: string; reasoning?: string };
+            const j = JSON.parse(body || "{}") as { model?: string; resume?: string; reasoning?: string; tokenBudget?: number };
             m = j.model || model;
             if (j.reasoning !== undefined && isEffort(j.reasoning)) effort = effortOf(j.reasoning);
+            // A ceiling for turns nobody is watching. Interactive chat leaves this unset — you can
+            // see a run wandering and stop it — but a scheduled task has no such brake, and an
+            // open-ended brief ("rank what is worth doing") explores until it runs out of repo.
+            if (typeof j.tokenBudget === "number" && j.tokenBudget > 0) budget = j.tokenBudget;
             // "latest" picks the most recently modified transcript; otherwise resume expects one of
             // the `file` values from GET /v1/sessions (a restarted `ada serve` has no memory of which
             // in-memory sessionIds existed before, so the IDE re-resolves by transcript file instead).
@@ -1211,7 +1298,7 @@ async function main(): Promise<void> {
               return;
             }
           }
-          const { id, rec } = makeSession(m, resume);
+          const { id, rec } = makeSession(m, resume, budget);
           // Falls back to the serve-wide setting when the caller says nothing, so an IDE that never
           // sends the field behaves exactly as it did before this existed.
           if (effort !== undefined) rec.agent.setReasoning(effort);

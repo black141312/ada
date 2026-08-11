@@ -40,7 +40,15 @@ let dbMod: typeof Database | null | undefined;
 function getDriver(): typeof Database | null {
   if (dbMod === undefined) {
     try {
-      dbMod = createRequire(import.meta.url)("better-sqlite3") as typeof Database;
+      const mod = createRequire(import.meta.url)("better-sqlite3") as typeof Database;
+      // OPEN one, don't just require it. `require` loads the JS wrapper alone — the .node binding is
+      // dlopen'd on first use. So a driver built for another ABI sails through the require and
+      // throws much later: the desktop app runs the agent under Electron's Node (ABI 136) while a
+      // dev `npm install` builds against system Node (137), and the result was `graphAvailable()`
+      // answering true, memory hooks wiring themselves up, and a raw
+      // "compiled against a different Node.js version" landing in the middle of a chat.
+      new mod(":memory:").close();
+      dbMod = mod;
     } catch {
       dbMod = null;
     }
@@ -229,6 +237,21 @@ if (asScript) {
   // The driver is optional: present here (dev/CLI), absent in the packaged app. Everything below
   // needs it, so fail loudly if it vanished from a dev tree rather than silently skipping the suite.
   assert.equal(graphAvailable(), true, "better-sqlite3 should be installed in a dev tree");
+
+  // "Available" must mean USABLE, not merely requireable. A `require` loads the JS wrapper while the
+  // native binding is dlopen'd on first use, so a driver built for another ABI passed the old check
+  // and then threw mid-agent-turn. Asserting the flag AGREES with a real open is what catches that:
+  // run under a mismatched runtime (the app's Electron Node vs a system-Node build), the two answers
+  // diverge and this fails, instead of a raw dlopen error surfacing in someone's chat.
+  let reallyOpens: boolean;
+  try {
+    const D = createRequire(import.meta.url)("better-sqlite3") as typeof Database;
+    new D(":memory:").close();
+    reallyOpens = true;
+  } catch {
+    reallyOpens = false;
+  }
+  assert.equal(graphAvailable(), reallyOpens, "graphAvailable() must reflect whether the driver actually opens, not just whether it resolves");
 
   addEdge({ subject: "Alice", predicate: "works_at", object: "Acme", at: t0 });
   addEdge({ subject: "Acme", predicate: "located_in", object: "Berlin", at: t0 });

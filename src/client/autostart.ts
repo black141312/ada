@@ -76,7 +76,7 @@ export async function ensureBackend(backendUrl: string, opts?: { quiet?: boolean
   if (!isLocalBackend(backendUrl)) return "remote";
 
   if (!opts?.quiet) process.stderr.write("\x1b[2mstarting ada-server…\x1b[0m ");
-  const child = spawn(process.execPath, [serverBin()], { stdio: ["ignore", "ignore", "ignore"], detached: false });
+  const child = spawn(process.execPath, [serverBin()], { stdio: ["ignore", "ignore", "ignore"], detached: false, windowsHide: true });
   child.unref(); // don't keep parent alive once parent's own work finishes
   const killChild = (): void => {
     try {

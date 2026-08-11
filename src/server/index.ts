@@ -6,6 +6,7 @@ import { createServer, type Server } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ProviderName } from "../shared/types.ts";
 import { PORT, PROVIDERS, clientKeys, configuredProviders, isConfigured, providerKey, providerStatus } from "./config.ts";
+import { type ExchangeRequest, exchangeClients, exchangeHosts, exchangeMisconfigured, handleMcpOauthExchange } from "./mcp-oauth-exchange.ts";
 import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, createSeat, disableSeat, disableSeatByExternalId, enterpriseMode, extractLastUsage, identifySeat, listSeats, loadPolicy, modelAllowed, savePolicy, upsertSeatForSSO, usageSummary, validatePolicy } from "./enterprise.ts";
 import { adminUsers, verifyIdentity } from "./identity.ts";
 import { addAllowed, isAllowedUser, listAllowed, removeAllowed } from "./allowlist.ts";
@@ -442,6 +443,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     // Pre-auth login routes (a locked backend must still let a new user authenticate).
     if (req.method === "GET" && url.pathname === "/v1/auth/methods") return await handleAuthMethods(res);
     if (req.method === "POST" && url.pathname === "/v1/auth/oidc/exchange") return await handleOidcExchange(req, res);
+    // Which connector token endpoints this deployment can complete an exchange for. Pre-auth and
+    // deliberately contentless — it is a capability probe, so the desktop app can decide whether to
+    // route through here or finish the exchange itself, before a user is anywhere near a sign-in.
+    if (req.method === "GET" && url.pathname === "/v1/mcp/oauth/hosts") return json(res, 200, { hosts: exchangeHosts(), clients: exchangeClients(), misconfigured: exchangeMisconfigured() });
     // Better Auth: accounts, sessions, social login, API keys, device flow.
     if (url.pathname.startsWith("/api/auth")) return betterAuthHandler(req, res);
     // The public plan catalog. PRE-AUTH: it powers the website's pricing/upgrade pages, which are
@@ -583,6 +588,23 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     }
     if (!who) return json(res, 401, { error: { message: "unauthorized — invalid client key, seat key, or login" } });
     const isAnon = who.user === "anon" && String(who.role) === "free";
+
+    // Finish a connector sign-in with this deployment's client secret. The tokens are handed back
+    // and never stored — the user's machine stays the only place they live.
+    //
+    // Behind the auth gate ON PURPOSE, unlike the /hosts probe above. That one publishes a client
+    // id, which is public anyway. This one spends Ada's client SECRET, and leaving it open would
+    // let anyone exchange codes against Ada's Google app for their own product.
+    if (req.method === "POST" && url.pathname === "/v1/mcp/oauth/exchange") {
+      let b: ExchangeRequest;
+      try {
+        b = JSON.parse(await readBody(req)) as ExchangeRequest;
+      } catch {
+        return json(res, 400, { error: { message: "invalid JSON body" } });
+      }
+      const r = await handleMcpOauthExchange(b);
+      return json(res, r.status, r.json);
+    }
 
     if (req.method === "GET" && url.pathname === "/v1/whoami") {
       return json(res, 200, { ok: true, user: who.user, role: who.role });
@@ -849,6 +871,11 @@ export function startAdaServer(port: number = PORT): Server {
     const provs = configuredProviders();
     console.log(`ada backend → http://localhost:${port}  [${auth}]`);
     console.log(`providers: ${provs.length ? provs.join(", ") : "(none configured — set provider API keys)"}`);
+    // Connector sign-in, separate from the model providers above. Silence here means nobody can
+    // sign in to Google/GitHub/Slack, which otherwise only shows up as a dead button in the app.
+    const signin = exchangeHosts();
+    console.log(`connector sign-in: ${signin.length ? signin.join(", ") : "(none — set ADA_MCP_OAUTH_*_CLIENT_ID/_SECRET)"}`);
+    for (const bad of exchangeMisconfigured()) console.warn(`  WARNING: ${bad} — this provider will not be offered`);
   });
   return server;
 }
