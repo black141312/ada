@@ -31,7 +31,7 @@ import { catalogText, prefetch } from "./models-dev.ts";
 import { ensureBackend, isLocalBackend } from "./autostart.ts";
 import { popularModels } from "./models.ts";
 import { route } from "../server/router.ts"; // pure model-id → provider mapping (static table, safe client-side)
-import { registerSubagentTools, renderJobs } from "./background.ts";
+import { listJobs, registerSubagentTools, renderJobs } from "./background.ts";
 import { renderTodos } from "./todos.ts";
 import { track } from "./telemetry.ts";
 
@@ -1142,6 +1142,12 @@ async function main(): Promise<void> {
       // List on-disk transcripts (survive an `ada serve` restart) so an IDE can offer "resume".
       if (req.method === "GET" && url.pathname === "/v1/sessions") {
         res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessions: list() }));
+        return;
+      }
+      // Background jobs, so the editor can show what `background_task` produced. The CLI reads the
+      // same list through /jobs; without this route the app started jobs it could never read back.
+      if (req.method === "GET" && url.pathname === "/v1/jobs") {
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jobs: listJobs() }));
         return;
       }
       // Skills & MCP management — lets an IDE render settings pages off the same loaders the agent uses.
