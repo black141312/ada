@@ -163,6 +163,7 @@ export function ensureAdaDir(dir: string): string {
           "index.json",
           "index.vec",
           "graph.db",
+          "jobs.json",
           "sessions/",
           "tmp/",
           "worktrees/",

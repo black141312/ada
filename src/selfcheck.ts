@@ -826,6 +826,35 @@ async function main(): Promise<void> {
   await new Promise((r) => setTimeout(r, 30));
   assert.ok(renderJobs().includes(jid) && /job-done-ok/.test(renderJobs()), "background job runs and reports its result");
 
+  // --- jobs survive a restart, and a restart does not lie about what was running ---
+  {
+    const { reviveJobs } = await import("./client/background.ts");
+
+    // A job still marked "running" belongs to a process that is gone. Loading it faithfully would
+    // show it running forever — a worse bug, and a permanent one, than the unreachable result this
+    // whole change is about.
+    const stale = reviveJobs([
+      { id: "j1", task: "was running when serve died", status: "running", started: 1 },
+      { id: "j2", task: "finished cleanly", status: "done", result: "the answer", started: 2, ended: 3 },
+    ]);
+    assert.equal(stale.jobs.length, 2, "revive keeps both jobs");
+    assert.equal(stale.jobs[0]!.status, "error", "a running job loads as interrupted, not running");
+    assert.match(stale.jobs[0]!.result ?? "", /restart/i, "and says why it is interrupted");
+    assert.equal(stale.jobs[1]!.status, "done", "a finished job loads untouched");
+    assert.equal(stale.jobs[1]!.result, "the answer", "with its result intact — the point of persisting");
+
+    // Ids are `j${++seq}` off a module counter. Without continuing the sequence, a restart hands
+    // out j1 again and silently overwrites the persisted j1 — destroying the very result we saved.
+    assert.equal(reviveJobs([{ id: "j7", task: "t", status: "done", started: 1 }]).nextSeq, 7, "seq continues from the highest id");
+    assert.equal(reviveJobs([]).nextSeq, 0, "an empty store starts the sequence at zero");
+
+    // A corrupt or hand-edited file must not take the agent down with it.
+    assert.deepEqual(reviveJobs(null), { jobs: [], nextSeq: 0 }, "null parses to an empty store");
+    assert.deepEqual(reviveJobs("nonsense"), { jobs: [], nextSeq: 0 }, "a non-array parses to an empty store");
+    assert.equal(reviveJobs([{ nope: true }, { id: "j3", task: "ok", status: "done", started: 1 }]).jobs.length, 1, "junk entries are dropped, good ones kept");
+    assert.equal(reviveJobs([{ nope: true }, { id: "j3", task: "ok", status: "done", started: 1 }]).nextSeq, 3, "and junk does not disturb the sequence");
+  }
+
   // --- agent-server helpers: SSE framing, id uniqueness, approval correlation (no live model needed) ---
   {
     const { sseFrame, newId, ApprovalRegistry } = await import("./client/agent-server.ts");
