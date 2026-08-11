@@ -464,7 +464,7 @@ Expected: lint clean, build succeeds.
 npm test
 ```
 
-Expected: 107 pass, 0 fail.
+Expected: 104 pass, 0 fail.
 
 Then in the browser preview (`npx vite --port 5173`), open devtools and run:
 
@@ -633,13 +633,13 @@ In `ada-app/src/style.css`, after the existing `.tp-row` rules, add:
 npm run lint && npm run build && npm test
 ```
 
-Expected: lint clean, build succeeds, 107 tests 0 fail.
+Expected: lint clean, build succeeds, 104 tests 0 fail.
 
 ```bash
 npm run typecheck 2>&1 | grep -cE "error TS"
 ```
 
-Expected: `91`.
+Expected: `80`.
 
 Then the real check, end to end with the actual engine — the preview stub returns an empty list, so it proves only that nothing throws:
 
