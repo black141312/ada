@@ -412,10 +412,18 @@ async function main(): Promise<void> {
     // But memory and skills are the user's, and meant to be committed and shared with the team.
     assert.ok(!/^memory\/?$/m.test(gi) && !/^skills\/?$/m.test(gi), "memory and skills must stay committable");
 
-    // A second call must not clobber a file the user has edited.
+    // A second call must not clobber a file the user has edited — but an install from before
+    // jobs.json existed still needs the line appended, or that project shows `?? .ada/jobs.json`
+    // forever. Append, don't rewrite.
     writeFileSync(join(ada, ".gitignore"), "# mine\n");
     ensureAdaDir(ada);
-    assert.equal(readFileSync(join(ada, ".gitignore"), "utf8"), "# mine\n", "an existing .gitignore is left alone");
+    const gi2 = readFileSync(join(ada, ".gitignore"), "utf8");
+    assert.ok(gi2.startsWith("# mine\n"), "the user's existing content is preserved, not rewritten");
+    assert.ok(/^jobs\.json$/m.test(gi2), "jobs.json is appended for installs that predate it");
+
+    // Calling again must not append a second copy of the line.
+    ensureAdaDir(ada);
+    assert.equal(readFileSync(join(ada, ".gitignore"), "utf8"), gi2, "appending jobs.json is idempotent");
     rmSync(tmp, { recursive: true, force: true });
   }
 
@@ -853,6 +861,14 @@ async function main(): Promise<void> {
     assert.deepEqual(reviveJobs("nonsense"), { jobs: [], nextSeq: 0 }, "a non-array parses to an empty store");
     assert.equal(reviveJobs([{ nope: true }, { id: "j3", task: "ok", status: "done", started: 1 }]).jobs.length, 1, "junk entries are dropped, good ones kept");
     assert.equal(reviveJobs([{ nope: true }, { id: "j3", task: "ok", status: "done", started: 1 }]).nextSeq, 3, "and junk does not disturb the sequence");
+
+    // Pruning ranks by start time, which would age out a job that is still running once enough newer
+    // jobs pile up — losing the one result the whole file exists to keep. A running job must never
+    // be dropped for being old, even past the 50-job cap; only finished jobs are ever trimmed.
+    const { listJobs } = await import("./client/background.ts");
+    for (let i = 0; i < 55; i++) startJob(`long job ${i}`, () => new Promise<string>(() => {})); // never resolves
+    const stillRunning = listJobs().filter((j) => j.status === "running" && j.task.startsWith("long job"));
+    assert.equal(stillRunning.length, 55, "every running job survives a prune, even past the 50-job cap");
   }
 
   // --- agent-server helpers: SSE framing, id uniqueness, approval correlation (no live model needed) ---

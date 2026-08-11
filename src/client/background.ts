@@ -79,10 +79,25 @@ function load(): void {
   }
 }
 
+/** Keep every running job, then fill the rest of the window with the newest finished ones.
+ *
+ * Ranking by start time alone would age out a long job while it is still working — and with it the
+ * result that was the entire point of persisting. A running job has no result yet, so dropping it
+ * is never the right trade; a finished one has already been readable.
+ */
+function prune(): void {
+  const all = [...jobs.values()].sort((a, b) => b.started - a.started);
+  const running = all.filter((j) => j.status === "running");
+  const finished = all.filter((j) => j.status !== "running").slice(0, Math.max(0, CAP - running.length));
+  const keep = new Set([...running, ...finished].map((j) => j.id));
+  for (const id of [...jobs.keys()]) if (!keep.has(id)) jobs.delete(id);
+}
+
 /** Whole-file write on every status change — three writes per job, of a file capped at 50 entries.
  *  A read-only checkout just keeps its jobs in memory. */
 function save(): void {
   try {
+    prune();
     const dir = resolve(process.cwd(), ".ada");
     ensureAdaDir(dir);
     writeFileSync(join(dir, "jobs.json"), JSON.stringify(listJobs(), null, 2));
@@ -91,10 +106,10 @@ function save(): void {
   }
 }
 
-/** Every job this project knows about, newest first. */
+/** Every job still in the store, newest first — see `prune`. */
 export function listJobs(): Job[] {
   load();
-  return [...jobs.values()].sort((a, b) => b.started - a.started).slice(0, CAP);
+  return [...jobs.values()].sort((a, b) => b.started - a.started);
 }
 
 /** Start `run()` in the background; returns a job id immediately. */
