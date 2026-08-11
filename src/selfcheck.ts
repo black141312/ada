@@ -1185,6 +1185,18 @@ async function main(): Promise<void> {
     // unrecognised to "done".
     const revived = reviveJobs([{ id: "j98", task: "t", status: "cancelled", started: 1, ended: 2 }]);
     assert.equal(revived.jobs[0]!.status, "cancelled", "reviveJobs preserves cancelled rather than coercing it to done");
+
+    // The real sub-agent RESOLVES on abort (send() unwinds and returns whatever partial text it had)
+    // rather than rejecting — model the runner on that, not on a throw, to cover the path that
+    // actually happens in production.
+    const partialId = startJob("cancel with partial", (signal) => new Promise<string>((res) => {
+      signal?.addEventListener("abort", () => res("half an answer"));
+    }));
+    cancelJob(partialId);
+    await new Promise((r) => setTimeout(r, 30));
+    const partial = listJobs().find((x) => x.id === partialId);
+    assert.equal(partial?.status, "cancelled", "a late resolve does not move the status off cancelled");
+    assert.equal(partial?.result, "half an answer", "but its partial text is kept — the spec promises this");
   }
 
   console.log("selfcheck OK");

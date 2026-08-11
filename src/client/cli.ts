@@ -1153,7 +1153,7 @@ async function main(): Promise<void> {
       }
       const cancelJobMatch = req.method === "POST" && url.pathname.match(/^\/v1\/jobs\/([^/]+)\/cancel$/);
       if (cancelJobMatch) {
-        const job = cancelJob(cancelJobMatch[1]!);
+        const job = cancelJob(decodeURIComponent(cancelJobMatch[1]!));
         if (!job) {
           res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: "no such job" }));
           return;

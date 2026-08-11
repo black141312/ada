@@ -175,8 +175,17 @@ export function startJob(task: string, run: (signal?: AbortSignal) => Promise<st
   save();
   const settle = (status: Job["status"], result: string): void => {
     aborts.delete(id);
-    // cancelJob already wrote "cancelled"; the runner's own rejection arrives moments later and must
-    // not relabel a deliberate stop as a crash.
+    // A cancelled job has already been stamped by cancelJob. Its runner then settles moments later —
+    // and for the real sub-agent that is a RESOLVE, not a reject: aborting makes send() unwind and
+    // return whatever it had. Keep that partial answer, since half an answer beats the word
+    // "cancelled", but never let the late settlement move the status off the deliberate stop.
+    if (job.status === "cancelled") {
+      if (result && job.result === "cancelled") {
+        job.result = result;
+        save();
+      }
+      return;
+    }
     if (job.status !== "running") return;
     job.status = status;
     job.result = result;
