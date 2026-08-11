@@ -412,10 +412,18 @@ async function main(): Promise<void> {
     // But memory and skills are the user's, and meant to be committed and shared with the team.
     assert.ok(!/^memory\/?$/m.test(gi) && !/^skills\/?$/m.test(gi), "memory and skills must stay committable");
 
-    // A second call must not clobber a file the user has edited.
+    // A second call must not clobber a file the user has edited — but an install from before
+    // jobs.json existed still needs the line appended, or that project shows `?? .ada/jobs.json`
+    // forever. Append, don't rewrite.
     writeFileSync(join(ada, ".gitignore"), "# mine\n");
     ensureAdaDir(ada);
-    assert.equal(readFileSync(join(ada, ".gitignore"), "utf8"), "# mine\n", "an existing .gitignore is left alone");
+    const gi2 = readFileSync(join(ada, ".gitignore"), "utf8");
+    assert.ok(gi2.startsWith("# mine\n"), "the user's existing content is preserved, not rewritten");
+    assert.ok(/^jobs\.json$/m.test(gi2), "jobs.json is appended for installs that predate it");
+
+    // Calling again must not append a second copy of the line.
+    ensureAdaDir(ada);
+    assert.equal(readFileSync(join(ada, ".gitignore"), "utf8"), gi2, "appending jobs.json is idempotent");
     rmSync(tmp, { recursive: true, force: true });
   }
 
@@ -825,6 +833,71 @@ async function main(): Promise<void> {
   const jid = startJob("selfcheck job", async () => "job-done-ok");
   await new Promise((r) => setTimeout(r, 30));
   assert.ok(renderJobs().includes(jid) && /job-done-ok/.test(renderJobs()), "background job runs and reports its result");
+
+  // --- jobs survive a restart, and a restart does not lie about what was running ---
+  {
+    const { reviveJobs } = await import("./client/background.ts");
+
+    // A job still marked "running" belongs to a process that is gone. Loading it faithfully would
+    // show it running forever — a worse bug, and a permanent one, than the unreachable result this
+    // whole change is about.
+    const stale = reviveJobs([
+      { id: "j1", task: "was running when serve died", status: "running", started: 1 },
+      { id: "j2", task: "finished cleanly", status: "done", result: "the answer", started: 2, ended: 3 },
+    ]);
+    assert.equal(stale.jobs.length, 2, "revive keeps both jobs");
+    assert.equal(stale.jobs[0]!.status, "error", "a running job loads as interrupted, not running");
+    assert.match(stale.jobs[0]!.result ?? "", /restart/i, "and says why it is interrupted");
+    assert.equal(stale.jobs[1]!.status, "done", "a finished job loads untouched");
+    assert.equal(stale.jobs[1]!.result, "the answer", "with its result intact — the point of persisting");
+
+    // Ids are `j${++seq}` off a module counter. Without continuing the sequence, a restart hands
+    // out j1 again and silently overwrites the persisted j1 — destroying the very result we saved.
+    assert.equal(reviveJobs([{ id: "j7", task: "t", status: "done", started: 1 }]).nextSeq, 7, "seq continues from the highest id");
+    assert.equal(reviveJobs([]).nextSeq, 0, "an empty store starts the sequence at zero");
+
+    // A corrupt or hand-edited file must not take the agent down with it.
+    assert.deepEqual(reviveJobs(null), { jobs: [], nextSeq: 0 }, "null parses to an empty store");
+    assert.deepEqual(reviveJobs("nonsense"), { jobs: [], nextSeq: 0 }, "a non-array parses to an empty store");
+    assert.equal(reviveJobs([{ nope: true }, { id: "j3", task: "ok", status: "done", started: 1 }]).jobs.length, 1, "junk entries are dropped, good ones kept");
+    assert.equal(reviveJobs([{ nope: true }, { id: "j3", task: "ok", status: "done", started: 1 }]).nextSeq, 3, "and junk does not disturb the sequence");
+
+    // save() must merge with disk, not clobber it: a second `ada` in the same folder — the app's
+    // serve for the open project, say, beside a terminal `ada` — has its own Map and writes the same
+    // file. Blind overwrite means each one's save() erases whatever the other added since its own
+    // load(). A job this process never created should still be there after a save() of its own.
+    {
+      const jobsPath = join(process.cwd(), ".ada", "jobs.json");
+      const onDisk = existsSync(jobsPath) ? JSON.parse(readFileSync(jobsPath, "utf8")) : [];
+      const foreignId = "j_selfcheck_foreign";
+      // A recent `started` matters: capJobs keeps the *newest* finished jobs, and this file already
+      // has decades of prior selfcheck runs' entries in it — an old timestamp would make the foreign
+      // job look stale and get pruned for a reason that has nothing to do with the merge being tested.
+      const now = Date.now();
+      writeFileSync(
+        jobsPath,
+        JSON.stringify(
+          [...onDisk, { id: foreignId, task: "left by another ada in this folder", status: "done", result: "not ours", started: now, ended: now }],
+          null,
+          2,
+        ),
+      );
+      // Any startJob() triggers a save() as a side effect — that is the real code path, not a
+      // reach into internals.
+      startJob("triggers a save so the merge above actually runs", async () => "ok");
+      await new Promise((r) => setTimeout(r, 30));
+      const after = JSON.parse(readFileSync(jobsPath, "utf8"));
+      assert.ok(Array.isArray(after) && after.some((j: { id?: string }) => j.id === foreignId), "save() merges in a job it never created instead of overwriting the file with only its own");
+    }
+
+    // Pruning ranks by start time, which would age out a job that is still running once enough newer
+    // jobs pile up — losing the one result the whole file exists to keep. A running job must never
+    // be dropped for being old, even past the 50-job cap; only finished jobs are ever trimmed.
+    const { listJobs } = await import("./client/background.ts");
+    for (let i = 0; i < 55; i++) startJob(`long job ${i}`, () => new Promise<string>(() => {})); // never resolves
+    const stillRunning = listJobs().filter((j) => j.status === "running" && j.task.startsWith("long job"));
+    assert.equal(stillRunning.length, 55, "every running job survives a prune, even past the 50-job cap");
+  }
 
   // --- agent-server helpers: SSE framing, id uniqueness, approval correlation (no live model needed) ---
   {
