@@ -928,7 +928,10 @@ export class Agent {
     // other way: blind workers spent ~174k input tokens groping around the repo to orient. The map
     // is ~1.5k and it replaces that search. Cheap models are exactly the ones that can't infer
     // layout from nothing — and they're now cheap enough that context is the affordable half.
-    const sub = new Agent({ client: this.client, model, session: Session.create(), onApprove: this.onApprove, autoApprove: true, project: this.project, tokenBudget: WORKER_TOKEN_BUDGET });
+    // Forwarded so a background_task started by this fallback worker still attributes to the chat
+    // that kicked off the fan-out — the isolated-worker path above already carries it; this sibling
+    // was the one spot it still fell on the floor.
+    const sub = new Agent({ client: this.client, model, session: Session.create(), sessionId: this.sessionId, onApprove: this.onApprove, autoApprove: true, project: this.project, tokenBudget: WORKER_TOKEN_BUDGET });
     try {
       return await sub.send(prompt, { quiet: true, delegated: true });
     } finally {

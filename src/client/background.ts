@@ -284,10 +284,15 @@ export function registerSubagentTools(opts: SubagentOpts): void {
         // at each step — without this, cancelling the job would relabel it "cancelled" while the
         // sub-agent kept running and spending tokens underneath, which is the exact failure this
         // feature exists to fix.
+        // The placeholder must not fire on the aborted path: `settle` only keeps partial text (or
+        // falls back to "cancelled") when the runner's result is falsy, so stamping empty output
+        // with this placeholder here would hand `settle` a truthy string and it would overwrite the
+        // "cancelled" sentinel with "(sub-agent returned no text)" instead. Leave it empty when
+        // aborted and let `settle` decide.
         (signal) =>
           sub(true, ctx?.sessionId)
             .send(task, { quiet: true, delegated: true, signal })
-            .then((text) => text || "(sub-agent returned no text)"),
+            .then((text) => (signal?.aborted ? text : text || "(sub-agent returned no text)")),
         ctx?.sessionId,
       );
       return { output: `Started background job ${id}. Check results with /jobs in the terminal, or the Background jobs section in the app (don't wait on it).` };
