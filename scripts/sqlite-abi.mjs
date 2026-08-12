@@ -32,6 +32,11 @@ function moduleRoot() {
 // fail someone's `npm install` over this — it only costs them the second ABI, which is exactly the
 // situation everyone was in before this script existed. Run directly, it still exits non-zero so a
 // failure is visible.
+//
+// The `|| exit 0` on the postinstall script is not redundant with the handling below: the Dockerfile
+// installs deps from package.json alone, before any sources are copied, so `npm ci` runs a
+// postinstall pointing at a file that does not exist yet. node exits 1 before a single line here
+// runs, and the whole image build fails.
 const asPostinstall = process.env.npm_lifecycle_event === "postinstall";
 
 const root = moduleRoot();
