@@ -51,6 +51,74 @@ type OAIMessage = {
 type Block = Record<string, unknown>;
 
 /** OpenAI messages[] → Anthropic { system, messages[] }. */
+/**
+ * Make every tool_use / tool_result pair adjacent, the way Anthropic requires.
+ *
+ * The OpenAI API tolerates a transcript where a tool call's result is missing, arrives late, or has
+ * something in between. Anthropic refuses the whole request:
+ *
+ *   messages.414: tool_use ids were found without tool_result blocks immediately after: toolu_…
+ *   Each tool_use block must have a corresponding tool_result block in the next message.
+ *
+ * That is a 400 on EVERY subsequent turn, so one malformed pair anywhere in the history bricks the
+ * conversation — and the transcript can drift into that shape for ordinary reasons: compaction
+ * dropping a result while keeping the call, a tool interrupted mid-flight, a message landing
+ * between the two.
+ *
+ * So repair rather than forward it: synthesize a result for any call that lacks one, and drop
+ * results that answer no call (the mirror case, which Anthropic also rejects). The synthesized text
+ * is visible to the model on purpose — "no result" is the truth about what happened, and inventing
+ * a plausible-looking success would be worse than saying so.
+ */
+export function repairToolPairs(messages: Block[]): Block[] {
+  const out: Block[] = [];
+
+  const idsOf = (m: Block | undefined, type: string, key: string): string[] =>
+    Array.isArray(m?.content)
+      ? (m.content as Block[]).filter((b) => b?.type === type).map((b) => String(b[key] ?? ""))
+      : [];
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]!;
+
+    if (msg.role === "user" && Array.isArray(msg.content)) {
+      // Drop tool_results that answer no immediately-preceding call. Anything else in the message
+      // (text, images) is untouched — only the orphaned results go.
+      const expected = new Set(idsOf(out[out.length - 1], "tool_use", "id"));
+      const kept = (msg.content as Block[]).filter((b) => b?.type !== "tool_result" || expected.has(String(b.tool_use_id ?? "")));
+      if (!kept.length) continue; // nothing left to say — dropping the turn beats sending an empty one
+      out.push({ ...msg, content: kept });
+      continue;
+    }
+
+    out.push(msg);
+
+    const calls = idsOf(msg, "tool_use", "id");
+    if (msg.role !== "assistant" || !calls.length) continue;
+
+    // Whatever answers this turn must be the very next message, and must cover every id.
+    const next = messages[i + 1];
+    const answered = new Set(next?.role === "user" ? idsOf(next, "tool_result", "tool_use_id") : []);
+    const missing = calls.filter((id) => !answered.has(id));
+    if (!missing.length) continue;
+
+    const filler: Block[] = missing.map((id) => ({
+      type: "tool_result",
+      tool_use_id: id,
+      content: "(no result recorded — the tool did not report back)",
+    }));
+
+    if (next?.role === "user" && Array.isArray(next.content)) {
+      // Merge into the reply that's already there, so ordering and any text it carries survive.
+      messages[i + 1] = { ...next, content: [...filler, ...(next.content as Block[])] };
+    } else {
+      out.push({ role: "user", content: filler });
+    }
+  }
+
+  return out;
+}
+
 function convert(messages: OAIMessage[]): { system?: string; messages: Block[] } {
   const system: string[] = [];
   const out: Block[] = [];
@@ -110,7 +178,7 @@ function convert(messages: OAIMessage[]): { system?: string; messages: Block[] }
     }
   }
 
-  return { system: system.length ? system.join("\n\n") : undefined, messages: out };
+  return { system: system.length ? system.join("\n\n") : undefined, messages: repairToolPairs(out) };
 }
 
 /** Mark the end of the transcript cacheable, so each turn cache-*reads* every prior turn instead of
@@ -275,3 +343,60 @@ export const anthropicAdapter: Adapter = {
     }
   },
 };
+
+/** demo(): `node --experimental-strip-types anthropic.ts` — the tool-pairing rules Anthropic
+ *  enforces, each of which returns a 400 that bricks the whole conversation when violated. */
+async function demo(): Promise<void> {
+  const assert = (c: unknown, m: string): void => {
+    if (!c) throw new Error(`FAIL: ${m}`);
+  };
+  const use = (id: string): Block => ({ type: "tool_use", id, name: "ls", input: {} });
+  const result = (id: string): Block => ({ type: "tool_result", tool_use_id: id, content: "ok" });
+  const resultsOf = (m: Block | undefined): string[] =>
+    Array.isArray(m?.content) ? (m.content as Block[]).filter((b) => b.type === "tool_result").map((b) => String(b.tool_use_id)) : [];
+
+  // Well-formed input must survive untouched.
+  const ok = repairToolPairs([
+    { role: "assistant", content: [use("a")] },
+    { role: "user", content: [result("a")] },
+  ]);
+  assert(ok.length === 2 && resultsOf(ok[1]).join() === "a", "a correct pair is left alone");
+
+  // The reported failure: a call with no result at all.
+  const orphanCall = repairToolPairs([{ role: "assistant", content: [use("a")] }]);
+  assert(orphanCall.length === 2, "a result turn is synthesized for an unanswered call");
+  assert(resultsOf(orphanCall[1]).join() === "a", "and it answers the right id");
+
+  // A call answered by something that isn't its result — the message in between is what breaks it.
+  const interrupted = repairToolPairs([
+    { role: "assistant", content: [use("a")] },
+    { role: "user", content: [{ type: "text", text: "actually, stop" }] },
+  ]);
+  assert(resultsOf(interrupted[1]).join() === "a", "the missing result is merged into the next turn");
+  assert(
+    Array.isArray(interrupted[1]!.content) && (interrupted[1]!.content as Block[]).some((b) => b.type === "text"),
+    "without discarding what the user said",
+  );
+
+  // Partially answered: only the missing ids get filled.
+  const partial = repairToolPairs([
+    { role: "assistant", content: [use("a"), use("b")] },
+    { role: "user", content: [result("b")] },
+  ]);
+  assert(resultsOf(partial[1]).sort().join() === "a,b", "every unanswered id is covered");
+
+  // The mirror case Anthropic also rejects: a result answering no call.
+  const orphanResult = repairToolPairs([
+    { role: "user", content: "hi" },
+    { role: "user", content: [result("ghost")] },
+  ]);
+  assert(orphanResult.length === 1, "a result with no matching call is dropped, not forwarded");
+
+  // An orphan result alongside real text keeps the text.
+  const mixed = repairToolPairs([{ role: "user", content: [result("ghost"), { type: "text", text: "hello" }] }]);
+  assert(resultsOf(mixed[0]).length === 0 && (mixed[0]!.content as Block[]).length === 1, "only the orphan goes");
+
+  console.log("anthropic: all checks passed");
+}
+
+if (process.argv[1]?.endsWith("anthropic.ts")) void demo();
