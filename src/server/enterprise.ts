@@ -54,6 +54,16 @@ export interface UsageRow {
   provider: string;
   promptTokens: number;
   completionTokens: number;
+  // Prompt caching, when the provider reports it. promptTokens counts fresh + cached together, so
+  // without this split a run that reads its whole prefix from cache is indistinguishable from one
+  // that reprocessed it — same number, ~10x the cost and work. Optional: most providers say nothing.
+  cacheRead?: number;
+  cacheWrite?: number;
+  // How long the request took, and how much of that passed before the first byte came back.
+  // Split because they mean different things: a long ttft is queueing or thinking (a throttled
+  // subscription looks exactly like that), a long remainder is just generation.
+  ms?: number;
+  ttftMs?: number;
 }
 export interface Identity {
   user: string;
@@ -385,7 +395,7 @@ function matchBraces(text: string, start: number): string | null {
 
 /** Pull the LAST real `"usage": { … }` object out of streamed/response text. Skips a trailing
  *  `"usage": null` and keeps scanning backwards, so a null in a late frame doesn't hide a real one. */
-export function extractLastUsage(text: string): { promptTokens: number; completionTokens: number } | null {
+export function extractLastUsage(text: string): { promptTokens: number; completionTokens: number; cacheRead?: number; cacheWrite?: number } | null {
   let at = text.lastIndexOf('"usage"');
   while (at >= 0) {
     const brace = text.indexOf("{", at + 7);
@@ -394,8 +404,20 @@ export function extractLastUsage(text: string): { promptTokens: number; completi
       const obj = matchBraces(text, brace);
       if (obj) {
         try {
-          const u = JSON.parse(obj) as { prompt_tokens?: number; completion_tokens?: number };
-          if (u.prompt_tokens != null || u.completion_tokens != null) return { promptTokens: u.prompt_tokens ?? 0, completionTokens: u.completion_tokens ?? 0 };
+          const u = JSON.parse(obj) as {
+            prompt_tokens?: number;
+            completion_tokens?: number;
+            prompt_tokens_details?: { cached_tokens?: number; cache_creation_tokens?: number };
+          };
+          if (u.prompt_tokens != null || u.completion_tokens != null) {
+            const d = u.prompt_tokens_details;
+            return {
+              promptTokens: u.prompt_tokens ?? 0,
+              completionTokens: u.completion_tokens ?? 0,
+              ...(d?.cached_tokens != null ? { cacheRead: d.cached_tokens } : {}),
+              ...(d?.cache_creation_tokens != null ? { cacheWrite: d.cache_creation_tokens } : {}),
+            };
+          }
         } catch {
           /* malformed — keep looking backwards */
         }

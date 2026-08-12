@@ -6,6 +6,7 @@ import { betterAuth } from "better-auth";
 import { bearer, deviceAuthorization } from "better-auth/plugins";
 import type Database from "better-sqlite3";
 import { Pool } from "pg";
+import { sqliteOptions } from "./sqlite-binding.ts";
 
 // Storage: a hosted Postgres (Supabase) when DATABASE_URL is set — makes the backend STATELESS, so it
 // runs on any serverless/container host without a persistent disk. Falls back to local SQLite for dev.
@@ -19,6 +20,9 @@ export const authDatabase = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
   : new (createRequire(import.meta.url)("better-sqlite3") as typeof Database)(
       process.env.ADA_AUTH_DB ?? "ada-auth.db",
+      // Load the binary built for the runtime we're actually on — the app runs this under
+      // Electron's Node, whose ABI differs from the system Node that npm installed for.
+      sqliteOptions(),
     );
 
 const socialProviders: Record<string, { clientId: string; clientSecret: string }> = {};

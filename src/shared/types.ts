@@ -3,6 +3,7 @@
 export type ProviderName =
   | "openai"
   | "anthropic"
+  | "chatgpt" // a ChatGPT Plus/Pro subscription (Codex endpoint), NOT the pay-per-token openai API
   | "google"
   | "mistral"
   | "openrouter"

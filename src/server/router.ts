@@ -14,6 +14,10 @@ export function route(model: string, explicit?: string): ProviderName {
   // Prefixed ids that must beat the OpenRouter "/" rule below:
   if (m.startsWith("@cf/")) return "cloudflare"; // Cloudflare Workers AI model ids
   if (m.startsWith("copilot/")) return "copilot";
+  // `chatgpt/gpt-5.1-codex` — bill this to the ChatGPT subscription. Deliberately opt-in by prefix:
+  // a bare `gpt-…` keeps going to the pay-per-token OpenAI API, so adding a subscription can never
+  // silently reroute the model ids someone is already using.
+  if (m.startsWith("chatgpt/")) return "chatgpt";
   // `groq/…` / `together/…` disambiguate shared model names (llama-3.3, gemma2…) that no prefix can.
   if (m.startsWith("groq/")) return "groq";
   if (m.startsWith("together/")) return "together";
