@@ -899,6 +899,63 @@ async function main(): Promise<void> {
     assert.equal(stillRunning.length, 55, "every running job survives a prune, even past the 50-job cap");
   }
 
+  // --- a tool learns which session called it -------------------------------------------------
+  {
+    const { registerTool, toolByName } = await import("./client/tools.ts");
+    let seen: string | undefined = "unset";
+    registerTool({
+      name: "selfcheck_ctx_echo",
+      description: "selfcheck only",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+      needsApproval: false,
+      async run(_args, ctx) {
+        seen = ctx?.sessionId;
+        return { output: "ok" };
+      },
+    });
+    // Called the way the agent calls it, rather than through a whole turn: the contract under test
+    // is "the ctx reaches run()", and a live model round trip would prove nothing extra.
+    await toolByName.get("selfcheck_ctx_echo")!.run({}, { sessionId: "sess-abc" });
+    assert.equal(seen, "sess-abc", "a tool receives the calling session's id");
+    await toolByName.get("selfcheck_ctx_echo")!.run({});
+    assert.equal(seen, undefined, "and undefined when the caller has no session — a terminal agent");
+  }
+
+  // --- a job remembers which chat started it -------------------------------------------------
+  {
+    const { startJob, listJobs, reviveJobs } = await import("./client/background.ts");
+    const withId = startJob("attributed job", async () => "done", "sess-xyz");
+    const without = startJob("terminal job", async () => "done");
+    await new Promise((r) => setTimeout(r, 30));
+    const all = listJobs();
+    assert.equal(all.find((j) => j.id === withId)?.sessionId, "sess-xyz", "a job records the session that started it");
+    assert.equal(all.find((j) => j.id === without)?.sessionId, undefined, "a job with no session is still valid — a terminal agent has none");
+
+    // The field has to survive a restart, or attribution silently resets to unscoped.
+    const revived = reviveJobs([{ id: "j99", task: "t", status: "done", result: "r", started: 1, ended: 2, sessionId: "sess-xyz" }]);
+    assert.equal(revived.jobs[0]!.sessionId, "sess-xyz", "reviveJobs carries sessionId across a restart");
+
+    // The branch above is the easy one — status "done" never gets rewritten. The interrupted branch
+    // is the one a crash actually exercises, and it is also the one that rebuilds the job object
+    // field by field, so it is exactly where a forgotten sessionId would go unnoticed.
+    const revivedInterrupted = reviveJobs([{ id: "j98", task: "was running when serve died", status: "running", started: 1, sessionId: "sess-xyz" }]);
+    assert.equal(revivedInterrupted.jobs[0]!.status, "error", "a running job with a session still loads as interrupted");
+    assert.equal(revivedInterrupted.jobs[0]!.sessionId, "sess-xyz", "and the interrupted branch keeps its sessionId too");
+  }
+
+  // A burst of running jobs must not squeeze the finished log to nothing — that destroyed results
+  // on the next save, which is the whole thing persistence protects against.
+  {
+    const { listJobs } = await import("./client/background.ts");
+    // The premise this block depends on — the 55 "long job" running jobs started earlier — lives in
+    // an unrelated block above. Assert it explicitly, so a future edit that shrinks or moves that
+    // loop makes this test fail loudly instead of passing without ever exercising the cap.
+    const runningCount = listJobs().filter((j) => j.status === "running").length;
+    assert.ok(runningCount > 50, "setup actually has more running jobs than the cap, or the assertion below proves nothing");
+    const finishedKept = listJobs().filter((j) => j.status !== "running").length;
+    assert.ok(finishedKept > 0, "finished jobs survive even when running jobs outnumber the cap");
+  }
+
   // --- agent-server helpers: SSE framing, id uniqueness, approval correlation (no live model needed) ---
   {
     const { sseFrame, newId, ApprovalRegistry } = await import("./client/agent-server.ts");
@@ -1105,6 +1162,52 @@ async function main(): Promise<void> {
     const srv = createAdaServer();
     assert.ok(!srv.listening, "createAdaServer() builds the server without calling listen()");
     srv.close();
+  }
+
+  // --- cancelling a running job --------------------------------------------------------------
+  {
+    const { startJob, cancelJob, listJobs, reviveJobs } = await import("./client/background.ts");
+    // A job that only settles when its signal fires, so the test controls exactly when it ends.
+    const id = startJob("cancel me", (signal) => new Promise<string>((_res, rej) => {
+      signal?.addEventListener("abort", () => rej(new Error("aborted")));
+    }));
+    const j = cancelJob(id);
+    assert.equal(j?.status, "cancelled", "cancelJob settles the job as cancelled");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(listJobs().find((x) => x.id === id)?.status, "cancelled", "and the rejection does not overwrite it with error");
+
+    assert.equal(cancelJob("j-nope"), null, "cancelling an unknown job is null, not a throw");
+    const settled = startJob("already done", async () => "fine");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(cancelJob(settled)?.status, "done", "cancelling a settled job is a no-op, not an error");
+
+    // Without this, a restart relabels a deliberate stop as a success — the coercion sends anything
+    // unrecognised to "done".
+    const revived = reviveJobs([{ id: "j98", task: "t", status: "cancelled", started: 1, ended: 2 }]);
+    assert.equal(revived.jobs[0]!.status, "cancelled", "reviveJobs preserves cancelled rather than coercing it to done");
+
+    // The real sub-agent RESOLVES on abort (send() unwinds and returns whatever partial text it had)
+    // rather than rejecting — model the runner on that, not on a throw, to cover the path that
+    // actually happens in production.
+    const partialId = startJob("cancel with partial", (signal) => new Promise<string>((res) => {
+      signal?.addEventListener("abort", () => res("half an answer"));
+    }));
+    cancelJob(partialId);
+    await new Promise((r) => setTimeout(r, 30));
+    const partial = listJobs().find((x) => x.id === partialId);
+    assert.equal(partial?.status, "cancelled", "a late resolve does not move the status off cancelled");
+    assert.equal(partial?.result, "half an answer", "but its partial text is kept — the spec promises this");
+  }
+
+  // --- a nested job inherits the chat ---------------------------------------------------------
+  {
+    const { startJob, listJobs } = await import("./client/background.ts");
+    // Stands in for the nested call: a sub-agent carrying an inherited sessionId reaches exactly
+    // this path when its own background_task fires. The hop that cannot be exercised here is the
+    // live sub-agent turn; the hop that can is that an inherited id lands on the record.
+    const nested = startJob("nested job", async () => "done", "sess-parent");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(listJobs().find((j) => j.id === nested)?.sessionId, "sess-parent", "a job started with an inherited session id records it");
   }
 
   console.log("selfcheck OK");

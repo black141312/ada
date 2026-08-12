@@ -31,7 +31,7 @@ import { catalogText, prefetch } from "./models-dev.ts";
 import { ensureBackend, isLocalBackend } from "./autostart.ts";
 import { popularModels } from "./models.ts";
 import { route } from "../server/router.ts"; // pure model-id → provider mapping (static table, safe client-side)
-import { listJobs, registerSubagentTools, renderJobs } from "./background.ts";
+import { cancelJob, listJobs, registerSubagentTools, renderJobs } from "./background.ts";
 import { renderTodos } from "./todos.ts";
 import { track } from "./telemetry.ts";
 
@@ -1090,11 +1090,13 @@ async function main(): Promise<void> {
     const makeSession = (m: string, resumeFile?: string): { id: string; rec: AgentSession } => {
       const session = resumeFile ? Session.open(resumeFile) : Session.create();
       const history = resumeFile ? (session.load() as unknown as Msg[]) : undefined;
+      const id = newId("sess");
       const rec: AgentSession = { agent: undefined as unknown as Agent, registry: new ApprovalRegistry(), questions: new QuestionRegistry(), emit: null, file: session.file, ctrl: null, steer: [], mode: "ask" };
       rec.agent = new Agent({
         client,
         model: m,
         session,
+        sessionId: id, // so a background_task started in this chat can record whose it is
         history,
         project: trusted,
         compactAt: settings.compactAt,
@@ -1110,7 +1112,6 @@ async function main(): Promise<void> {
           return promise;
         },
       });
-      const id = newId("sess");
       sessions.set(id, rec);
       return { id, rec };
     };
@@ -1148,6 +1149,16 @@ async function main(): Promise<void> {
       // same list through /jobs; without this route the app started jobs it could never read back.
       if (req.method === "GET" && url.pathname === "/v1/jobs") {
         res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jobs: listJobs() }));
+        return;
+      }
+      const cancelJobMatch = req.method === "POST" && url.pathname.match(/^\/v1\/jobs\/([^/]+)\/cancel$/);
+      if (cancelJobMatch) {
+        const job = cancelJob(decodeURIComponent(cancelJobMatch[1]!));
+        if (!job) {
+          res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: "no such job" }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ job }));
         return;
       }
       // Skills & MCP management — lets an IDE render settings pages off the same loaders the agent uses.
