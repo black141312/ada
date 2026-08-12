@@ -10,6 +10,7 @@ import TextInput from "ink-text-input";
 // this repo's tsconfig and falls back to the classic JSX transform (React.createElement).
 import React, { type JSX, useEffect, useRef, useState } from "react";
 import type { Agent } from "./agent.ts";
+import { subscriptionFor, subscriptionLogin } from "../server/providers/subscription-oauth.ts";
 import { setAsker } from "./tools.ts";
 import type { AskOption } from "./tools.ts";
 
@@ -168,6 +169,23 @@ function AdaApp({ agent, model }: { agent: Agent; model: string }): JSX.Element 
     hist.current.list.push(text);
     hist.current.i = -1;
     if (text === "/exit" || text === "/quit") return exit();
+    // /login is handled here (rather than falling through to the stub below) because a plan sign-in
+    // is the one command you may need BEFORE the TUI can talk to a model at all — being told to
+    // restart without --tui to run it would be a dead end.
+    if (text === "/login" || text.startsWith("/login ")) {
+      push("user", text);
+      const arg = text.slice("/login".length).trim().toLowerCase();
+      const provider = subscriptionFor(arg);
+      if (!provider) {
+        push("info", `  usage: /login claude | /login chatgpt${arg ? `  (unknown: ${arg})` : ""}`);
+        return;
+      }
+      push("info", "  opening your browser — finish the sign-in there…");
+      void subscriptionLogin(provider, (s) => {
+        for (const line of s.split("\n")) if (line.trim()) push("info", `  ${line}`);
+      }).catch((e: unknown) => push("error", `login failed: ${e instanceof Error ? e.message : String(e)}`));
+      return;
+    }
     if (text.startsWith("/") && !text.includes(" ") && text.length > 1) {
       // ponytail: TUI only implements /exit; other commands live in the plain REPL for now
       push("user", text);

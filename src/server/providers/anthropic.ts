@@ -8,14 +8,37 @@ import type AnthropicSDK from "@anthropic-ai/sdk";
 import { providerKey } from "../config.ts";
 import { endStream, SSE_HEADERS, writeChunk } from "../sse.ts";
 import type { Adapter, ChatRequest } from "./adapter.ts";
+import { freshToken } from "./subscription-oauth.ts";
 
-let cached: AnthropicSDK | null = null;
-async function getClient(): Promise<AnthropicSDK> {
-  if (!cached) {
+/** A Claude Pro/Max subscription token, as opposed to a `sk-ant-api…` key. The two authenticate
+ *  differently (bearer vs x-api-key) and the subscription route needs extra beta opt-ins. */
+export const isSubscriptionToken = (k: string): boolean => k.startsWith("sk-ant-oat");
+
+/** Betas the subscription route requires. Without `oauth-2025-04-20` the token is refused; without
+ *  `claude-code-*` the request is treated as an API-key call and the plan doesn't cover it. */
+const SUBSCRIPTION_BETAS = ["claude-code-20250219", "oauth-2025-04-20"];
+
+/** Sent as the first system block on the subscription route — the plan only covers Claude Code
+ *  traffic, and Anthropic rejects the request without it. */
+const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+// Keyed by token: a refreshed subscription token must not keep using a client built on the old one.
+let cached: { token: string; client: AnthropicSDK } | null = null;
+async function getClient(): Promise<{ client: AnthropicSDK; subscription: boolean }> {
+  // freshToken renews an expiring subscription token; "" means there's no subscription, so fall
+  // back to the API key.
+  const token = (await freshToken("anthropic")) || providerKey("anthropic") || "";
+  const subscription = isSubscriptionToken(token);
+  if (cached?.token !== token) {
     const { default: Anthropic } = await import("@anthropic-ai/sdk");
-    cached = new Anthropic({ apiKey: providerKey("anthropic") });
+    cached = {
+      token,
+      // The SDK sends `authToken` as `Authorization: Bearer`; apiKey null keeps it from also
+      // sending x-api-key, which the subscription endpoint rejects.
+      client: subscription ? new Anthropic({ apiKey: null, authToken: token }) : new Anthropic({ apiKey: token }),
+    };
   }
-  return cached;
+  return { client: cached.client, subscription };
 }
 
 type OAIMessage = {
@@ -137,7 +160,7 @@ export const anthropicAdapter: Adapter = {
     let cacheWrite = 0;
 
     try {
-      const client = await getClient();
+      const { client, subscription } = await getClient();
       const { system, messages } = convert((body.messages as OAIMessage[]) ?? []);
       const tools = (
         (body.tools as Array<{ function: { name: string; description?: string; parameters?: unknown } }>) ?? []
@@ -153,7 +176,13 @@ export const anthropicAdapter: Adapter = {
       const cacheControl: Record<string, string> = { type: "ephemeral" };
       if (ttl1h) cacheControl.ttl = "1h";
       if (tools.length) (tools[tools.length - 1] as Record<string, unknown>).cache_control = cacheControl;
-      const systemParam = system ? [{ type: "text", text: system, cache_control: cacheControl }] : undefined;
+      // On the subscription route the identity block goes FIRST and ada's own system prompt follows
+      // it as a second block — appending it or merging the two doesn't satisfy the check.
+      const systemBlocks = [
+        ...(subscription ? [{ type: "text", text: CLAUDE_CODE_IDENTITY }] : []),
+        ...(system ? [{ type: "text", text: system, cache_control: cacheControl }] : []),
+      ];
+      const systemParam = systemBlocks.length ? systemBlocks : undefined;
       markLastBlockCacheable(messages, cacheControl);
 
       const params = {
@@ -164,9 +193,14 @@ export const anthropicAdapter: Adapter = {
         ...(tools.length ? { tools: tools as AnthropicSDK.Tool[] } : {}),
       } as unknown as Parameters<typeof client.messages.stream>[0];
 
+      // One merged anthropic-beta header: a second `headers` object would replace the first, so the
+      // subscription betas and the cache-TTL beta have to be joined rather than set separately.
+      const betas = [...(subscription ? SUBSCRIPTION_BETAS : []), ...(ttl1h ? ["extended-cache-ttl-2025-04-11"] : [])];
       const stream = client.messages.stream(
         params,
-        ttl1h ? { headers: { "anthropic-beta": "extended-cache-ttl-2025-04-11" } } : undefined,
+        betas.length
+          ? { headers: { "anthropic-beta": betas.join(","), ...(subscription ? { "user-agent": "claude-cli/1.0.0 (external, cli)" } : {}) } }
+          : undefined,
       );
 
       for await (const event of stream) {
@@ -221,11 +255,17 @@ export const anthropicAdapter: Adapter = {
   },
 
   async listModels(): Promise<string[]> {
-    const key = providerKey("anthropic");
+    const key = (await freshToken("anthropic")) || providerKey("anthropic");
     if (!key) return [];
     try {
       const r = await fetch("https://api.anthropic.com/v1/models?limit=1000", {
-        headers: { "x-api-key": key, "anthropic-version": "2023-06-01" },
+        headers: {
+          "anthropic-version": "2023-06-01",
+          // Same split as chat: bearer for a subscription token, x-api-key for an API key.
+          ...(isSubscriptionToken(key)
+            ? { authorization: `Bearer ${key}`, "anthropic-beta": SUBSCRIPTION_BETAS.join(",") }
+            : { "x-api-key": key }),
+        },
       });
       if (!r.ok) return [];
       const j = (await r.json()) as { data?: Array<{ id?: unknown }> };

@@ -55,6 +55,8 @@
     "start": "tsx src/client/cli.ts",
     "server": "tsx src/server/index.ts",
     "typecheck": "tsc --noEmit",
+    "sqlite:abi": "node scripts/sqlite-abi.mjs",
+    "postinstall": "node scripts/sqlite-abi.mjs || exit 0",
     "typecheck:worker": "tsc -p src/worker/tsconfig.json --noEmit",
     "selfcheck": "tsx src/selfcheck.ts",
     "check:browser": "tsx src/browsercheck.ts",

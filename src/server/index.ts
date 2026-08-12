@@ -46,6 +46,8 @@ q('#gh').onclick=async()=>{ const u=await session(); if(u){await approve();retur
 import { assertOidcConfig, discover, isProvisionAllowed, mapIdentityToSeatFields, oidcConfig, oidcEnabled, verifyOidcToken } from "./oidc.ts";
 import { adapterFor } from "./providers/registry.ts";
 import { route } from "./router.ts";
+import { clientAbort, proxyUpstream, upstream, upstreamModels } from "./upstream.ts";
+import { hasSubscription } from "./providers/subscription-oauth.ts";
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -137,6 +139,18 @@ async function handleModels(res: ServerResponse, freeOnly = false): Promise<void
       data.push(free ? { id, object: "model", owned_by: p, free } : { id, object: "model", owned_by: p });
     }
   }
+  // Everything the upstream can serve, minus anything we already serve ourselves — a locally-held
+  // subscription must win, or the same id would be listed twice and the picker would send it to
+  // whichever entry it saw first.
+  const up = upstream();
+  if (up) {
+    const mine = new Set(data.map((m) => m.id));
+    for (const m of await upstreamModels(up)) {
+      if (mine.has(m.id)) continue;
+      if (freeOnly && m.free !== true) continue;
+      data.push(m.free ? { id: m.id, object: "model", owned_by: m.owned_by ?? "upstream", free: true } : { id: m.id, object: "model", owned_by: m.owned_by ?? "upstream" });
+    }
+  }
   json(res, 200, { object: "list", data });
 }
 
@@ -169,10 +183,29 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
     return json(res, 403, { error: { message: `model '${model}' is not allowed by org policy (allowed: ${policy.models!.join(", ")})` } });
   }
 
+  // Routed early, because whether Ada's plan applies at all depends on WHO pays for this request.
+  // When an allowlist is active, IGNORE the client's `provider` hint — else a seat holder could
+  // send an allowlisted model id with a different provider and leak the body to it before the
+  // upstream rejects the id. Route by the model id only.
+  const explicit = policy.models?.length ? undefined : typeof body.provider === "string" ? body.provider : undefined;
+  const provider = route(model, explicit);
+
+  // A request served by a subscription on THIS machine is paid for by that plan, direct to the
+  // vendor — Ada never sees a token of it. Metering it against Ada's own quota would bill the user
+  // twice over: once to Anthropic/OpenAI, and again against an allowance they aren't consuming.
+  // (Only credentials held locally count. Anything forwarded upstream is metered there as before.)
+  const paidBySubscription = (provider === "anthropic" || provider === "chatgpt") && hasSubscription(provider) && isConfigured(provider);
+
+  // Requests we're about to FORWARD aren't ours to police either. The upstream applies its own
+  // plan and quota — it's the one paying — and a local gateway's plan store is a private, usually
+  // empty file in which every user looks like a fresh free account. Enforcing it here denied
+  // perfectly valid models before they ever reached the backend that would have allowed them.
+  const willForward = !isConfigured(provider) && !!upstream();
+
   // Plan quota. Skipped for the anonymous free tier (already restricted to `:free` above, and there
   // is no account to meter against) and for enterprise seats, which are governed by org policy and
   // billed by contract rather than by plan.
-  if (!isAnonymous(who) && !enterpriseMode()) {
+  if (!isAnonymous(who) && !enterpriseMode() && !paidBySubscription && !willForward) {
     const ent = await checkEntitlement(who.user, model);
     if (!ent.ok) {
       appendAudit({ ts: Date.now(), user: who.user, event: ent.status === 402 ? "quota_exceeded" : "plan_denied_model", detail: model });
@@ -181,14 +214,24 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
     }
   }
 
-  // When an allowlist is active, IGNORE the client's `provider` hint — else a seat holder could
-  // send an allowlisted model id with a different provider and leak the body to it before the
-  // upstream rejects the id. Route by the model id only.
-  const explicit = policy.models?.length ? undefined : typeof body.provider === "string" ? body.provider : undefined;
-  const provider = route(model, explicit);
   if (!isConfigured(provider)) {
+    // Can't serve it here — but if this gateway fronts a hosted backend, that one probably can.
+    // This is what lets a local gateway use the subscription for Claude while OpenRouter, quotas
+    // and metering keep working through the hosted server exactly as before.
+    const up = upstream();
+    if (up) {
+      delete body.provider; // our routing hint, never forwarded
+      return await proxyUpstream(up, "/chat/completions", body, res, clientAbort(req, res));
+    }
     return json(res, 400, {
-      error: { message: `provider '${provider}' not configured — set ${PROVIDERS[provider].keyEnv} on the backend` },
+      error: {
+        // chatgpt has no practical API-key route — naming its env var here would send people
+        // looking for a key that doesn't exist. Point at the sign-in instead.
+        message:
+          provider === "chatgpt"
+            ? "not signed in to ChatGPT — run `ada login chatgpt` (needs a Plus/Pro plan)"
+            : `provider '${provider}' not configured — set ${PROVIDERS[provider].keyEnv} on the backend`,
+      },
     });
   }
 
@@ -200,12 +243,28 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
   // upstream reported. Wrapping res keeps this in ONE place for every adapter.
   {
     let tail = "";
+    // Timing lives here for the same reason the token count does: one place, every adapter. Split
+    // into two numbers because they fail differently — a long ttft is the model queueing or
+    // thinking before it says anything (and a throttled subscription looks exactly like this),
+    // while a long tail after first byte is just generation. One combined number hides which.
+    const started = Date.now();
+    let ttft: number | null = null;
+    // `res.write` is typed `never` here by the cast below, so the check lives in its own function
+    // where the argument can be typed honestly as unknown.
+    const firstOutput = (c: unknown): boolean =>
+      (typeof c === "string" || Buffer.isBuffer(c)) && /"(content|tool_calls|reasoning_content)":/.test(c.toString());
     const scan = (c: unknown): void => {
       if (typeof c === "string" || Buffer.isBuffer(c)) tail = (tail + c.toString()).slice(-16_384);
     };
     const write = res.write.bind(res);
     const end = res.end.bind(res);
     res.write = ((c: never, ...a: never[]) => {
+      // First chunk carrying real MODEL output, not our own opening frame. Every adapter emits a
+      // `{role:"assistant"}` chunk the moment it writes headers, so timing the first write measured
+      // us, not the model — it read as ~1ms every time and made the number worthless.
+      if (ttft === null && firstOutput(c)) {
+        ttft = Date.now() - started;
+      }
       scan(c);
       return write(c, ...a);
     }) as typeof res.write;
@@ -215,7 +274,18 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
       if (u) {
         // Same row to both sinks: the file is the self-hosted record, the table is the one that
         // survives a container restart and can therefore be billed against.
-        const row = { ts: Date.now(), user: who.user, model, provider, promptTokens: u.promptTokens, completionTokens: u.completionTokens };
+        const row = {
+          ts: Date.now(),
+          user: who.user,
+          model,
+          provider,
+          promptTokens: u.promptTokens,
+          completionTokens: u.completionTokens,
+          ...(u.cacheRead != null ? { cacheRead: u.cacheRead } : {}),
+          ...(u.cacheWrite != null ? { cacheWrite: u.cacheWrite } : {}),
+          ms: Date.now() - started,
+          ...(ttft != null ? { ttftMs: ttft } : {}),
+        };
         appendUsage(row);
         void recordUsage(row); // fire-and-forget: this is response teardown, nothing can await here
       }

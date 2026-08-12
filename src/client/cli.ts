@@ -14,6 +14,7 @@ import { expandPrompt, loadPrompts } from "./prompts.ts";
 import { Session, list, type SessionMeta } from "./session.ts";
 import { deleteCredential, getCredential, listCredentials, setCredential } from "../server/credentials.ts";
 import { deviceGrant, deviceLogin, oauthConfig } from "../server/oauth.ts";
+import { subscriptionFor, subscriptionLogin } from "../server/providers/subscription-oauth.ts";
 import { addTrust, isTrusted, loadSettings, setActiveAgentPermissions, setGlobal, setOrgPermissions, workspaceDirs, type PermRule, type Settings } from "./settings.ts";
 import { getCommands, loadExtensions } from "./extensions.ts";
 import { registerTool, setAsker } from "./tools.ts";
@@ -581,6 +582,19 @@ async function accountLogin(): Promise<boolean> {
 async function loginFlow(provider: string): Promise<boolean> {
   if (provider === "account" || provider === "email") return accountLogin();
   if (provider === "oidc" || provider === "sso") return oidcLogin();
+  // Subscription sign-in (Claude Pro/Max, ChatGPT Plus/Pro): a browser PKCE flow, not the device
+  // flow, because that's what those OAuth apps are registered for. Aliases so both the plan name
+  // and the provider name work — `ada login claude` and `ada login anthropic` are the same thing.
+  const sub = subscriptionFor(provider);
+  if (sub) {
+    try {
+      await subscriptionLogin(sub, (s) => console.log(s));
+      return true;
+    } catch (e) {
+      console.error(`login failed: ${e instanceof Error ? e.message : e}`);
+      return false;
+    }
+  }
   const cfg = oauthConfig(provider);
   if (!cfg) {
     console.log(`No OAuth config for ${provider}. Set ADA_OAUTH_${provider.toUpperCase()}_{CLIENT_ID,DEVICE_URL,TOKEN_URL}.`);
@@ -662,17 +676,26 @@ async function authCommand(sub: string, provider?: string): Promise<void> {
     console.log(`logged out ${provider}`);
     return;
   }
-  if (!(await loginFlow(provider))) process.exit(1);
+  // finish(), not process.exit(): login runs network calls, and exiting on top of them aborts.
+  if (!(await loginFlow(provider))) finish(1);
 }
 
 // Providers the local backend can route to (each just needs an API key stored in the credential store).
 const CONNECTABLE = ["openrouter", "openai", "anthropic", "cloudflare", "groq", "google", "mistral", "deepseek", "xai", "together", "dashscope"];
+
+// Plans you sign into instead of pasting a key. Listed after CONNECTABLE in the /connect menu, and
+// they run the browser flow rather than prompting for a key — see subscriptionLogin.
+const SUBSCRIBABLE: Array<{ id: "anthropic" | "chatgpt"; label: string; provider: string }> = [
+  { id: "anthropic", label: "Claude Pro/Max  \x1b[2m(sign in — no API key)\x1b[0m", provider: "anthropic" },
+  { id: "chatgpt", label: "ChatGPT Plus/Pro  \x1b[2m(sign in — no API key)\x1b[0m", provider: "chatgpt" },
+];
 
 /** /connect — pick a provider (saves its API key; the local backend routes to it) or a backend
  *  endpoint (saves the URL/key so new sessions point there). Interactive menu, or /connect <name|url>. */
 async function connectCommand(rl: RL, arg?: string): Promise<void> {
   if (arg) {
     if (/^https?:\/\//.test(arg)) return connectBackend(rl, arg);
+    if (arg === "claude" || arg === "chatgpt" || arg === "codex") return void (await loginFlow(arg));
     if (CONNECTABLE.includes(arg)) return connectProvider(rl, arg);
     console.log(`unknown target "${arg}". Run /connect for the menu, or pass a provider name or a backend URL.`);
     return;
@@ -682,10 +705,16 @@ async function connectCommand(rl: RL, arg?: string): Promise<void> {
   // we don't claim "✓ connected" from them (would be a false positive).
   const backendProvs = await fetchProviders();
   const connected = (p: string): boolean => (backendProvs ? !!backendProvs.find((b) => b.name === p)?.configured : LOCAL_BACKEND && !!getCredential(p)?.key);
-  const items = [...CONNECTABLE.map((p) => `${p}${connected(p) ? "  \x1b[2m✓ connected\x1b[0m" : ""}`), "custom backend / Cloudflare Worker URL…"];
+  const items = [
+    ...SUBSCRIBABLE.map((s) => `${s.label}${connected(s.provider) ? "  \x1b[2m✓ connected\x1b[0m" : ""}`),
+    ...CONNECTABLE.map((p) => `${p}${connected(p) ? "  \x1b[2m✓ connected\x1b[0m" : ""}`),
+    "custom backend / Cloudflare Worker URL…",
+  ];
   const i = await select(rl, "Connect ada to:", items);
   if (i == null) return;
-  return i < CONNECTABLE.length ? connectProvider(rl, CONNECTABLE[i]!) : connectBackend(rl);
+  if (i < SUBSCRIBABLE.length) return void (await loginFlow(SUBSCRIBABLE[i]!.id));
+  const j = i - SUBSCRIBABLE.length;
+  return j < CONNECTABLE.length ? connectProvider(rl, CONNECTABLE[j]!) : connectBackend(rl);
 }
 
 async function connectProvider(rl: RL, p: string): Promise<void> {
@@ -1578,7 +1607,9 @@ async function main(): Promise<void> {
     });
     if (flags.strategy) agent.setStrategy(flags.strategy);
     const text = await agent.send(flags.print, { quiet: !!flags.json });
-    if (flags.json) console.log(JSON.stringify({ model: pm, text, usage: agent.usageReport() }));
+    // `context` lets a caller that drives ada in a loop (bench/arcagi3.mjs) see how full the window
+    // is and decide to start fresh, instead of estimating it from the usage string.
+    if (flags.json) console.log(JSON.stringify({ model: pm, text, usage: agent.usageReport(), context: agent.contextTokens() }));
     return;
   }
 
@@ -1996,10 +2027,35 @@ async function main(): Promise<void> {
   rl.close();
 }
 
+/**
+ * End the process with `code`, preferring a NATURAL exit.
+ *
+ * Calling process.exit() while undici is still tearing down a socket aborts on Windows —
+ *   Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c, line 76
+ * — which turned every successful `ada login` (the token exchange is a fetch, and the exit follows
+ * it immediately) into exit 127. Draining the connection pool first doesn't help; letting the loop
+ * empty on its own always does.
+ *
+ * The forced exit still has to exist, because node-pty (bash) and stdin can pin the loop open
+ * forever. So: set the code, let the loop drain if it can, and force it only if something is still
+ * holding on. The timer is unref'd — it won't keep the process alive by itself, but it DOES fire
+ * when something else is keeping the loop running, which is exactly the case it's there for.
+ */
+let finishing = false;
+function finish(code: number): void {
+  // First caller wins. A command that already recorded a failure (a failed login calls finish(1)
+  // and then returns normally) must not have it erased by main()'s success handler calling
+  // finish(0) afterwards — the old code couldn't hit this because process.exit() never returned.
+  if (finishing) return;
+  finishing = true;
+  process.exitCode = code;
+  setTimeout(() => process.exit(code), 500).unref();
+}
+
 main().then(
-  () => process.exit(0), // explicit exit: node-pty (bash) and stdin can keep the loop alive otherwise
+  () => finish(0),
   (e) => {
     console.error(e instanceof Error ? e.message : e);
-    process.exit(1);
+    finish(1);
   },
 );
