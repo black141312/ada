@@ -11,7 +11,7 @@ import OpenAI from "openai";
 import { Agent, type AgentEvent, type ApprovalDecision, type OnApprove } from "./agent.ts";
 import { ApprovalRegistry, QuestionRegistry, newId, sseFrame } from "./agent-server.ts";
 import { expandPrompt, loadPrompts } from "./prompts.ts";
-import { Session, list, resolveTranscript, type SessionMeta } from "./session.ts";
+import { Session, list, removeStore, resolveTranscript, stores, type SessionMeta } from "./session.ts";
 import { deleteCredential, getCredential, listCredentials, setCredential } from "../server/credentials.ts";
 import { deviceGrant, deviceLogin, oauthConfig } from "../server/oauth.ts";
 import { subscriptionFor, subscriptionLogin } from "../server/providers/subscription-oauth.ts";
@@ -830,7 +830,7 @@ async function printBanner(): Promise<void> {
 }
 
 /** Subcommands that don't touch the backend — no point spawning a server for these. */
-const NO_BACKEND = new Set(["mcp", "skill", "worktree", "wt", "catalog", "share", "memory"]);
+const NO_BACKEND = new Set(["mcp", "skill", "worktree", "wt", "catalog", "share", "memory", "sessions"]);
 
 async function main(): Promise<void> {
   const sub = process.argv[2];
@@ -869,6 +869,37 @@ async function main(): Promise<void> {
   }
   if (sub === "update") {
     selfUpdate();
+    return;
+  }
+  if (sub === "sessions") {
+    if (process.argv[3] !== "prune") {
+      console.error("usage: ada sessions prune [--yes]");
+      process.exit(1);
+    }
+    const all = stores();
+    const gone = all.filter((s) => s.missing);
+    const unknown = all.filter((s) => !s.project);
+    const kept = all.length - gone.length - unknown.length;
+    if (!gone.length) {
+      console.log(`Nothing to prune — ${kept} store${kept === 1 ? "" : "s"} in use.`);
+    }
+    for (const s of gone) {
+      console.log(`  ${s.sessions} session${s.sessions === 1 ? "" : "s"}  \x1b[2m${s.project}\x1b[0m`);
+    }
+    // A folder on an unplugged drive or a disconnected share reads exactly like a deleted one, and
+    // these are whole conversations. So this never deletes on its own — it shows, and waits.
+    if (gone.length && !process.argv.includes("--yes")) {
+      const total = gone.reduce((n, s) => n + s.sessions, 0);
+      console.log(`\n${total} session${total === 1 ? "" : "s"} from ${gone.length} folder${gone.length === 1 ? "" : "s"} that no longer exist.`);
+      console.log("Check the paths above are really gone (an unplugged drive looks the same), then: ada sessions prune --yes");
+    } else if (gone.length) {
+      for (const s of gone) removeStore(s.dir);
+      console.log(`\nPruned ${gone.length} store${gone.length === 1 ? "" : "s"}.`);
+    }
+    if (unknown.length) {
+      const n = unknown.length;
+      console.log(`\n\x1b[2m${n} store${n === 1 ? " predates" : "s predate"} this and cannot be attributed — left alone. Each gets a note the next time its project runs ada.\x1b[0m`);
+    }
     return;
   }
   if (sub === "memory") {
