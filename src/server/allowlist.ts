@@ -7,13 +7,13 @@
 //   anything anywhere                 -> the union of both is the allow-list
 import type { Pool } from "pg";
 import type Database from "better-sqlite3";
-import { authDatabase, usingPostgres } from "./auth.js";
+import { authDatabase, usingPostgres } from "./db.js";
 import { allowedUsers } from "./identity.js";
 
 type Row = { id: string; added_by: string | null; added_at: string };
 
-const pg = () => authDatabase as Pool;
-const lite = () => authDatabase as Database.Database;
+const pg = () => authDatabase() as Pool;
+const lite = () => authDatabase() as Database.Database;
 
 let ready: Promise<void> | null = null;
 function ensure(): Promise<void> {

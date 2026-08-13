@@ -10,7 +10,7 @@
 // so the number enforced is the number recorded — no conversion to disagree about later.
 import type { Pool } from "pg";
 import type Database from "better-sqlite3";
-import { authDatabase, usingPostgres } from "./auth.js";
+import { authDatabase, usingPostgres } from "./db.js";
 import { adminUsers } from "./identity.js";
 import { billableUsageSince } from "./usage.js";
 
@@ -47,8 +47,8 @@ export interface UserPlan {
   maxTokens: number | null;
 }
 
-const pg = () => authDatabase as Pool;
-const lite = () => authDatabase as Database.Database;
+const pg = () => authDatabase() as Pool;
+const lite = () => authDatabase() as Database.Database;
 
 let ready: Promise<void> | null = null;
 function ensure(): Promise<void> {
