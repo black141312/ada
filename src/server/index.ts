@@ -19,10 +19,22 @@ import { ANALYTICS_PAGE } from "./analytics-page.ts";
 
 /** The anonymous free-tier pseudo-identity — no account, so nothing to meter or bill. */
 const isAnonymous = (who: Identity): boolean => who.user === "anon" && String(who.role) === "free";
-import { auth, betterAuthEnabled, verifyBetterAuth } from "./auth.ts";
-import { toNodeHandler } from "better-auth/node";
+// ./auth.ts is imported ON DEMAND, never at startup. It builds Better Auth eagerly, which opens a
+// database — and without DATABASE_URL that means better-sqlite3, which the DESKTOP BUNDLE
+// deliberately ships without (ada-app's extraResources filter drops it). A static import here made
+// the packaged app's local gateway die on "Cannot find module 'better-sqlite3'" the instant it
+// started, with the app silently falling back to the hosted backend. Better Auth is off unless
+// BETTER_AUTH_ENABLED is set, so on that path nothing here needs a database at all.
+const betterAuthEnabled = (): boolean => process.env.BETTER_AUTH_ENABLED === "1" || process.env.BETTER_AUTH_ENABLED === "true";
 
-const betterAuthHandler = toNodeHandler(auth);
+let authHandler: ((req: IncomingMessage, res: ServerResponse) => unknown) | null = null;
+async function betterAuthHandler(req: IncomingMessage, res: ServerResponse): Promise<unknown> {
+  if (!authHandler) {
+    const [{ auth }, { toNodeHandler }] = await Promise.all([import("./auth.ts"), import("better-auth/node")]);
+    authHandler = toNodeHandler(auth);
+  }
+  return authHandler(req, res);
+}
 
 // Device sign-in page: Continue with GitHub → (return signed in) → auto-approve the code.
 const DEVICE_PAGE = `<!doctype html><meta charset="utf-8"><title>Ada — sign in</title>
@@ -108,7 +120,7 @@ async function identify(req: IncomingMessage): Promise<Identity | "corrupt" | nu
     // account and bypass a backend locked by seats / admin key / ADA_CLIENT_KEYS / allowlist / OIDC.
     // Accounts are a valid credential only when Better Auth is the intended gate. Allowlist applies too.
     if (betterAuthEnabled()) {
-      const acct = await verifyBetterAuth(token);
+      const acct = await (await import("./auth.ts")).verifyBetterAuth(token);
       if (acct) return { user: acct, role: "dev" };
     }
   }
