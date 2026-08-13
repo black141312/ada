@@ -6,12 +6,17 @@
 // filed under an id that is kept IN the project and therefore travels with it — so the folder can
 // move and the conversations still find their way home.
 
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
 const LEGACY = resolve(process.cwd(), ".ada", "sessions");
+
+/** Where every project's store lives. */
+function storeRoot(): string {
+  return join(homedir(), ".ada", "sessions");
+}
 
 /** This project's identity, stable across renames because it lives inside the project. */
 function projectId(): string {
@@ -40,11 +45,80 @@ let dirCache: string | null = null;
 /** The store for this project, created and migrated on first use. */
 function dir(): string {
   if (dirCache) return dirCache;
-  const d = join(homedir(), ".ada", "sessions", projectId());
+  const d = join(storeRoot(), projectId());
   mkdirSync(d, { recursive: true, mode: 0o700 }); // transcripts can contain secrets from tool output
+  stampProject(d);
   adoptLegacy(d);
   dirCache = d;
   return d;
+}
+
+/**
+ * Note which folder this store belongs to. Without it a store is an opaque uuid directory that
+ * nothing can ever attribute or clean up. Rewritten whenever the folder has moved, so a renamed
+ * project keeps its own breadcrumb current instead of looking abandoned to the next sweep.
+ */
+function stampProject(d: string): void {
+  const f = join(d, "project");
+  const here = resolve(process.cwd());
+  try {
+    if (readFileSync(f, "utf8").trim() === here) return;
+  } catch {
+    /* not written yet, or unreadable — write it below */
+  }
+  try {
+    writeFileSync(f, `${here}\n`, { mode: 0o600 });
+  } catch {
+    /* the store works fine without it; only a sweep would be left guessing */
+  }
+}
+
+export interface StoreInfo {
+  dir: string;
+  /** The folder this store belongs to, or null if it predates the note and cannot be attributed. */
+  project: string | null;
+  /** True only when we know the project and it is not there. Unknown is never missing. */
+  missing: boolean;
+  sessions: number;
+}
+
+/** Every store on this machine, so orphans can be found. Ordered oldest-touched first. */
+export function stores(): StoreInfo[] {
+  const root = storeRoot();
+  let names: string[];
+  try {
+    names = readdirSync(root);
+  } catch {
+    return [];
+  }
+  const out: StoreInfo[] = [];
+  for (const n of names) {
+    const d = join(root, n);
+    let files: string[];
+    try {
+      if (!statSync(d).isDirectory()) continue;
+      files = readdirSync(d);
+    } catch {
+      continue;
+    }
+    let project: string | null = null;
+    try {
+      project = readFileSync(join(d, "project"), "utf8").trim() || null;
+    } catch {
+      /* no breadcrumb — an older store, or one we could not write */
+    }
+    out.push({ dir: d, project, missing: !!project && !existsSync(project), sessions: files.filter((f) => f.endsWith(".jsonl")).length });
+  }
+  return out.sort((a, b) => statSync(a.dir).mtimeMs - statSync(b.dir).mtimeMs);
+}
+
+/** Delete one store, transcripts and all. Refuses anything that is not a store. */
+export function removeStore(d: string): void {
+  const root = storeRoot();
+  if (resolve(d) === resolve(root) || dirname(resolve(d)) !== resolve(root)) {
+    throw new Error(`refusing to delete ${d}: not a session store`);
+  }
+  rmSync(d, { recursive: true, force: true });
 }
 
 /** Move any transcripts left in the project's own folder into the store, once. */
