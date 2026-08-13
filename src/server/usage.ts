@@ -11,7 +11,7 @@
 // time from the model id.
 import type { Pool } from "pg";
 import type Database from "better-sqlite3";
-import { authDatabase, usingPostgres } from "./auth.js";
+import { authDatabase, usingPostgres } from "./db.js";
 
 export interface UsageEvent {
   ts: number;
@@ -22,8 +22,8 @@ export interface UsageEvent {
   completionTokens: number;
 }
 
-const pg = () => authDatabase as Pool;
-const lite = () => authDatabase as Database.Database;
+const pg = () => authDatabase() as Pool;
+const lite = () => authDatabase() as Database.Database;
 
 let ready: Promise<void> | null = null;
 function ensure(): Promise<void> {

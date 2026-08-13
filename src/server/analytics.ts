@@ -10,14 +10,14 @@
 // so they are testable without a database.
 import type { Pool } from "pg";
 import type Database from "better-sqlite3";
-import { authDatabase, usingPostgres } from "./auth.js";
+import { authDatabase, usingPostgres } from "./db.js";
 import { PLANS, type PlanName } from "./plans.js";
 import { kelviqEnabled, listKelviqSubscriptions } from "./kelviq.js";
 
 const DAY_MS = 86_400_000;
 
-const pg = () => authDatabase as Pool;
-const lite = () => authDatabase as Database.Database;
+const pg = () => authDatabase() as Pool;
+const lite = () => authDatabase() as Database.Database;
 
 /** Run one SELECT against whichever database is configured. `?` placeholders; translated for pg. */
 async function all<T>(sql: string, params: unknown[]): Promise<T[]> {
