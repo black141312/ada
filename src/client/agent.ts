@@ -613,11 +613,17 @@ async function safeRun(tool: Tool, args: Record<string, unknown>, ctx?: ToolCtx)
   }
 }
 
-function isTransient(e: unknown): boolean {
-  const status = (e as { status?: number }).status;
+// The SDK collapses every network-layer failure into APIConnectionError, whose whole message is
+// "Connection error." — no status, no cause, nothing the patterns below used to match. So the one
+// failure most worth retrying, a call that never reached the provider, was the one we gave up on
+// instantly. Same for "Request timed out." (APIConnectionTimeoutError): "timed out", not "timeout".
+export function isTransient(e: unknown): boolean {
+  const status = (e as { status?: number } | undefined)?.status;
   if (status && [408, 409, 429, 500, 502, 503, 504, 529].includes(status)) return true;
   const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
-  return /timeout|econn|temporarily|overloaded|rate.?limit|fetch failed|socket hang/.test(msg);
+  return /timeout|timed out|econn|enotfound|eai_again|temporarily|overloaded|rate.?limit|connection error|fetch failed|terminated|socket hang/.test(
+    msg,
+  );
 }
 
 /** Run `fn`, retrying transient failures (429/5xx/network) with exponential backoff. */

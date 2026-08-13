@@ -3,7 +3,7 @@
 import { createInterface } from "node:readline/promises";
 import { spawnSync } from "node:child_process";
 import { basename, dirname, join, resolve } from "node:path";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { stdin, stdout } from "node:process";
@@ -11,7 +11,7 @@ import OpenAI from "openai";
 import { Agent, type AgentEvent, type ApprovalDecision, type OnApprove } from "./agent.ts";
 import { ApprovalRegistry, QuestionRegistry, newId, sseFrame } from "./agent-server.ts";
 import { expandPrompt, loadPrompts } from "./prompts.ts";
-import { Session, list, type SessionMeta } from "./session.ts";
+import { Session, list, resolveTranscript, type SessionMeta } from "./session.ts";
 import { deleteCredential, getCredential, listCredentials, setCredential } from "../server/credentials.ts";
 import { deviceGrant, deviceLogin, oauthConfig } from "../server/oauth.ts";
 import { subscriptionFor, subscriptionLogin } from "../server/providers/subscription-oauth.ts";
@@ -1243,12 +1243,10 @@ async function main(): Promise<void> {
             // the `file` values from GET /v1/sessions (a restarted `ada serve` has no memory of which
             // in-memory sessionIds existed before, so the IDE re-resolves by transcript file instead).
             if (j.resume === "latest") resume = list()[0]?.file;
-            // `list()` only scans THIS cwd's .ada/sessions. Requiring the file to appear there meant
-            // a transcript that plainly exists on disk was refused whenever serve came back on a
-            // different cwd than the one that wrote it (a pruned worktree, the project opened by
-            // another path) — and refused silently, so the chat simply reopened with no memory.
-            // The path is enough: if it is a transcript and it is there, it can be resumed.
-            else if (j.resume?.endsWith(".jsonl") && existsSync(j.resume)) resume = j.resume;
+            // Anything that still names a real transcript. Requiring the file to appear in this
+            // cwd's scan meant a transcript plainly sitting on disk was refused whenever serve came
+            // back somewhere else — and refused silently, so the chat just reopened with no memory.
+            else if (j.resume) resume = resolveTranscript(j.resume) ?? undefined;
           } catch {
             /* ignore, use default model + no resume */
           }
