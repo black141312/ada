@@ -3,7 +3,7 @@
 import { createInterface } from "node:readline/promises";
 import { spawnSync } from "node:child_process";
 import { basename, dirname, join, resolve } from "node:path";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { stdin, stdout } from "node:process";
@@ -1243,7 +1243,12 @@ async function main(): Promise<void> {
             // the `file` values from GET /v1/sessions (a restarted `ada serve` has no memory of which
             // in-memory sessionIds existed before, so the IDE re-resolves by transcript file instead).
             if (j.resume === "latest") resume = list()[0]?.file;
-            else if (j.resume && list().some((s) => s.file === j.resume)) resume = j.resume;
+            // `list()` only scans THIS cwd's .ada/sessions. Requiring the file to appear there meant
+            // a transcript that plainly exists on disk was refused whenever serve came back on a
+            // different cwd than the one that wrote it (a pruned worktree, the project opened by
+            // another path) — and refused silently, so the chat simply reopened with no memory.
+            // The path is enough: if it is a transcript and it is there, it can be resumed.
+            else if (j.resume?.endsWith(".jsonl") && existsSync(j.resume)) resume = j.resume;
           } catch {
             /* ignore, use default model + no resume */
           }
@@ -1570,7 +1575,10 @@ async function main(): Promise<void> {
 
   // Headless print mode: run one prompt non-interactively and exit.
   if (flags.print !== undefined) {
-    const trusted = isTrusted(process.cwd());
+    // ADA_TRUST_CWD=1: same contract as `serve` — the caller vouches for this cwd. A harness that
+    // creates a working directory and then drives ada inside it can't add it to
+    // the interactive trustedDirs list, so without this its AGENTS.md was silently never loaded.
+    const trusted = process.env.ADA_TRUST_CWD === "1" || isTrusted(process.cwd());
     const settings = loadSettings(trusted);
     await applyOrgPolicy(); // org tool rules bind headless runs too (CI is the classic bypass path)
     let pm = flags.model ?? process.env.ADA_MODEL ?? settings.model ?? scoped[0] ?? "";
@@ -1595,10 +1603,25 @@ async function main(): Promise<void> {
     if (process.env.ADA_NO_SUBAGENTS !== "1") {
       registerSubagentTools({ client, model: pm, onApprove: async (): Promise<ApprovalDecision> => "yes", autoApprove: true, project: trusted, compactAt: settings.compactAt });
     }
+    // `--continue` here is what lets a caller drive ada in a loop and keep ONE
+    // conversation across many `-p` invocations — and, by dropping the flag, deliberately start a
+    // fresh one. Without this, every headless call began from zero and both halves of that mechanic
+    // were silently no-ops. Sessions live under the cwd's .ada/sessions, so each run dir is its own
+    // conversation with no extra bookkeeping.
+    let printSession = Session.create();
+    let printHistory: Msg[] | undefined;
+    if (flags.cont) {
+      const prev = Session.latest();
+      if (prev) {
+        printSession = prev;
+        printHistory = prev.load() as unknown as Msg[];
+      }
+    }
     const agent = new Agent({
       client,
       model: pm,
-      session: Session.create(),
+      session: printSession,
+      history: printHistory,
       onApprove: async (): Promise<ApprovalDecision> => "yes",
       autoApprove: true,
       reasoning: flags.reasoning ?? settings.reasoning,
@@ -1607,7 +1630,7 @@ async function main(): Promise<void> {
     });
     if (flags.strategy) agent.setStrategy(flags.strategy);
     const text = await agent.send(flags.print, { quiet: !!flags.json });
-    // `context` lets a caller that drives ada in a loop (bench/arcagi3.mjs) see how full the window
+    // `context` lets a caller that drives ada in a loop see how full the window
     // is and decide to start fresh, instead of estimating it from the usage string.
     if (flags.json) console.log(JSON.stringify({ model: pm, text, usage: agent.usageReport(), context: agent.contextTokens() }));
     return;
