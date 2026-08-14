@@ -1132,6 +1132,22 @@ async function main(): Promise<void> {
 
     const port = Number(process.env.ADA_HTTP_PORT) || 8788;
 
+    // Orphan watchdog. The Ada app spares this serve on quit when it still has running background
+    // jobs (so a long job survives the app closing) and hands us its pid; once that parent is gone
+    // AND no job is running, exit rather than linger as a leaked process. The finished results are
+    // already in .ada/jobs.json, where the next serve's merge picks them up.
+    const parentPid = Number(process.env.ADA_PARENT_PID) || 0;
+    if (parentPid) {
+      const watchdog = setInterval(() => {
+        try {
+          process.kill(parentPid, 0); // throws when the parent is gone
+        } catch {
+          if (!listJobs().some((j) => j.status === "running")) process.exit(0);
+        }
+      }, 30_000);
+      watchdog.unref();
+    }
+
     // Interactive sessions — for driving ada like an IDE agent panel (live text/tool-call events,
     // and edits pause for YOUR approval UI instead of auto-running). See docs/integrations.md.
     interface AgentSession {
