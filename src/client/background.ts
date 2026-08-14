@@ -14,6 +14,7 @@ import { Agent, type OnApprove, subagentModel } from "./agent.ts";
 import { Session } from "./session.ts";
 import { ensureAdaDir } from "./settings.ts";
 import { registerTool } from "./tools.ts";
+import { notify } from "./live.ts";
 
 export interface Job {
   id: string;
@@ -191,6 +192,10 @@ export function startJob(task: string, run: (signal?: AbortSignal) => Promise<st
     job.result = result;
     job.ended = Date.now();
     save();
+    // Close the loop: the agent that started this job hears the result instead of it sitting
+    // unread in /jobs. Delivered into the owning chat's steer queue mid-turn, or parked for its
+    // next turn. Result clipped — the notification is a summary, the full text stays on the job.
+    notify(job.sessionId, `[background job ${id} ${status}: ${job.task.slice(0, 80)}]\n${result.slice(0, 1500)}`);
   };
   run(ac.signal).then(
     (r) => settle("done", r),

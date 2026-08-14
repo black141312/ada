@@ -29,6 +29,17 @@ export interface ToolResult {
   images?: string[]; // data URLs shown to the model alongside the text (e.g. a `look` screenshot)
 }
 
+/** The slice of Agent the self-awareness tools (live.ts) need. Defined here, not in agent.ts, so
+ *  tool modules can depend on it without importing the Agent class and creating a cycle; Agent
+ *  satisfies it structurally. */
+export interface AgentHandle {
+  contextTokens(): number;
+  compactLimit(): number;
+  compactNow(): Promise<string>;
+  usageRaw(): { model: string; promptTokens: number; completionTokens: number; cost: number | null };
+  lastText(): string;
+}
+
 /** What the calling agent knows about itself, handed to a tool at call time.
  *
  * An argument rather than a module-level "current session", deliberately: several chats stream at
@@ -36,6 +47,10 @@ export interface ToolResult {
  * because most tools neither need nor read it, and an agent outside a serve session has no id. */
 export interface ToolCtx {
   sessionId?: string;
+  /** The live-run registry id of the turn making this call (see live.ts). */
+  runId?: string;
+  /** The calling agent itself, for tools that introspect it (context_status, goal, compact_now). */
+  agent?: AgentHandle;
 }
 
 export interface Tool {

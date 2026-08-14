@@ -20,6 +20,7 @@ export interface Settings {
   reasoning?: "low" | "medium" | "high";
   autoApprove?: boolean;
   compactAt?: number;
+  verify?: string; // command run after a turn that edited files (e.g. "npm run typecheck"); failures are fed back to the model. Env ADA_VERIFY overrides. Unset = LSP diagnostics on the edited files.
   trustedDirs?: string[];
   keybindings?: { interrupt?: string };
   protectedPaths?: string[];
