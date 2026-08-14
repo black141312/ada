@@ -1210,6 +1210,129 @@ async function main(): Promise<void> {
     assert.equal(listJobs().find((j) => j.id === nested)?.sessionId, "sess-parent", "a job started with an inherited session id records it");
   }
 
+  // --- self-awareness tools (live.ts): registry, messaging, goal, context, notes ---------------
+  {
+    const { registerRun, endRun, liveRuns } = await import("./client/live.ts");
+    // A stub that satisfies AgentHandle — the tools only read these five methods.
+    const stubAgent = (model = "stub") => ({
+      contextTokens: () => 1234,
+      compactLimit: () => 10_000,
+      compactNow: async () => "compacted (stub)",
+      usageRaw: () => ({ model, promptTokens: 500, completionTokens: 100, cost: null }),
+      lastText: () => "stub said this",
+    });
+
+    const steerA: string[] = [];
+    const steerB: string[] = [];
+    const a = registerRun("task A: refactor the parser", steerA, stubAgent());
+    const b = registerRun("task B: write the tests", steerB, stubAgent());
+    assert.equal(liveRuns().length, 2, "both runs visible");
+
+    let r = await tool("list_agents").run({}, { runId: a });
+    assert.ok(r.output.includes("(you)") && r.output.includes("task B"), "list marks self and shows others");
+
+    r = await tool("peek_agent").run({ id: b });
+    assert.ok(r.output.includes("stub said this"), "peek shows the target's last text");
+    r = await tool("peek_agent").run({ id: "nope" });
+    assert.ok(r.isError, "peeking a dead run errors");
+
+    r = await tool("send_agent_message").run({ id: b, message: "focus on edge cases" }, { runId: a });
+    assert.ok(!r.isError, r.output);
+    assert.ok(steerB[0]!.includes("focus on edge cases") && steerB[0]!.includes(a), "message lands in the target's steer queue, attributed");
+    r = await tool("send_agent_message").run({ id: a, message: "hi me" }, { runId: a });
+    assert.ok(r.isError, "self-messaging is rejected");
+
+    // goal: set → get reports spend since set → done closes
+    const agentForGoal = stubAgent();
+    r = await tool("goal").run({ action: "set", objective: "ship the feature", token_budget: 9000 }, { agent: agentForGoal });
+    assert.ok(r.output.includes("ship the feature"), r.output);
+    r = await tool("goal").run({ action: "get" }, { agent: agentForGoal });
+    assert.ok(r.output.includes("active") && r.output.includes("9000"), "goal get reports status and budget");
+    r = await tool("goal").run({ action: "done" }, { agent: agentForGoal });
+    assert.ok(r.output.includes("closed"), r.output);
+
+    r = await tool("context_status").run({}, { agent: stubAgent() });
+    assert.ok(r.output.includes("1234") && r.output.includes("12%"), "context status reports tokens and percent");
+    r = await tool("compact_now").run({}, { agent: stubAgent() });
+    assert.equal(r.output, "compacted (stub)");
+
+    // heartbeat: create pushes into own steer on a timer; endRun clears it
+    r = await tool("heartbeat").run({ action: "create", instruction: "check the build", every_seconds: 1 }, { runId: a });
+    assert.ok(!r.isError, r.output); // min interval clamps to 15s — creation is what's under test
+    r = await tool("heartbeat").run({ action: "list" }, { runId: a });
+    assert.ok(r.output.includes("check the build"), "heartbeat listed");
+    r = await tool("heartbeat").run({ action: "cancel", id: 1 }, { runId: a });
+    assert.ok(r.output.includes("cancelled"), r.output);
+
+    endRun(a);
+    endRun(b);
+    assert.equal(liveRuns().length, 0, "endRun clears the registry");
+
+    // refine_note appends to .ada/notes.md in cwd — run it from a temp cwd so the repo stays clean
+    const notesDir = join(tmpdir(), `ada-notes-${Date.now()}`);
+    mkdirSync(notesDir, { recursive: true });
+    const oldCwd = process.cwd();
+    process.chdir(notesDir);
+    try {
+      const { readNotes } = await import("./client/live.ts");
+      r = await tool("refine_note").run({ note: "always run tests from repo root" });
+      assert.ok(!r.isError, r.output);
+      assert.ok(readNotes().includes("always run tests from repo root"), "note readable back for the system prompt");
+    } finally {
+      process.chdir(oldCwd);
+      rmSync(notesDir, { recursive: true, force: true });
+    }
+  }
+
+  // --- job notifications reach the owning agent (live.notify) ----------------------------------
+  {
+    const { registerRun, endRun, notify } = await import("./client/live.ts");
+    const stub = { contextTokens: () => 0, compactLimit: () => 1, compactNow: async () => "", usageRaw: () => ({ model: "stub", promptTokens: 0, completionTokens: 0, cost: null }), lastText: () => "" };
+
+    // Live delivery: a run in flight for the session gets the message in its steer queue.
+    const steer: string[] = [];
+    const run = registerRun("chat turn", steer, stub, "sess-live");
+    notify("sess-live", "[background job j9 done] result text");
+    assert.ok(steer.some((s) => s.includes("j9")), "notify lands in the live run's steer queue");
+    endRun(run);
+
+    // Parked delivery: no run in flight — the message waits and drains into the session's NEXT turn.
+    notify("sess-idle", "[background job j10 done] later result");
+    const steer2: string[] = [];
+    const run2 = registerRun("next turn", steer2, stub, "sess-idle");
+    assert.ok(steer2.some((s) => s.includes("j10")), "a parked notification drains into the next turn");
+    endRun(run2);
+
+    // A different session's turn must NOT receive it.
+    notify("sess-a", "[job for a]");
+    const steerB: string[] = [];
+    const runB = registerRun("b's turn", steerB, stub, "sess-b");
+    assert.equal(steerB.length, 0, "notifications never cross sessions");
+    endRun(runB);
+  }
+
+  // --- post-edit verification (verifyEdits + auto-detection) -----------------------------------
+  {
+    const { verifyEdits, detectVerifyCommand } = await import("./client/agent.ts");
+
+    // Auto-detection: npm script wins, then other ecosystems, then nothing.
+    const vDir = join(tmpdir(), `ada-verify-${Date.now()}`);
+    mkdirSync(vDir, { recursive: true });
+    writeFileSync(join(vDir, "package.json"), JSON.stringify({ scripts: { typecheck: "tsc --noEmit" } }));
+    assert.equal(detectVerifyCommand(vDir), "npm run typecheck", "package.json typecheck script is detected");
+    writeFileSync(join(vDir, "package.json"), "{}");
+    writeFileSync(join(vDir, "Cargo.toml"), "[package]");
+    assert.equal(detectVerifyCommand(vDir), "cargo check --quiet", "cargo project detected when npm has no scripts");
+    rmSync(vDir, { recursive: true, force: true });
+    assert.equal(detectVerifyCommand(join(tmpdir(), "ada-verify-none")), null, "no project markers → nothing to run");
+    const fail = await verifyEdits([], `node -e "console.error('boom');process.exit(1)"`);
+    assert.ok(fail && fail.includes("boom") && fail.includes("exited 1"), "failing verify command reports its output");
+    const ok = await verifyEdits([], `node -e "process.exit(0)"`);
+    assert.equal(ok, null, "clean verify command reports nothing");
+    const none = await verifyEdits([], undefined);
+    assert.equal(none, null, "no command and no LSP-checkable paths → silently clean");
+  }
+
   console.log("selfcheck OK");
   process.exit(0); // a spawned stub MCP subprocess can hold stdin open — exit cleanly
 }
