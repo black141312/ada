@@ -232,7 +232,12 @@ function thinkingSpinner(): () => void {
     if (i === 0 && Math.random() < 0.5) verb = THINK_VERBS[Math.floor(Math.random() * THINK_VERBS.length)]!;
     draw();
   }, 90);
+  // Idempotent: the second call must NOT re-issue "erase line" — by then real output is on that
+  // line, and clearing it would eat the first line of the reply.
+  let stopped = false;
   return () => {
+    if (stopped) return;
+    stopped = true;
     clearInterval(t);
     stdout.write("\r\x1b[2K");
   };
@@ -2065,7 +2070,7 @@ async function main(): Promise<void> {
       process.stdout.write("\x1b[38;5;214m◆\x1b[0m  "); // reply streams inline right after the bullet (no "ada" label)
     };
     try {
-      await agent.send(toSend, { signal: abort.signal, steer, images: imgs, onReplyStart: openReply });
+      await agent.send(toSend, { signal: abort.signal, steer, images: imgs, onReplyStart: openReply, onReasoningStart: stopSpin });
       if (!abort.signal.aborted && Date.now() - turnStart > 8000) notify("ada", "task complete");
     } catch (e) {
       track("error", { message: e instanceof Error ? e.message : String(e) });

@@ -69,8 +69,55 @@ type SendCtrl = {
   delegated?: boolean;
   images?: string[];
   onReplyStart?: () => void;
+  /** First thinking token of a turn. Separate from `onReplyStart` because the answer has not
+   *  started yet — the REPL clears its spinner here but holds the ◆ bullet back for the answer. */
+  onReasoningStart?: () => void;
   onEvent?: (e: AgentEvent) => void;
 };
+/**
+ * Streams the model's thinking to the terminal the way Claude Code shows it: a dim, indented block
+ * under a `✻ Thinking…` header, closed the moment the answer starts so the two never interleave.
+ *
+ * Until now reasoning deltas were only ever forwarded to `onEvent`, so the plain REPL — the way
+ * most of ada is actually used — dropped them on the floor: `/reasoning high` cost tokens and
+ * showed a spinner. A caller with its own UI still gets events and prints nothing here.
+ */
+function thinkingPrinter(ctrl: SendCtrl | undefined): { push: (delta: string) => void; end: () => void } {
+  let open = false;
+  let atLineStart = true;
+  return {
+    push(delta: string): void {
+      if (ctrl?.onEvent) {
+        ctrl.onEvent({ type: "reasoning", delta });
+        return;
+      }
+      if (ctrl?.quiet || !delta) return;
+      if (!open) {
+        open = true;
+        ctrl?.onReasoningStart?.(); // clear the REPL spinner; the ◆ bullet waits for the answer
+        process.stdout.write("\n\x1b[2m✻ Thinking…\x1b[0m\n\n");
+        atLineStart = true;
+      }
+      // Indent continuation lines to match, so a multi-paragraph thought stays visibly a block.
+      let out = "";
+      for (const ch of delta) {
+        if (atLineStart && ch !== "\n") {
+          out += "  ";
+          atLineStart = false;
+        }
+        out += ch;
+        if (ch === "\n") atLineStart = true;
+      }
+      process.stdout.write(`\x1b[2;3m${out}\x1b[0m`);
+    },
+    end(): void {
+      if (!open) return;
+      open = false;
+      process.stdout.write("\n\n");
+    },
+  };
+}
+
 type ToolCall = { id: string; name: string; args: string };
 type StepResult = { content: string; toolCalls: ToolCall[] };
 type ToolDef = OpenAI.Chat.Completions.ChatCompletionTool;
@@ -1040,6 +1087,7 @@ export class Agent {
 
       let content = "";
       const md = new MarkdownStreamer();
+      const think = thinkingPrinter(ctrl);
       const calls: Array<{ id: string; name: string; args: string }> = [];
       // If the reply opens like a leaked tool call (raw JSON / <tool_call> / fence), hold the
       // text back instead of streaming it — we may recover it as a real call after the stream.
@@ -1070,10 +1118,11 @@ export class Agent {
           // and DeepSeek send `reasoning`, others `reasoning_content`. Never added to `content` —
           // it is not the answer, and folding it in would put the model's scratch work in the
           // transcript and in every later request.
-          const think = (delta as { reasoning?: string; reasoning_content?: string } | undefined);
-          const thinkDelta = think?.reasoning ?? think?.reasoning_content;
-          if (thinkDelta) ctrl?.onEvent?.({ type: "reasoning", delta: thinkDelta });
+          const raw = (delta as { reasoning?: string; reasoning_content?: string } | undefined);
+          const thinkDelta = raw?.reasoning ?? raw?.reasoning_content;
+          if (thinkDelta) think.push(thinkDelta);
           if (delta?.content) {
+            think.end(); // the answer starts here — close the thinking block before it
             content += delta.content;
             if (!sniffed && content.trim()) {
               sniffed = true;
@@ -1084,6 +1133,7 @@ export class Agent {
           for (const tc of delta?.tool_calls ?? []) applyToolCallDelta(calls, tc);
         }
       } catch (e) {
+        think.end();
         say(md.end());
         if (signal?.aborted) {
           interrupted();
@@ -1091,6 +1141,7 @@ export class Agent {
         }
         throw explainApiError(e);
       }
+      think.end(); // a turn that only thought, then called a tool, still has a block to close
       if (!bufferMode) say(md.end());
 
       let toolCalls = calls.filter((c): c is { id: string; name: string; args: string } => !!c);
