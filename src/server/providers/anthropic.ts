@@ -22,6 +22,12 @@ const SUBSCRIPTION_BETAS = ["claude-code-20250219", "oauth-2025-04-20"];
  *  traffic, and Anthropic rejects the request without it. */
 const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 
+/** OpenAI's `reasoning_effort` → Anthropic's thinking budget. Anthropic's floor is 1024 tokens.
+ *  Without this the effort the user picked with `/reasoning` was simply dropped for every Claude
+ *  model: the field has no meaning in the Messages API, so Claude never thought and the client
+ *  had nothing to print. */
+const THINK_BUDGET: Record<string, number> = { low: 2048, medium: 8192, high: 16384 };
+
 // Keyed by token: a refreshed subscription token must not keep using a client built on the old one.
 let cached: { token: string; client: AnthropicSDK } | null = null;
 async function getClient(): Promise<{ client: AnthropicSDK; subscription: boolean }> {
@@ -49,6 +55,35 @@ type OAIMessage = {
 };
 
 type Block = Record<string, unknown>;
+
+/**
+ * Thinking blocks, keyed by the first tool_use id of the turn that produced them.
+ *
+ * Anthropic's contract for extended thinking is that the assistant turn which called a tool is
+ * replayed with the thinking blocks it produced still on the front, signature and all. The OpenAI
+ * wire format the client speaks has nowhere to carry one, so the adapter remembers them here and
+ * re-attaches them on the way back out.
+ *
+ * Measured, not assumed: a Claude turn whose tool_use arrives with no thinking block in front of it
+ * is currently ACCEPTED rather than rejected — so this is about the model keeping its own reasoning
+ * across a tool call, not about dodging a 400. A signature that gets replayed *wrong* is a 400,
+ * which is why the blocks are stored verbatim rather than reconstructed.
+ *
+ * ponytail: an in-process Map, capped. A gateway restart mid-conversation just loses it; the turn
+ * goes out without the block and the retry in `chat` covers a provider that turns strict. Move it
+ * beside the transcript if the gateway ever goes multi-process.
+ */
+const thinkingByCall = new Map<string, Block[]>();
+const THINKING_CACHE_MAX = 64;
+
+export function rememberThinking(callId: string, blocks: Block[]): void {
+  if (!callId || !blocks.length) return;
+  thinkingByCall.set(callId, blocks);
+  for (const k of thinkingByCall.keys()) {
+    if (thinkingByCall.size <= THINKING_CACHE_MAX) break;
+    thinkingByCall.delete(k);
+  }
+}
 
 /** OpenAI messages[] → Anthropic { system, messages[] }. */
 /**
@@ -119,7 +154,7 @@ export function repairToolPairs(messages: Block[]): Block[] {
   return out;
 }
 
-function convert(messages: OAIMessage[]): { system?: string; messages: Block[] } {
+export function convert(messages: OAIMessage[]): { system?: string; messages: Block[] } {
   const system: string[] = [];
   const out: Block[] = [];
 
@@ -147,6 +182,9 @@ function convert(messages: OAIMessage[]): { system?: string; messages: Block[] }
 
     if (msg.role === "assistant") {
       const blocks: Block[] = [];
+      // Thinking goes FIRST, ahead of any text — that is the order Anthropic checks for.
+      const firstCall = msg.tool_calls?.[0]?.id;
+      if (firstCall) blocks.push(...(thinkingByCall.get(firstCall) ?? []));
       if (msg.content) blocks.push({ type: "text", text: String(msg.content) });
       for (const tc of msg.tool_calls ?? []) {
         let input: unknown = {};
@@ -253,46 +291,102 @@ export const anthropicAdapter: Adapter = {
       const systemParam = systemBlocks.length ? systemBlocks : undefined;
       markLastBlockCacheable(messages, cacheControl);
 
-      const params = {
-        model,
-        max_tokens: typeof body.max_tokens === "number" ? body.max_tokens : 8192,
-        ...(systemParam ? { system: systemParam } : {}),
-        messages: messages as unknown as AnthropicSDK.MessageParam[],
-        ...(tools.length ? { tools: tools as AnthropicSDK.Tool[] } : {}),
-      } as unknown as Parameters<typeof client.messages.stream>[0];
+      const maxTokens = typeof body.max_tokens === "number" ? body.max_tokens : 8192;
 
       // One merged anthropic-beta header: a second `headers` object would replace the first, so the
       // subscription betas and the cache-TTL beta have to be joined rather than set separately.
       const betas = [...(subscription ? SUBSCRIPTION_BETAS : []), ...(ttl1h ? ["extended-cache-ttl-2025-04-11"] : [])];
-      const stream = client.messages.stream(
-        params,
-        betas.length
-          ? { headers: { "anthropic-beta": betas.join(","), ...(subscription ? { "user-agent": "claude-cli/1.0.0 (external, cli)" } : {}) } }
-          : undefined,
-      );
+      const reqOpts = betas.length
+        ? { headers: { "anthropic-beta": betas.join(","), ...(subscription ? { "user-agent": "claude-cli/1.0.0 (external, cli)" } : {}) } }
+        : undefined;
 
-      for await (const event of stream) {
-        if (event.type === "message_start") {
-          const u = (event.message as { usage?: { input_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } }).usage;
-          inTokens = u?.input_tokens ?? 0;
-          cacheRead = u?.cache_read_input_tokens ?? 0;
-          cacheWrite = u?.cache_creation_input_tokens ?? 0;
-        } else if (event.type === "content_block_start") {
-          const cb = event.content_block as { type: string; id?: string; name?: string };
-          if (cb.type === "tool_use") {
-            toolIndex++;
-            chunk({ tool_calls: [{ index: toolIndex, id: cb.id, type: "function", function: { name: cb.name, arguments: "" } }] });
+      // Extended thinking, if the caller asked for it.
+      let budget: number | undefined = THINK_BUDGET[String(body.reasoning_effort ?? "")];
+      let streamed = false; // any of the model's own output already on the wire
+      const emit = (delta: Block): void => {
+        streamed = true;
+        chunk(delta);
+      };
+
+      const attempt = async (): Promise<void> => {
+        stop = "stop"; // a retry starts from a clean slate — the failed attempt's tallies are void
+        toolIndex = -1;
+        inTokens = outTokens = cacheRead = cacheWrite = 0;
+
+        const params = {
+          model,
+          // The budget is spent out of max_tokens, so a request that only budgets thinking has no
+          // room left to answer in.
+          max_tokens: budget ? Math.max(maxTokens, budget + 8192) : maxTokens,
+          ...(budget ? { thinking: { type: "enabled", budget_tokens: budget } } : {}),
+          ...(systemParam ? { system: systemParam } : {}),
+          messages: messages as unknown as AnthropicSDK.MessageParam[],
+          ...(tools.length ? { tools: tools as AnthropicSDK.Tool[] } : {}),
+        } as unknown as Parameters<typeof client.messages.stream>[0];
+
+        const stream = client.messages.stream(params, reqOpts);
+
+        // Rebuilt verbatim from the deltas so the exact blocks (signature and all) can be replayed
+        // on the next request — see `thinkingByCall`.
+        const thinkingBlocks: Block[] = [];
+        let openThinking: { type: string; thinking: string; signature: string } | null = null;
+        let firstToolUseId = "";
+
+        for await (const event of stream) {
+          if (event.type === "message_start") {
+            const u = (event.message as { usage?: { input_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } }).usage;
+            inTokens = u?.input_tokens ?? 0;
+            cacheRead = u?.cache_read_input_tokens ?? 0;
+            cacheWrite = u?.cache_creation_input_tokens ?? 0;
+          } else if (event.type === "content_block_start") {
+            const cb = event.content_block as { type: string; id?: string; name?: string; data?: string };
+            if (cb.type === "tool_use") {
+              toolIndex++;
+              firstToolUseId ||= cb.id ?? "";
+              emit({ tool_calls: [{ index: toolIndex, id: cb.id, type: "function", function: { name: cb.name, arguments: "" } }] });
+            } else if (cb.type === "thinking") {
+              openThinking = { type: "thinking", thinking: "", signature: "" };
+            } else if (cb.type === "redacted_thinking") {
+              // Encrypted by Anthropic — nothing to show a human, but it still has to be replayed.
+              thinkingBlocks.push({ type: "redacted_thinking", data: cb.data });
+            }
+          } else if (event.type === "content_block_delta") {
+            const d = event.delta as { type: string; text?: string; partial_json?: string; thinking?: string; signature?: string };
+            if (d.type === "text_delta") emit({ content: d.text });
+            else if (d.type === "input_json_delta") emit({ tool_calls: [{ index: toolIndex, function: { arguments: d.partial_json } }] });
+            else if (d.type === "thinking_delta") {
+              if (openThinking) openThinking.thinking += d.thinking ?? "";
+              // `reasoning_content` is the field the client already reads — never `content`, which
+              // would fold the model's scratch work into the answer and into every later request.
+              emit({ reasoning_content: d.thinking });
+            } else if (d.type === "signature_delta") {
+              if (openThinking) openThinking.signature += d.signature ?? "";
+            }
+          } else if (event.type === "content_block_stop") {
+            if (openThinking) thinkingBlocks.push({ ...openThinking });
+            openThinking = null;
+          } else if (event.type === "message_delta") {
+            const reason = (event.delta as { stop_reason?: string | null }).stop_reason;
+            if (reason) stop = mapStop(reason);
+            const ot = (event as { usage?: { output_tokens?: number } }).usage?.output_tokens;
+            if (typeof ot === "number") outTokens = ot; // cumulative — take the latest
           }
-        } else if (event.type === "content_block_delta") {
-          const d = event.delta as { type: string; text?: string; partial_json?: string };
-          if (d.type === "text_delta") chunk({ content: d.text });
-          else if (d.type === "input_json_delta") chunk({ tool_calls: [{ index: toolIndex, function: { arguments: d.partial_json } }] });
-        } else if (event.type === "message_delta") {
-          const reason = (event.delta as { stop_reason?: string | null }).stop_reason;
-          if (reason) stop = mapStop(reason);
-          const ot = (event as { usage?: { output_tokens?: number } }).usage?.output_tokens;
-          if (typeof ot === "number") outTokens = ot; // cumulative — take the latest
         }
+
+        rememberThinking(firstToolUseId, thinkingBlocks);
+      };
+
+      try {
+        await attempt();
+      } catch (e) {
+        // Thinking is the one part of this request that can be refused on its own: a model that
+        // doesn't support it, a budget it won't take, a transcript Anthropic wants a thinking
+        // block in. None of that is worth costing the user their turn — drop thinking and send it
+        // again. Only while nothing has shipped: retrying after output would restart the answer on
+        // top of itself, and no provider can resume a completion cut mid-sentence.
+        if (!budget || streamed) throw e;
+        budget = undefined;
+        await attempt();
       }
 
       chunk({}, stop);
@@ -395,6 +489,41 @@ async function demo(): Promise<void> {
   // An orphan result alongside real text keeps the text.
   const mixed = repairToolPairs([{ role: "user", content: [result("ghost"), { type: "text", text: "hello" }] }]);
   assert(resultsOf(mixed[0]).length === 0 && (mixed[0]!.content as Block[]).length === 1, "only the orphan goes");
+
+  // --- extended thinking -------------------------------------------------------------------
+  // A tool-calling assistant turn, as the OpenAI-shaped transcript stores it: no thinking block,
+  // because the wire format has nowhere to put one.
+  const toolTurn = [
+    { role: "user", content: "list the files" },
+    { role: "assistant", content: null, tool_calls: [{ id: "toolu_1", function: { name: "ls", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "toolu_1", content: "a.txt" },
+  ] as unknown as Parameters<typeof convert>[0];
+
+  const blocksOf = (m: Block | undefined): Block[] => (Array.isArray(m?.content) ? (m.content as Block[]) : []);
+
+  // Nothing remembered yet → the turn goes out as-is. Not an error, just a turn the model has to
+  // re-reason; `chat`'s retry is what covers a provider that refuses the shape outright.
+  const bare = convert(toolTurn).messages;
+  assert(blocksOf(bare[1])[0]?.type === "tool_use", "with nothing cached the turn is unchanged");
+
+  // Once the stream has been seen, the same transcript replays the thinking block ahead of the
+  // tool_use — the shape Anthropic demands.
+  rememberThinking("toolu_1", [{ type: "thinking", thinking: "the user wants a listing", signature: "sig-abc" }]);
+  const restored = convert(toolTurn).messages;
+  const first = blocksOf(restored[1])[0];
+  assert(first?.type === "thinking", "the remembered thinking block leads the assistant turn");
+  assert(first?.signature === "sig-abc", "and carries its signature verbatim — Anthropic verifies it");
+  assert(blocksOf(restored[1])[1]?.type === "tool_use", "with the tool call still behind it");
+
+  // Text and tool_use in the same turn: thinking still goes first, ahead of the text.
+  rememberThinking("toolu_2", [{ type: "thinking", thinking: "…", signature: "s" }]);
+  const withText = convert([
+    { role: "assistant", content: "on it", tool_calls: [{ id: "toolu_2", function: { name: "ls", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "toolu_2", content: "ok" },
+  ] as unknown as Parameters<typeof convert>[0]).messages;
+  assert(blocksOf(withText[0]).map((b) => b.type).join() === "thinking,text,tool_use", "thinking, then text, then the call");
+
+  assert(THINK_BUDGET.low! >= 1024 && THINK_BUDGET.high! > THINK_BUDGET.medium!, "budgets clear Anthropic's 1024 floor and increase with effort");
 
   console.log("anthropic: all checks passed");
 }

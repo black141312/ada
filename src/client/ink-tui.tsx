@@ -17,6 +17,7 @@ import type { AskOption } from "./tools.ts";
 const GOLD = "#ffaf00"; // ada accent (xterm 214)
 const WORDS = ["Cogitating", "Pondering", "Noodling", "Percolating", "Ruminating", "Tinkering", "Untangling", "Brewing", "Mulling", "Crunching"];
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const THINKING_TAIL = 600; // chars of live thinking kept on screen — roughly a screenful
 
 type Item =
   | { id: number; kind: "header"; text: string }
@@ -70,6 +71,9 @@ function AdaApp({ agent, model }: { agent: Agent; model: string }): JSX.Element 
   const [input, setInput] = useState("");
   const [queued, setQueued] = useState<string[]>([]);
   const [live, setLive] = useState("");
+  // Shown while the turn runs and dropped once the answer lands — thinking is not part of the
+  // reply, so it never joins the transcript.
+  const [thinking, setThinking] = useState("");
   const [running, setRunning] = useState(false);
   const [tokens, setTokens] = useState(agent.contextTokens());
   const [confirm, setConfirm] = useState<{ risk: string; detail: string; danger: boolean; resolve: (d: "yes" | "all" | "no") => void } | null>(null);
@@ -138,6 +142,10 @@ function AdaApp({ agent, model }: { agent: Agent; model: string }): JSX.Element 
             liveRef.current += e.delta;
             setLive(liveRef.current);
             setQueued((q) => (q.length === steerRef.current.length ? q : [...steerRef.current])); // reflect drained steers
+          } else if (e.type === "reasoning") {
+            // Keep only the tail: a high-effort thought is longer than the terminal, and the
+            // interesting part is always the most recent line.
+            setThinking((t) => (t + e.delta).slice(-THINKING_TAIL));
           } else if (e.type === "done" && e.context) setTokens(e.context);
         },
       });
@@ -148,6 +156,7 @@ function AdaApp({ agent, model }: { agent: Agent; model: string }): JSX.Element 
       if (error) push("error", error);
       liveRef.current = "";
       setLive("");
+      setThinking("");
       setQueued([]);
       setRunning(false);
       runningRef.current = false;
@@ -243,6 +252,14 @@ function AdaApp({ agent, model }: { agent: Agent; model: string }): JSX.Element 
   return (
     <Box flexDirection="column">
       <Static items={items}>{(item) => <ItemView key={item.id} item={item} />}</Static>
+      {thinking.trim() && !live.trim() ? (
+        <Box flexDirection="column" marginTop={1}>
+          <Text dimColor>{"✻ Thinking…"}</Text>
+          <Text dimColor italic>
+            {thinking.replace(/^\s+/, "")}
+          </Text>
+        </Box>
+      ) : null}
       {live.trim() ? (
         <Box marginTop={1}>
           <Text color={GOLD}>{"◆ "}</Text>
