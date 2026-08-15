@@ -6,6 +6,53 @@ All notable changes to ada are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — the browser tool can actually automate things
+
+Looking at a page and *driving* one are different jobs. The tool could do the first well and the
+second barely: refs came only from an accessibility-tree `read` and went stale on every navigation,
+every wait was a blind 300 ms sleep, and there was no way to fill a form, pick from a dropdown,
+attach a file, or read structured data back out.
+
+- **Target elements by CSS `selector` or by visible text (`find`)**, not just `ref_N`. Selectors and
+  text survive re-renders; refs do not.
+- **New verbs**: `wait` (for a selector, page text, or load — with `timeout`), `select`, `hover`,
+  `fill` (many inputs in one pass), `upload`, `eval`, `drag`, `back`, `forward`, `reload`, `pdf`.
+- `fill` and `select` write through the native value setter and dispatch `input`+`change`, so React
+  and Vue see the value instead of silently ignoring it.
+- `drag` walks the cursor in ten steps — HTML5 drag handlers ignore a teleporting mouse.
+- **`screenshot` now shows the image inline as well as saving the file.** Saving one and not being
+  able to see it was a strange default; `look` remains inline-only for loops that would otherwise
+  flood the transcript.
+
+### Changed — ada drives the system default browser, in a profile that remembers you
+
+- The browser is now found by asking the OS which one opens `https://` (Windows registry, macOS
+  LaunchServices, `xdg-settings`) instead of guessing Chrome-then-Edge. Non-Chromium defaults fall
+  back to the old list, since only Chromium speaks CDP.
+- **The profile persists** at `~/.ada/browser-profile` (override with `ADA_BROWSER_PROFILE`) instead
+  of a fresh temp directory per run, so signing into a site is a one-time cost rather than a
+  per-run one.
+- **Headed by default.** Headless only under `ADA_BROWSER_HEADLESS=1`, in CI, or on a display-less
+  Linux box. Automating real sites means occasionally seeing what went wrong and taking over.
+
+### Fixed
+- `Page.navigate` no longer hangs the tool for 30 s. Some pages — anything running aggressive bot
+  detection, or opening a JS dialog — never acknowledge the command even though the navigation
+  commits. It now uses a 10 s timeout and ignores a missing ack; the `readyState` poll that follows
+  is the real completion signal.
+
+### Added — `npm run browser:login` and `npm run browser:profile`
+`browser:login <site>...` opens ada's browser visibly with a tab per site so a human can sign in
+once, by hand, with credentials that never pass through ada.
+
+`browser:profile` clones a real Chrome profile's preferences, history and localStorage — but **not**
+its logins, and it now says so loudly. Measured on Chrome 151: a profile with 3879 app-bound (`v20`)
+cookies and 4 `li_at` entries came back with zero of each, because Chrome discards app-bound cookies
+on first launch against a copy. Nor is there a flag around it — both `--remote-debugging-port` and
+`--remote-debugging-pipe` refuse to attach to the default profile directory ("DevTools remote
+debugging requires a non-default data directory"). Driving an already-logged-in Chrome would take a
+browser extension using `chrome.debugger`; ada's own persistent profile is the supported path.
+
 ## [0.15.0] — 2026-07-30
 
 ### Added — plans and token quotas (replaces the allow-list)

@@ -4,19 +4,72 @@
 // port — node has fetch and WebSocket built in, so this costs no dependency (puppeteer/playwright
 // would each add >100MB and a bundled browser to an app that already ships an Electron one).
 
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { mkdtemp } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
+import { Bridge, isAttachable } from "./bridge.ts";
 
 const PORT = Number(process.env.ADA_CDP_PORT) || 9222;
 const ORIGIN = `http://127.0.0.1:${PORT}`;
 
-/** Where Chrome/Edge usually lives, per platform. First hit wins; $ADA_BROWSER overrides. */
+/** The exe the OS itself opens https:// with, when we can read it and it speaks CDP. Only Chromium
+ *  browsers do — Firefox/Safari have no debug port we can drive, so they fall through to the list. */
+function defaultBrowserExe(): string | null {
+  const run = (cmd: string, args: string[]): string => {
+    try {
+      return execFileSync(cmd, args, { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
+    } catch {
+      return "";
+    }
+  };
+  try {
+    if (process.platform === "win32") {
+      const choice = run("reg", ["query", "HKCU\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\https\\UserChoice", "/v", "ProgId"]);
+      const progId = /ProgId\s+REG_SZ\s+(\S+)/.exec(choice)?.[1];
+      if (!progId) return null;
+      const cmd = run("reg", ["query", `HKCR\\${progId}\\shell\\open\\command`, "/ve"]);
+      const exe = /"([^"]+\.exe)"/i.exec(cmd)?.[1] ?? /(\S+\.exe)/i.exec(cmd.split("REG_SZ")[1] ?? "")?.[1];
+      return exe && existsSync(exe) ? exe : null;
+    }
+    if (process.platform === "darwin") {
+      // LaunchServices stores the bundle id; map the Chromium ones we can actually drive.
+      const plist = run("defaults", ["read", "com.apple.LaunchServices/com.apple.launchservices.secure", "LSHandlers"]);
+      const id = /LSHandlerURLScheme = https;[\s\S]{0,200}?LSHandlerRoleAll = "?([\w.]+)/.exec(plist)?.[1]?.toLowerCase() ?? "";
+      const apps: Record<string, string> = {
+        "com.google.chrome": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "com.microsoft.edgemac": "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "com.brave.browser": "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "org.chromium.chromium": "/Applications/Chromium.app/Contents/MacOS/Chromium",
+      };
+      const exe = apps[id];
+      return exe && existsSync(exe) ? exe : null;
+    }
+    const desktop = run("xdg-settings", ["get", "default-web-browser"]).trim().toLowerCase();
+    const linux: [RegExp, string[]][] = [
+      [/chrome/, ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"]],
+      [/chromium/, ["/usr/bin/chromium", "/usr/bin/chromium-browser"]],
+      [/edge/, ["/usr/bin/microsoft-edge"]],
+      [/brave/, ["/usr/bin/brave-browser"]],
+    ];
+    for (const [re, paths] of linux) if (re.test(desktop)) return paths.find((p) => existsSync(p)) ?? null;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Where Chrome/Edge usually lives, per platform. First hit wins; $ADA_BROWSER overrides, and the
+ *  OS default browser is preferred over the hardcoded list when it is a Chromium we can drive. */
 function browserPaths(): string[] {
   if (process.env.ADA_BROWSER) return [process.env.ADA_BROWSER];
+  const preferred = defaultBrowserExe();
   const p = process.platform;
+  if (preferred) return [preferred, ...fallbackPaths(p)];
+  return fallbackPaths(p);
+}
+
+function fallbackPaths(p: string): string[] {
   if (p === "win32") {
     const bases = [process.env["PROGRAMFILES"], process.env["PROGRAMFILES(X86)"], process.env["LOCALAPPDATA"]].filter(Boolean) as string[];
     return bases.flatMap((b) => [join(b, "Google/Chrome/Application/chrome.exe"), join(b, "Microsoft/Edge/Application/msedge.exe")]);
@@ -40,14 +93,28 @@ async function debuggerUp(): Promise<boolean> {
   }
 }
 
-/** Reuse an already-running debug browser, else start a headless one in a scratch profile. Never
- *  touches the user's real profile — that would fight with their open windows and their cookies. */
+/** Headless only where nobody could watch anyway. Automating real sites means solving the odd
+ *  captcha and seeing what went wrong, so a visible window is the default. */
+function headless(): boolean {
+  if (process.env.ADA_BROWSER_HEADLESS === "1") return true;
+  if (process.env.ADA_BROWSER_HEADLESS === "0") return false;
+  if (process.env.CI) return true;
+  return process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY;
+}
+
+/** Reuse an already-running debug browser, else start one in ada's own persistent profile — so a
+ *  login survives to the next run. Still not the user's real profile directory: Chrome 136+ refuses
+ *  --remote-debugging-port there, and sharing it would fight with their open windows. To drive the
+ *  real one, start it yourself with --remote-debugging-port and ada will attach to it. */
 async function ensureBrowser(): Promise<void> {
   if (await debuggerUp()) return;
   const exe = browserPaths().find((p) => existsSync(p));
-  if (!exe) throw new Error(`no Chrome/Edge found. Install one, or set ADA_BROWSER to its path (or start any Chrome with --remote-debugging-port=${PORT}).`);
-  const profile = await mkdtemp(join(tmpdir(), "ada-cdp-"));
-  const child = spawn(exe, [`--remote-debugging-port=${PORT}`, `--user-data-dir=${profile}`, "--headless=new", "--no-first-run", "--no-default-browser-check", "--disable-gpu", "about:blank"], {
+  if (!exe) throw new Error(`no Chromium-based browser found. Install Chrome/Edge, or set ADA_BROWSER to its path (or start any Chrome with --remote-debugging-port=${PORT}).`);
+  const profile = process.env.ADA_BROWSER_PROFILE || join(homedir(), ".ada", "browser-profile");
+  mkdirSync(profile, { recursive: true });
+  const flags = [`--remote-debugging-port=${PORT}`, `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "about:blank"];
+  if (headless()) flags.splice(2, 0, "--headless=new", "--disable-gpu");
+  const child = spawn(exe, flags, {
     detached: true,
     stdio: "ignore",
   });
@@ -68,6 +135,91 @@ interface Target {
 
 /** Last tab this tool selected (via tab_new/tab_select). Acting defaults to it while it lives. */
 let selectedTabId: string | null = null;
+
+// ---- transport: the extension bridge when it is there, the debug port otherwise ----
+
+let bridge: Bridge | null = null;
+let bridgeChecked = false;
+/** Decided once per process. Re-deciding per action let a single run start in ada's own profile and
+ *  then silently switch to the user's real browser halfway through. */
+let bridgeMode: boolean | null = null;
+
+/** The bridge drives the user's REAL browser (their logins, their tabs) via a loaded extension;
+ *  the debug port drives ada's own profile. Prefer the bridge when the extension is actually
+ *  connected, because that is the browser the user means. ADA_BROWSER_BRIDGE=0 opts out. */
+async function getBridge(): Promise<Bridge | null> {
+  if (process.env.ADA_BROWSER_BRIDGE === "0") return null;
+  if (bridgeMode !== null) return bridgeMode ? bridge : null;
+  if (bridgeChecked) return null;
+  bridgeChecked = true;
+  try {
+    bridge = await Bridge.start();
+  } catch {
+    // Port busy usually means another ada already owns the bridge; fall back rather than fight.
+    bridge = null;
+    bridgeMode = false;
+    return null;
+  }
+  // The extension retries every 2s, so this window is generous enough to catch a live one and short
+  // enough not to punish the common case of no extension at all.
+  for (let i = 0; i < 24 && !bridge.connected; i++) await new Promise((r) => setTimeout(r, 250));
+  bridgeMode = bridge.connected;
+  return bridgeMode ? bridge : null;
+}
+
+/** Sites that treat a debugger-attached session as compromised and sign you out of it. In bridge
+ *  mode that session is the user's REAL one, so the cost of touching these lands on their actual
+ *  account - measured: one automated read of the Instagram feed invalidated the live session.
+ *  ada's own profile has no such blast radius, so there the same sites are fine. */
+const BRIDGE_BLOCKED = (process.env.ADA_BRIDGE_BLOCKED ?? "instagram.com,facebook.com,threads.net")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
+/** Pure, so selfcheck can exercise the matching without a browser. */
+export function bridgeBlocks(url: string, blocked: string[] = BRIDGE_BLOCKED): boolean {
+  let host: string;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return blocked.some((b) => host === b || host.endsWith(`.${b}`));
+}
+
+function assertBridgeAllowed(url: string): void {
+  if (!bridgeBlocks(url)) return;
+  throw new Error(
+    `refusing to drive ${new URL(url).hostname} through your real browser - it signs out sessions it finds a debugger on, ` +
+      `and that would be your actual account. Run this with ADA_BROWSER_BRIDGE=0 to use ada's own profile instead, ` +
+      `or set ADA_BRIDGE_BLOCKED to override.`,
+  );
+}
+
+/** What browserAction needs from a transport: send a CDP method, collect console output, hang up. */
+interface CdpLike {
+  send(method: string, params?: Json, timeoutMs?: number): Promise<Json>;
+  readonly logs: string[];
+  close(): void;
+}
+
+/** CDP over the extension. chrome.debugger speaks the same protocol, so only the wire changes. */
+class BridgeSession implements CdpLike {
+  constructor(
+    private b: Bridge,
+    private tabId: number,
+  ) {}
+  get logs(): string[] {
+    return this.b.logs;
+  }
+  async send(method: string, params: Json = {}, timeoutMs = 30_000): Promise<Json> {
+    return (await this.b.cdp(this.tabId, method, params, timeoutMs)) as Json;
+  }
+  close(): void {
+    // Deliberately stays attached: detaching per action would make Chrome's "ada bridge is debugging
+    // this browser" bar flicker on and off, and every action would pay the re-attach cost.
+  }
+}
 
 /** ref_N → backendDOMNodeId per tab, with the URL the refs were read from. */
 const refState = new Map<string, { url: string; refs: Map<string, number> }>();
@@ -103,6 +255,33 @@ function originOf(url: string): string {
 }
 
 export async function tabAction(action: "tabs" | "tab_new" | "tab_select" | "tab_close", tab?: string): Promise<string> {
+  const b = await getBridge();
+  if (b) {
+    // Same verbs against the real browser. Tabs the debugger cannot attach to (chrome://, the Web
+    // Store) are listed but marked, so a model can see them without being tempted to act on them.
+    if (action === "tabs") {
+      const all = await b.tabs();
+      return all.map((t) => `${String(t.id)}${String(t.id) === selectedTabId ? " *" : isAttachable(t.url) ? "  " : " -"}  ${originOf(t.url)}`).join("\n") || "(no tabs)";
+    }
+    if (action === "tab_new") {
+      const made = (await b.call("newTab", { url: "about:blank" })) as { id?: number };
+      selectedTabId = made.id === undefined ? null : String(made.id);
+      return `opened tab ${selectedTabId}`;
+    }
+    if (!tab) throw new Error(`${action} needs a tab id — list with \`tabs\``);
+    const known = (await b.tabs()).find((t) => String(t.id) === tab);
+    if (!known) throw new Error(`no such tab: ${tab} — list with \`tabs\``);
+    if (action === "tab_select") {
+      if (!isAttachable(known.url)) throw new Error(`cannot drive ${originOf(known.url)} — Chrome blocks the debugger on its own pages`);
+      await b.call("activate", { tabId: known.id });
+      selectedTabId = tab;
+      return `selected tab ${tab}`;
+    }
+    await b.call("closeTab", { tabId: known.id });
+    refState.delete(tab);
+    if (selectedTabId === tab) selectedTabId = null;
+    return `closed tab ${tab}`;
+  }
   await ensureBrowser();
   if (action === "tabs") {
     const pages = await listPages();
@@ -171,14 +350,14 @@ class Cdp {
     return c;
   }
 
-  send(method: string, params: Json = {}): Promise<Json> {
+  send(method: string, params: Json = {}, timeoutMs = 30_000): Promise<Json> {
     const id = ++this.id;
     return new Promise<Json>((ok, fail) => {
       this.waiters.set(id, { ok, fail });
       this.ws.send(JSON.stringify({ id, method, params }));
       setTimeout(() => {
         if (this.waiters.delete(id)) fail(new Error(`${method} timed out`));
-      }, 30_000);
+      }, timeoutMs);
     });
   }
 
@@ -268,7 +447,7 @@ export function keyParams(name: string): { key: string; code: string; keyCode: n
 }
 
 /** Send keyDown/keyUp for a `press` key, optionally holding between the two (games read held keys). */
-async function pressKey(cdp: Cdp, name: string, hold = 0): Promise<void> {
+async function pressKey(cdp: { send(method: string, params?: Json): Promise<Json> }, name: string, hold = 0): Promise<void> {
   const k = keyParams(name);
   const base = { key: k.key, code: k.code, windowsVirtualKeyCode: k.keyCode, nativeVirtualKeyCode: k.keyCode };
   await cdp.send("Input.dispatchKeyEvent", { type: "keyDown", ...base, ...(k.text ? { text: k.text } : {}) });
@@ -280,9 +459,30 @@ async function pressKey(cdp: Cdp, name: string, hold = 0): Promise<void> {
 export interface BrowserResult {
   text: string;
   screenshot?: Buffer;
+  pdf?: Buffer;
 }
 
-export type BrowserVerb = "open" | "screenshot" | "text" | "console" | "read" | "click" | "type" | "press" | "scroll";
+export type BrowserVerb =
+  | "open"
+  | "screenshot"
+  | "text"
+  | "console"
+  | "read"
+  | "click"
+  | "type"
+  | "press"
+  | "scroll"
+  | "wait"
+  | "select"
+  | "hover"
+  | "fill"
+  | "upload"
+  | "eval"
+  | "drag"
+  | "back"
+  | "forward"
+  | "reload"
+  | "pdf";
 
 export interface BrowserOpts {
   url?: string;
@@ -290,21 +490,72 @@ export interface BrowserOpts {
   height?: number;
   tab?: string;
   ref?: string;
+  selector?: string;
+  find?: string;
   x?: number;
   y?: number;
+  toX?: number;
+  toY?: number;
   hold?: number;
   text?: string;
+  value?: string;
+  fields?: Record<string, string>;
+  files?: string[];
+  expression?: string;
+  timeout?: number;
   key?: string;
   direction?: "up" | "down" | "left" | "right";
   amount?: number;
 }
 
+/** Find one element by CSS selector, or by the visible text a human would click. Serialized into the
+ *  page because CDP's DOM.querySelector can't match text and won't see into shadow-free innerText. */
+const FINDER = `(sel, txt) => {
+  if (sel) return document.querySelector(sel);
+  const norm = (s) => (s || "").replace(/\\s+/g, " ").trim().toLowerCase();
+  const want = norm(txt);
+  if (!want) return null;
+  const seen = (el) => { const r = el.getBoundingClientRect(); return !!(r.width || r.height); };
+  const label = (el) => norm(el.getAttribute("aria-label") || el.value || el.placeholder || el.innerText || el.textContent);
+  const inter = [...document.querySelectorAll('a,button,input,select,textarea,summary,[contenteditable],[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="checkbox"]')].filter(seen);
+  const exact = inter.find((el) => label(el) === want);
+  if (exact) return exact;
+  const partial = inter.find((el) => label(el).includes(want));
+  if (partial) return partial;
+  const deep = [...document.querySelectorAll("body *")].filter((el) => seen(el) && norm(el.innerText).includes(want) && ![...el.children].some((c) => norm(c.innerText).includes(want)));
+  return deep[0] || null;
+}`;
+
+/** Pick a transport and a tab: the real browser through the extension, else ada's own profile. */
+async function openSession(tab?: string): Promise<{ cdp: CdpLike; tabKey: string }> {
+  const b = await getBridge();
+  if (b) {
+    const usable = await b.targets();
+    let picked = tab ? usable.find((t) => String(t.id) === tab) : usable.find((t) => String(t.id) === selectedTabId);
+    if (tab && !picked) throw new Error(`no such tab: ${tab} - list with \`tabs\``);
+    picked ??= usable[0];
+    if (!picked) {
+      const made = (await b.call("newTab", { url: "about:blank" })) as { id?: number };
+      if (made.id === undefined) throw new Error("could not open a tab in the browser");
+      picked = { id: made.id, url: "about:blank", title: "", active: true };
+    }
+    const session = new BridgeSession(b, picked.id);
+    // Without these the page sends no console or exception events for the `console` verb to show.
+    await session.send("Runtime.enable").catch(() => {});
+    await session.send("Log.enable").catch(() => {});
+    return { cdp: session, tabKey: String(picked.id) };
+  }
+  await ensureBrowser();
+  const target = await resolveTarget(tab);
+  return { cdp: await Cdp.open(target.webSocketDebuggerUrl!), tabKey: target.id };
+}
+
 /** Run one browser action. `url` navigates first when given; otherwise acts on the current page. */
 export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {}): Promise<BrowserResult> {
   const { url, width = 1280, height = 800 } = opts;
-  await ensureBrowser();
-  const target = await resolveTarget(opts.tab);
-  const cdp = await Cdp.open(target.webSocketDebuggerUrl!);
+  if (url && bridgeMode) assertBridgeAllowed(url);
+  const { cdp, tabKey } = await openSession(opts.tab);
+  const target = { id: tabKey };
   try {
     await cdp.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
     if (url) {
@@ -316,7 +567,10 @@ export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {})
       await cdp.send("Log.clear").catch(() => {});
       await cdp.send("Runtime.discardConsoleEntries").catch(() => {});
       cdp.logs.length = 0;
-      await cdp.send("Page.navigate", { url });
+      // Page.navigate does not always acknowledge: heavy anti-bot pages (and any page that opens a
+      // JS dialog) leave the command hanging even though the navigation itself commits fine. The
+      // readyState poll below is the real completion signal, so a missing ack is not an error.
+      await cdp.send("Page.navigate", { url }, 10_000).catch(() => {});
       // No Page.loadEventFired race: poll readyState, which is true whether or not we missed the event.
       for (let i = 0; i < 60; i++) {
         const r = (await cdp.send("Runtime.evaluate", { expression: "document.readyState", returnByValue: true })) as { result?: { value?: string } };
@@ -328,6 +582,9 @@ export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {})
     }
     const where = (await cdp.send("Runtime.evaluate", { expression: "location.href", returnByValue: true })) as { result?: { value?: string } };
     const here = where.result?.value ?? "(unknown url)";
+    // Also guard the page we happen to have landed on - a redirect, or an already-open tab, can put
+    // us on a blocked site without any blocked URL ever being passed in.
+    if (bridgeMode) assertBridgeAllowed(here);
 
     // acting verbs — read builds the ref map; the rest act by ref and check staleness first
     const needRef = (): number => {
@@ -343,6 +600,47 @@ export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {})
       await cdp.send("DOM.getDocument", { depth: 0 });
     };
     const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 300)); // let handlers run and paint
+
+    /** The node this action targets: an explicit ref, else a CSS selector, else visible text. */
+    const nodeFor = async (): Promise<number> => {
+      if (opts.ref) return needRef();
+      if (!opts.selector && !opts.find) throw new Error("need `ref` (from `read`), `selector`, or `find`");
+      const r = (await cdp.send("Runtime.evaluate", {
+        expression: `(${FINDER})(${JSON.stringify(opts.selector ?? null)}, ${JSON.stringify(opts.find ?? null)})`,
+      })) as { result?: { objectId?: string } };
+      const objectId = r.result?.objectId;
+      if (!objectId) throw new Error(`nothing matched ${opts.selector ? `selector ${opts.selector}` : `text "${opts.find}"`} on ${here}`);
+      const d = (await cdp.send("DOM.describeNode", { objectId })) as { node?: { backendNodeId?: number } };
+      const id = d.node?.backendNodeId;
+      if (id === undefined) throw new Error("matched something that is not an element");
+      return id;
+    };
+    const centerOf = async (backendNodeId: number): Promise<{ x: number; y: number }> => {
+      await domReady();
+      await cdp.send("DOM.scrollIntoViewIfNeeded", { backendNodeId }).catch(() => {
+        throw new Error("element is not visible");
+      });
+      const q = (await cdp.send("DOM.getContentQuads", { backendNodeId }).catch(() => ({}))) as { quads?: number[][] };
+      const quad = q.quads?.[0];
+      if (!quad || quad.length < 8) throw new Error("element is not visible");
+      return { x: (quad[0]! + quad[2]! + quad[4]! + quad[6]!) / 4, y: (quad[1]! + quad[3]! + quad[5]! + quad[7]!) / 4 };
+    };
+    const evalJs = async (expression: string): Promise<unknown> => {
+      const r = (await cdp.send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true })) as {
+        result?: { value?: unknown };
+        exceptionDetails?: { exception?: { description?: string }; text?: string };
+      };
+      if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text ?? "script threw");
+      return r.result?.value;
+    };
+    const settleLoad = async (): Promise<void> => {
+      for (let i = 0; i < 60; i++) {
+        if ((await evalJs("document.readyState")) === "complete") break;
+        await new Promise((res) => setTimeout(res, 250));
+      }
+      refState.delete(target.id);
+      await new Promise((res) => setTimeout(res, 400));
+    };
 
     if (action === "read") {
       await cdp.send("Accessibility.enable").catch(() => {});
@@ -362,28 +660,17 @@ export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {})
         await settle();
         return { text: `clicked (${x}, ${y}) on ${here}` };
       }
-      const backendNodeId = needRef();
-      await domReady();
-      await cdp.send("DOM.scrollIntoViewIfNeeded", { backendNodeId }).catch(() => {
-        throw new Error("element is not visible — `read` again");
-      });
-      const q = (await cdp.send("DOM.getContentQuads", { backendNodeId }).catch(() => ({}))) as { quads?: number[][] };
-      const quad = q.quads?.[0];
-      if (!quad || quad.length < 8) throw new Error("element is not visible — `read` again");
-      const x = (quad[0]! + quad[2]! + quad[4]! + quad[6]!) / 4;
-      const y = (quad[1]! + quad[3]! + quad[5]! + quad[7]!) / 4;
+      const backendNodeId = await nodeFor();
+      const { x, y } = await centerOf(backendNodeId);
       await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
       await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
       await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
       await settle();
-      return { text: `clicked ${opts.ref} on ${here}` };
+      return { text: `clicked ${opts.ref ?? opts.selector ?? opts.find} on ${here}` };
     }
     if (action === "type") {
-      const backendNodeId = needRef();
-      await domReady();
-      await cdp.send("DOM.scrollIntoViewIfNeeded", { backendNodeId }).catch(() => {
-        throw new Error("element is not visible — `read` again");
-      });
+      const backendNodeId = await nodeFor();
+      await centerOf(backendNodeId);
       await cdp.send("DOM.focus", { backendNodeId }).catch(() => {
         throw new Error("element is not visible — `read` again");
       });
@@ -392,7 +679,7 @@ export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {})
       const text = String(opts.text ?? "");
       if (text) await cdp.send("Input.insertText", { text });
       else await pressKey(cdp, "backspace"); // empty text = clear the field
-      return { text: `typed into ${opts.ref} on ${here}` };
+      return { text: `typed into ${opts.ref ?? opts.selector ?? opts.find} on ${here}` };
     }
     if (action === "press") {
       await pressKey(cdp, String(opts.key ?? ""), Number(opts.hold) || 0);
@@ -400,13 +687,9 @@ export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {})
       return { text: `pressed ${opts.key} on ${here}` };
     }
     if (action === "scroll") {
-      if (opts.ref) {
-        const backendNodeId = needRef();
-        await domReady();
-        await cdp.send("DOM.scrollIntoViewIfNeeded", { backendNodeId }).catch(() => {
-          throw new Error("element is not visible — `read` again");
-        });
-        return { text: `scrolled ${opts.ref} into view on ${here}` };
+      if (opts.ref || opts.selector || opts.find) {
+        await centerOf(await nodeFor());
+        return { text: `scrolled ${opts.ref ?? opts.selector ?? opts.find} into view on ${here}` };
       }
       const dir = String(opts.direction ?? "down");
       const amount = Number(opts.amount) || 600;
@@ -417,6 +700,133 @@ export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {})
       return { text: `scrolled ${dir} ${amount}px on ${here}` };
     }
 
+    if (action === "hover") {
+      const { x, y } = await centerOf(await nodeFor());
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+      await settle();
+      return { text: `hovered ${opts.ref ?? opts.selector ?? opts.find} on ${here}` };
+    }
+    if (action === "drag") {
+      const from = opts.x !== undefined && opts.y !== undefined ? { x: Number(opts.x), y: Number(opts.y) } : await centerOf(await nodeFor());
+      const toX = Number(opts.toX);
+      const toY = Number(opts.toY);
+      if (!Number.isFinite(toX) || !Number.isFinite(toY)) throw new Error("drag needs toX and toY");
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: from.x, y: from.y });
+      await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x: from.x, y: from.y, button: "left", clickCount: 1 });
+      for (let i = 1; i <= 10; i++) {
+        // HTML5 drag handlers ignore a single teleporting move — walk it like a hand would
+        await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: from.x + ((toX - from.x) * i) / 10, y: from.y + ((toY - from.y) * i) / 10, button: "left" });
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: toX, y: toY, button: "left", clickCount: 1 });
+      await settle();
+      return { text: `dragged to (${toX}, ${toY}) on ${here}` };
+    }
+    if (action === "select") {
+      const backendNodeId = await nodeFor();
+      const r = (await cdp.send("DOM.resolveNode", { backendNodeId })) as { object?: { objectId?: string } };
+      const objectId = r.object?.objectId;
+      if (!objectId) throw new Error("could not reach that element");
+      const want = String(opts.value ?? opts.text ?? "");
+      const res = (await cdp.send("Runtime.callFunctionOn", {
+        objectId,
+        returnByValue: true,
+        functionDeclaration: `function (want) {
+          if (this.tagName !== "SELECT") throw new Error("not a <select>");
+          const opt = [...this.options].find((o) => o.value === want) || [...this.options].find((o) => o.textContent.trim() === want) || [...this.options].find((o) => o.textContent.trim().toLowerCase().includes(want.toLowerCase()));
+          if (!opt) throw new Error("no option matching " + JSON.stringify(want) + " — have: " + [...this.options].map((o) => o.textContent.trim()).join(", "));
+          this.value = opt.value;
+          this.dispatchEvent(new Event("input", { bubbles: true }));
+          this.dispatchEvent(new Event("change", { bubbles: true }));
+          return opt.textContent.trim();
+        }`,
+        arguments: [{ value: want }],
+      })) as { result?: { value?: string }; exceptionDetails?: { exception?: { description?: string } } };
+      if (res.exceptionDetails) throw new Error(res.exceptionDetails.exception?.description ?? "select failed");
+      await settle();
+      return { text: `selected "${res.result?.value ?? want}" on ${here}` };
+    }
+    if (action === "fill") {
+      const fields = opts.fields ?? {};
+      const names = Object.keys(fields);
+      if (!names.length) throw new Error("fill needs `fields`: a map of CSS selector → value");
+      // React and friends listen to the native setter, so assigning .value directly is ignored
+      // unless we go through the prototype descriptor and then fire the events they expect.
+      const done = (await evalJs(`(() => {
+        const fields = ${JSON.stringify(fields)};
+        const out = [];
+        for (const [sel, val] of Object.entries(fields)) {
+          const el = document.querySelector(sel);
+          if (!el) { out.push(sel + ": NOT FOUND"); continue; }
+          const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+          if (el.type === "checkbox" || el.type === "radio") el.checked = val === true || val === "true" || val === "on";
+          else if (setter) setter.call(el, String(val));
+          else el.textContent = String(val);
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          out.push(sel + ": ok");
+        }
+        return out.join("\\n");
+      })()`)) as string;
+      await settle();
+      return { text: `filled ${names.length} field(s) on ${here}\n${done}` };
+    }
+    if (action === "upload") {
+      const files = (opts.files ?? []).map((f) => resolve(f));
+      if (!files.length) throw new Error("upload needs `files`: absolute paths to attach");
+      const missing = files.filter((f) => !existsSync(f));
+      if (missing.length) throw new Error(`no such file: ${missing.join(", ")}`);
+      const backendNodeId = await nodeFor();
+      await domReady();
+      await cdp.send("DOM.setFileInputFiles", { backendNodeId, files });
+      await settle();
+      return { text: `attached ${files.length} file(s) on ${here}` };
+    }
+    if (action === "eval") {
+      const expression = String(opts.expression ?? "");
+      if (!expression) throw new Error("eval needs `expression`");
+      const value = await evalJs(expression);
+      return { text: `${here}\n\n${value === undefined ? "undefined" : typeof value === "string" ? value : JSON.stringify(value, null, 2)}` };
+    }
+    if (action === "wait") {
+      const timeout = Math.min(Math.max(Number(opts.timeout) || 10_000, 100), 60_000);
+      const started = Date.now();
+      const probe = opts.selector
+        ? `!!document.querySelector(${JSON.stringify(opts.selector)})`
+        : opts.find
+          ? `(document.body ? document.body.innerText : "").toLowerCase().includes(${JSON.stringify(String(opts.find).toLowerCase())})`
+          : `document.readyState === "complete"`;
+      while (Date.now() - started < timeout) {
+        if ((await evalJs(probe)) === true) {
+          refState.delete(target.id); // whatever we waited for probably repainted the page
+          return { text: `found ${opts.selector ?? opts.find ?? "a loaded page"} after ${Date.now() - started}ms on ${here}` };
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      throw new Error(`timed out after ${timeout}ms waiting for ${opts.selector ?? opts.find ?? "load"} on ${here}`);
+    }
+    if (action === "back" || action === "forward") {
+      const h = (await cdp.send("Page.getNavigationHistory")) as { currentIndex?: number; entries?: { id: number }[] };
+      const idx = (h.currentIndex ?? 0) + (action === "back" ? -1 : 1);
+      const entry = h.entries?.[idx];
+      if (!entry) throw new Error(`nothing to go ${action} to`);
+      await cdp.send("Page.enable");
+      await cdp.send("Page.navigateToHistoryEntry", { entryId: entry.id });
+      await settleLoad();
+      return { text: `went ${action} — now at ${await evalJs("location.href")}` };
+    }
+    if (action === "reload") {
+      await cdp.send("Page.enable");
+      await cdp.send("Page.reload");
+      await settleLoad();
+      return { text: `reloaded ${here}` };
+    }
+    if (action === "pdf") {
+      const out = (await cdp.send("Page.printToPDF", { printBackground: true })) as { data?: string };
+      if (!out.data) throw new Error("the browser returned no PDF");
+      return { text: here, pdf: Buffer.from(out.data, "base64") };
+    }
     if (action === "screenshot") {
       const shot = (await cdp.send("Page.captureScreenshot", { format: "png" })) as { data?: string };
       if (!shot.data) throw new Error("the browser returned no image");
