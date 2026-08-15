@@ -318,13 +318,12 @@ async function main(): Promise<void> {
   assert.equal(describeCall("browser", { action: "click", ref: "ref_2" }).detail, "click ref_2");
   assert.ok(permPhrase("browser", true).toLowerCase().includes("enter"), "press-Enter phrase should warn about submitting");
 
-  // The bridge shares the user's real session, so sites that sign out debugger-attached sessions
-  // must be refused there (and only there) - matching has to cover subdomains but not lookalikes.
-  assert.ok(bridgeBlocks("https://www.instagram.com/"), "instagram must be blocked in bridge mode");
-  assert.ok(bridgeBlocks("https://facebook.com/feed"), "facebook must be blocked in bridge mode");
-  assert.ok(!bridgeBlocks("https://linkedin.com/feed"), "linkedin tolerates automation and must stay allowed");
-  assert.ok(!bridgeBlocks("https://notinstagram.com/"), "suffix match must not catch lookalike domains");
-  assert.ok(!bridgeBlocks("not a url"), "a malformed url must not throw");
+  // Nothing is blocked by default - the block list is opt-in via ADA_BRIDGE_BLOCKED. Matching must
+  // cover subdomains without catching lookalike domains, and must not throw on junk input.
+  assert.ok(!bridgeBlocks("https://www.instagram.com/"), "nothing should be blocked by default");
+  assert.ok(bridgeBlocks("https://www.instagram.com/", ["instagram.com"]), "an opted-in host must match, subdomains included");
+  assert.ok(!bridgeBlocks("https://notinstagram.com/", ["instagram.com"]), "suffix match must not catch lookalike domains");
+  assert.ok(!bridgeBlocks("not a url", ["instagram.com"]), "a malformed url must not throw");
   assert.ok(!permPhrase("browser", false).startsWith("run the"), "browser needs its own perm phrase");
 
   // --- baked offline catalog seeds pricing/limits (no network) ---

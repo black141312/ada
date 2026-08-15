@@ -17,3 +17,5 @@ runs/
   
 # the bridge's shared secret, generated per machine  
 extension/token.txt  
+tmp-*.txt  
+tmp-*.ts  

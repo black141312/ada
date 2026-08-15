@@ -152,26 +152,38 @@ async function getBridge(): Promise<Bridge | null> {
   if (bridgeMode !== null) return bridgeMode ? bridge : null;
   if (bridgeChecked) return null;
   bridgeChecked = true;
+  // Strict mode: the caller means the REAL browser. Falling back to ada's own profile would run the
+  // same commands against a different set of logins and look like the site had signed them out -
+  // which is exactly the confusion that cost an afternoon here. Fail loudly instead.
+  const strict = process.env.ADA_BROWSER_BRIDGE === "1";
   try {
     bridge = await Bridge.start();
   } catch {
     // Port busy usually means another ada already owns the bridge; fall back rather than fight.
     bridge = null;
     bridgeMode = false;
+    if (strict) throw new Error("ADA_BROWSER_BRIDGE=1 but port 9223 is already taken - another ada already owns the bridge.");
     return null;
   }
   // The extension retries every 2s, so this window is generous enough to catch a live one and short
   // enough not to punish the common case of no extension at all.
-  for (let i = 0; i < 24 && !bridge.connected; i++) await new Promise((r) => setTimeout(r, 250));
+  for (let i = 0; i < (strict ? 60 : 24) && !bridge.connected; i++) await new Promise((r) => setTimeout(r, 250));
   bridgeMode = bridge.connected;
+  if (!bridgeMode && strict) {
+    throw new Error(
+      "ADA_BROWSER_BRIDGE=1 but the ada bridge extension never connected. Open the Chrome profile it is loaded in " +
+        "(extensions are per-profile), check chrome://extensions, then retry. Refusing to fall back to ada's own " +
+        "profile, which has different logins.",
+    );
+  }
   return bridgeMode ? bridge : null;
 }
 
-/** Sites that treat a debugger-attached session as compromised and sign you out of it. In bridge
- *  mode that session is the user's REAL one, so the cost of touching these lands on their actual
- *  account - measured: one automated read of the Instagram feed invalidated the live session.
- *  ada's own profile has no such blast radius, so there the same sites are fine. */
-const BRIDGE_BLOCKED = (process.env.ADA_BRIDGE_BLOCKED ?? "instagram.com,facebook.com,threads.net")
+/** Sites ada must not drive through the user's real session. Empty by default: the one case that
+ *  looked like a site killing its session turned out to be a silent fallback to a logged-out
+ *  profile, and blocking a site on that evidence would have been superstition. Set
+ *  ADA_BRIDGE_BLOCKED to a comma-separated host list if a site really does punish automation. */
+const BRIDGE_BLOCKED = (process.env.ADA_BRIDGE_BLOCKED ?? "")
   .split(",")
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
@@ -189,11 +201,7 @@ export function bridgeBlocks(url: string, blocked: string[] = BRIDGE_BLOCKED): b
 
 function assertBridgeAllowed(url: string): void {
   if (!bridgeBlocks(url)) return;
-  throw new Error(
-    `refusing to drive ${new URL(url).hostname} through your real browser - it signs out sessions it finds a debugger on, ` +
-      `and that would be your actual account. Run this with ADA_BROWSER_BRIDGE=0 to use ada's own profile instead, ` +
-      `or set ADA_BRIDGE_BLOCKED to override.`,
-  );
+  throw new Error(`refusing to drive ${new URL(url).hostname} through your real browser (ADA_BRIDGE_BLOCKED). Use ADA_BROWSER_BRIDGE=0 to act in ada's own profile instead.`);
 }
 
 /** What browserAction needs from a transport: send a CDP method, collect console output, hang up. */
@@ -261,7 +269,10 @@ export async function tabAction(action: "tabs" | "tab_new" | "tab_select" | "tab
     // Store) are listed but marked, so a model can see them without being tempted to act on them.
     if (action === "tabs") {
       const all = await b.tabs();
-      return all.map((t) => `${String(t.id)}${String(t.id) === selectedTabId ? " *" : isAttachable(t.url) ? "  " : " -"}  ${originOf(t.url)}`).join("\n") || "(no tabs)";
+      const rows = all.map((t) => `${String(t.id)}${String(t.id) === selectedTabId ? " *" : isAttachable(t.url) ? "  " : " -"}  ${originOf(t.url)}`).join("\n");
+      // Say which browser these came from: the two transports have different logins, and a silent
+      // difference between them is indistinguishable from a site signing you out.
+      return `[your real browser, via the ada bridge extension]\n${rows || "(no tabs)"}`;
     }
     if (action === "tab_new") {
       const made = (await b.call("newTab", { url: "about:blank" })) as { id?: number };
@@ -285,7 +296,8 @@ export async function tabAction(action: "tabs" | "tab_new" | "tab_select" | "tab
   await ensureBrowser();
   if (action === "tabs") {
     const pages = await listPages();
-    return pages.map((p) => `${p.id}${p.id === selectedTabId ? " *" : ""}  ${originOf(p.url)}`).join("\n") || "(no tabs)";
+    const rows = pages.map((p) => `${p.id}${p.id === selectedTabId ? " *" : ""}  ${originOf(p.url)}`).join("\n");
+    return `[ada's own browser profile - not your logged-in Chrome]\n${rows || "(no tabs)"}`;
   }
   if (action === "tab_new") {
     const made = (await (await fetch(`${ORIGIN}/json/new?about:blank`, { method: "PUT" })).json()) as Target;
