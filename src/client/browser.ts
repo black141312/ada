@@ -167,7 +167,20 @@ async function getBridge(): Promise<Bridge | null> {
   }
   // The extension retries every 2s, so this window is generous enough to catch a live one and short
   // enough not to punish the common case of no extension at all.
-  for (let i = 0; i < (strict ? 60 : 24) && !bridge.connected; i++) await new Promise((r) => setTimeout(r, 250));
+  for (let i = 0; i < 12 && !bridge.connected; i++) await new Promise((r) => setTimeout(r, 250));
+
+  // Still nothing: the profile holding the extension is probably just not open. Start it. This is
+  // the user's ordinary Chrome with their ordinary profile - no debugging flags, nothing special -
+  // so the extension loads itself and dials in. Without this, "drive my browser" silently means
+  // "drive a different browser" any time their window happens to be closed.
+  if (!bridge.connected && process.env.ADA_BROWSER_BRIDGE !== "0") {
+    const exe = browserPaths().find((p) => existsSync(p));
+    if (exe) {
+      const profileDir = process.env.ADA_CHROME_PROFILE || "Default";
+      spawn(exe, [`--profile-directory=${profileDir}`, "about:blank"], { detached: true, stdio: "ignore" }).unref();
+      for (let i = 0; i < (strict ? 120 : 40) && !bridge.connected; i++) await new Promise((r) => setTimeout(r, 250));
+    }
+  }
   bridgeMode = bridge.connected;
   if (!bridgeMode && strict) {
     throw new Error(
