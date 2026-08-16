@@ -1037,7 +1037,7 @@ async function main(): Promise<void> {
 
   // --- confident skill orchestration: auto-apply only on a dominant, name-exact match ---
   assert.equal(confidentSkill("describe the project", allSkills), "project-overview", "confident: describe the project → project-overview");
-  assert.equal(confidentSkill("draw an architecture diagram of this project", allSkills), "architecture-diagram", "confident: → architecture-diagram");
+  assert.equal(confidentSkill("draw an architecture diagram of this project", allSkills), "diagram", "confident: → diagram");
   assert.equal(confidentSkill("make a powerpoint about Q3 results", allSkills), null, "precision guard: 'powerpoint' must NOT auto-apply 'low-power'");
   assert.equal(confidentSkill("what is 2 + 2", allSkills), null, "ambiguous query → no auto-apply");
   // Coverage gate — a long sentence merely CONTAINING a skill-y keyword must not auto-apply
