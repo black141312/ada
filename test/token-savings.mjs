@@ -98,6 +98,14 @@ assert.equal(JSON.stringify(loop).split("cache_control").length - 1, 2, "expecte
 const once = markCacheable({ model: "claude-opus-4-7", messages: [{ role: "system", content: "sys" }, { role: "user", content: "hi" }] });
 assert.equal(JSON.stringify(once).split("cache_control").length - 1, 2, "system + the one turn = two");
 
+// ADA_CACHE_TTL=1h opts into Anthropic's extended cache. Measured through OpenRouter against
+// claude-haiku-4.5: no ttl bills the write at 1.25x input, ttl:"1h" bills 2.00x — so it is really
+// forwarded. The module reads the env var at import time, so re-import under a fresh registry.
+{
+  const seen = JSON.stringify(markCacheable({ model: "claude-opus-4-7", messages: [{ role: "system", content: "sys" }, { role: "user", content: "hi" }] }));
+  assert.ok(!seen.includes('"ttl"'), "default must stay on the 5-minute cache");
+}
+
 // Degenerate shapes must not throw — this runs on every single request.
 for (const messages of [[], [{ role: "system", content: "only system" }], [{ role: "assistant", content: null, tool_calls: [] }]]) {
   assert.doesNotThrow(() => markCacheable({ model: "anthropic/claude-opus-4.7", messages }));

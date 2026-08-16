@@ -19,8 +19,21 @@ const ADA_VERSION = (() => {
   }
 })();
 
-type Part = { type: string; text?: string; cache_control?: { type: string } };
+type Part = { type: string; text?: string; cache_control?: { type: string; ttl?: string } };
 type Msg = { role?: string; content?: unknown };
+
+/** How long a cache entry lives. `ADA_CACHE_TTL=1h` opts into Anthropic's extended cache; anything
+ *  else leaves the 5-minute default. Measured through OpenRouter against claude-haiku-4.5: a write
+ *  with no `ttl` bills 1.25x input, a write with `ttl:"1h"` bills 2.00x — so it IS forwarded, and no
+ *  `anthropic-beta` header is needed. Reads bill 0.1x under either.
+ *
+ *  Which to pick is a question about the gap between turns, not about the model. Under 5 minutes the
+ *  default already reads at 0.1x and 1h only costs you the extra 0.75x on the write. Over 5 minutes
+ *  the default has expired and every turn re-writes at 1.25x, while 1h reads at 0.1x — so 1h pays for
+ *  itself on the second turn and wins by more on every one after. Human-paced sessions clear that
+ *  bar constantly; a tight agentic loop does not. */
+const CACHE_TTL_1H = process.env.ADA_CACHE_TTL === "1h";
+const cacheControl = (): { type: string; ttl?: string } => (CACHE_TTL_1H ? { type: "ephemeral", ttl: "1h" } : { type: "ephemeral" });
 
 /** Claude is the only family that has to be ASKED to cache. DeepSeek, Kimi and OpenAI cache
  *  automatically — which is why their runs report a hit rate and Claude's report none at all.
@@ -72,7 +85,7 @@ export function markCacheable(body: Record<string, unknown>): Record<string, unk
       typeof m.content === "string" ? [{ type: "text", text: m.content }] : Array.isArray(m.content) ? [...(m.content as Part[])] : null;
     if (!parts?.length) return; // assistant turns can be tool_calls with null content
     if (parts.some((p) => p.cache_control)) return; // already marked — don't spend a second breakpoint
-    parts[parts.length - 1] = { ...parts[parts.length - 1]!, cache_control: { type: "ephemeral" } };
+    parts[parts.length - 1] = { ...parts[parts.length - 1]!, cache_control: cacheControl() };
     out[at] = { ...m, content: parts };
     marked = true;
   };
