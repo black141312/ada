@@ -18,6 +18,12 @@ export function isLocalBackend(backendUrl: string): boolean {
   }
 }
 
+/** The OpenAI-compatible model list. Every gateway worth pointing at answers this — it is what
+ *  "OpenAI-compatible" means — whereas /health is OUR path and nobody else implements it. */
+export function modelsUrl(backendUrl: string): string {
+  return `${backendUrl.replace(/\/+$/, "")}/models`;
+}
+
 /** Probe the backend's /health. The URL passed in is `<base>/v1`; /health is at the base, not /v1. */
 export function healthUrl(backendUrl: string): string {
   try {
@@ -62,6 +68,11 @@ function serverBin(): string {
 export async function ensureBackend(backendUrl: string, opts?: { quiet?: boolean; waitMs?: number }): Promise<"running" | "started" | "remote" | "failed"> {
   const probeUrl = healthUrl(backendUrl);
   if (await probe(probeUrl)) return "running";
+  // /health is ada-server's OWN path. Asking only that turns "is a usable backend here?" into "is
+  // MY server here?" — so pointing ada at any other local gateway (OmniRoute, LiteLLM, a plain
+  // llama.cpp server) made it try to boot ada-server over the top, fail, and never send the
+  // request at all. If the URL serves an OpenAI-compatible model list, it is a backend; use it.
+  if (await probe(modelsUrl(backendUrl))) return "running";
   if (!isLocalBackend(backendUrl)) return "remote";
 
   if (!opts?.quiet) process.stderr.write("\x1b[2mstarting ada-server…\x1b[0m ");
@@ -93,7 +104,7 @@ export async function ensureBackend(backendUrl: string, opts?: { quiet?: boolean
   const deadline = Date.now() + (opts?.waitMs ?? 9000);
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 150));
-    if (await probe(probeUrl, 400)) {
+    if ((await probe(probeUrl, 400)) || (await probe(modelsUrl(backendUrl), 400))) {
       if (!opts?.quiet) process.stderr.write("\x1b[32mok\x1b[0m\n");
       return "started";
     }

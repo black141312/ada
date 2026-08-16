@@ -12,6 +12,11 @@ export interface ProviderDef {
 export const PROVIDERS: Record<ProviderName, ProviderDef> = {
   openai: { baseURL: "https://api.openai.com/v1", keyEnv: "OPENAI_API_KEY" },
   anthropic: { baseURL: "https://api.anthropic.com/v1", keyEnv: "ANTHROPIC_API_KEY" },
+  // ChatGPT Plus/Pro — reached through the Codex Responses endpoint, not the OpenAI API, and paid
+  // for by the subscription rather than per token. Sign in with `ada login chatgpt`; there is no
+  // API key for this route (ANTHROPIC/OPENAI keys go to `anthropic`/`openai`). The env var is an
+  // escape hatch for a token you already hold, e.g. one lifted from the Codex CLI.
+  chatgpt: { baseURL: process.env.CHATGPT_BASE_URL ?? "https://chatgpt.com/backend-api/codex", keyEnv: "CHATGPT_ACCESS_TOKEN" },
   google: { baseURL: "https://generativelanguage.googleapis.com/v1beta/openai", keyEnv: "GEMINI_API_KEY" },
   mistral: { baseURL: "https://api.mistral.ai/v1", keyEnv: "MISTRAL_API_KEY" },
   openrouter: { baseURL: "https://openrouter.ai/api/v1", keyEnv: "OPENROUTER_API_KEY" },
@@ -35,6 +40,10 @@ export const PROVIDERS: Record<ProviderName, ProviderDef> = {
     keyEnv: "CLOUDFLARE_API_TOKEN",
   },
   ollama: { baseURL: process.env.OLLAMA_BASE_URL ?? "http://localhost:11434/v1", keyEnv: "" },
+  // A local OmniRoute gateway (github.com/diegosouzapw/OmniRoute) — one more OpenAI-compatible
+  // upstream, reached as `omniroute/<model>`. Keyless like Ollama because it runs on the user's own
+  // machine and holds its own provider keys; OMNIROUTE_API_KEY is honoured if theirs is protected.
+  omniroute: { baseURL: process.env.OMNIROUTE_BASE_URL ?? "http://localhost:20128/v1", keyEnv: "OMNIROUTE_API_KEY" },
 };
 
 // ADA_PORT wins for local dev; PORT is the convention PaaS hosts (Render, Cloud Run, Railway) inject.
@@ -47,12 +56,18 @@ export function clientKeys(): string[] | null {
   return v.split(",").map((s) => s.trim()).filter(Boolean);
 }
 
-/** The upstream provider key: env var first, then a stored credential (API key or OAuth token). */
+/** The upstream provider key: env var first, then a stored credential (API key or OAuth token).
+ *
+ *  Exception: a *subscription* login beats the env var. Signing in with `ada login claude` is a
+ *  deliberate, recent act — if a stale ANTHROPIC_API_KEY in someone's shell silently won, they'd be
+ *  billed per token while believing their Pro plan was paying. Callers that can await should prefer
+ *  `freshToken()` (providers/subscription-oauth.ts), which also renews an expired access token. */
 export function providerKey(p: ProviderName): string | undefined {
   const env = PROVIDERS[p].keyEnv;
-  if (env && process.env[env]) return process.env[env];
   const cred = getCredential(p);
-  if (cred) return cred.type === "oauth" ? cred.access : cred.key;
+  if (cred?.type === "oauth" && cred.access) return cred.access;
+  if (env && process.env[env]) return process.env[env];
+  if (cred) return cred.key;
   return undefined; // keyless provider (Ollama) or unconfigured
 }
 
@@ -68,11 +83,24 @@ export function configuredProviders(): ProviderName[] {
 }
 
 /** Every provider + whether/how it's configured — the truth behind "what is ada connected to?".
- *  source: env = key env var set · key = stored credential (/connect) · keyless = no key needed (Ollama). */
-export function providerStatus(): Array<{ name: ProviderName; configured: boolean; source: "env" | "key" | "keyless" | "none" }> {
+ *  source: subscription = signed in with a Claude/ChatGPT plan (`ada login`) · env = key env var set ·
+ *  key = stored API key (/connect) · keyless = no key needed (Ollama). */
+export function providerStatus(): Array<{ name: ProviderName; configured: boolean; source: "subscription" | "env" | "key" | "keyless" | "none" }> {
   return (Object.keys(PROVIDERS) as ProviderName[]).map((p) => {
     const env = PROVIDERS[p].keyEnv;
-    const source = env === "" ? "keyless" : process.env[env] ? "env" : getCredential(p) ? "key" : p === "copilot" && process.env.COPILOT_GITHUB_TOKEN ? "env" : "none";
+    const cred = getCredential(p);
+    const source =
+      cred?.type === "oauth" && cred.access
+        ? "subscription"
+        : env === ""
+          ? "keyless"
+          : process.env[env]
+            ? "env"
+            : cred
+              ? "key"
+              : p === "copilot" && process.env.COPILOT_GITHUB_TOKEN
+                ? "env"
+                : "none";
     return { name: p, configured: source !== "none", source };
   });
 }

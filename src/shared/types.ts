@@ -3,6 +3,7 @@
 export type ProviderName =
   | "openai"
   | "anthropic"
+  | "chatgpt" // a ChatGPT Plus/Pro subscription (Codex endpoint), NOT the pay-per-token openai API
   | "google"
   | "mistral"
   | "openrouter"
@@ -13,7 +14,8 @@ export type ProviderName =
   | "dashscope"
   | "copilot"
   | "cloudflare"
-  | "ollama";
+  | "ollama"
+  | "omniroute";
 
 export interface ModelInfo {
   id: string;

@@ -10,6 +10,8 @@ that holds every provider key and speaks one wire
 format to the client.
 
 ![ada architecture](docs/architecture.svg)
+use ada code from here https://github.com/black141312/ada-releases
+we udpate our progress here https://adacodelabs.com/
 
 The client talks **only** OpenAI Chat Completions to the backend. The backend routes each request
 to the right provider by model id and normalizes every provider back to that one format — so a new
@@ -229,6 +231,7 @@ are supported; their tools appear as `<server>__<tool>`, approval-gated, in trus
 | `ADA_PORT` | `8787` | Listen port |
 | `ADA_CLIENT_KEYS` | *(unset = dev/no-auth)* | Comma-separated allowed client keys |
 | `ADA_REQUIRE_LOGIN` / `ADA_ALLOWED_USERS` | — | Gate access to verified GitHub/Google users |
+| `ADA_FREE_MODELS` | *(unset)* | Extra model IDs the free tier may use, comma-separated (e.g. `deepseek/deepseek-v4-flash-0731`) on top of `:free`-suffixed ones |
 | `OLLAMA_BASE_URL` | `http://localhost:11434/v1` | Local Ollama endpoint |
 | *(provider keys)* | — | See the [Providers](#providers) table |
 
@@ -270,6 +273,12 @@ ada can run **SWE-bench Verified** — it generates patches for real GitHub issu
 clone per task), emitting an official-format `predictions.jsonl` that the official `swebench` Docker
 harness scores. `node bench/swebench.mjs --dataset … --model … --out runs/x`. See
 **[bench/README.md](bench/README.md)** for the full flow (dataset, prereqs, scoring command).
+
+**Measured against Claude Code** — same machine, same model (Opus 4.7), same prompts, matched
+git worktrees at the same commit, five tasks in this repository: **444k tokens against 893k,
+$3.05 against $4.68**, cheaper on four of five tasks. The full write-up — screenshots, per-task
+tables, a six-build storefront case study, method and known limits (including the task it lost) —
+is **[docs/product-report-v0.1.23.pdf](docs/product-report-v0.1.23.pdf)**.
 
 ## Contributing
 

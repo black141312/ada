@@ -4,14 +4,37 @@
 
 import { createServer, type Server } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import type { ProviderName } from "../shared/types.ts";
 import { PORT, PROVIDERS, clientKeys, configuredProviders, isConfigured, providerKey, providerStatus } from "./config.ts";
 import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, createSeat, disableSeat, disableSeatByExternalId, enterpriseMode, extractLastUsage, identifySeat, listSeats, loadPolicy, modelAllowed, savePolicy, upsertSeatForSSO, usageSummary, validatePolicy } from "./enterprise.ts";
-import { allowedUsers, isAllowed, verifyIdentity } from "./identity.ts";
-import { auth, betterAuthEnabled, verifyBetterAuth } from "./auth.ts";
-import { toNodeHandler } from "better-auth/node";
+import { adminUsers, verifyIdentity } from "./identity.ts";
+import { addAllowed, isAllowedUser, listAllowed, removeAllowed } from "./allowlist.ts";
+import { billableUsageSince, recordUsage } from "./usage.ts";
+import { billingWebhookImplemented, checkEntitlement, effectivePlan, isFreeModel, PLANS, planFor, periodStart, setPlan, type PlanName } from "./plans.ts";
+import { checkoutUrl, createCheckout, getCheckout, setCheckoutPlan } from "./billing.ts";
+import { createKelviqCheckout, getKelviqCatalog, handleKelviqWebhook, kelviqEnabled, verifyKelviqSignature, type KelviqEvent } from "./kelviq.ts";
+import { computeAnalytics } from "./analytics.ts";
+import { ANALYTICS_PAGE } from "./analytics-page.ts";
 
-const betterAuthHandler = toNodeHandler(auth);
+/** The anonymous free-tier pseudo-identity — no account, so nothing to meter or bill. */
+const isAnonymous = (who: Identity): boolean => who.user === "anon" && String(who.role) === "free";
+// ./auth.ts is imported ON DEMAND, never at startup. It builds Better Auth eagerly, which opens a
+// database — and without DATABASE_URL that means better-sqlite3, which the DESKTOP BUNDLE
+// deliberately ships without (ada-app's extraResources filter drops it). A static import here made
+// the packaged app's local gateway die on "Cannot find module 'better-sqlite3'" the instant it
+// started, with the app silently falling back to the hosted backend. Better Auth is off unless
+// BETTER_AUTH_ENABLED is set, so on that path nothing here needs a database at all.
+const betterAuthEnabled = (): boolean => process.env.BETTER_AUTH_ENABLED === "1" || process.env.BETTER_AUTH_ENABLED === "true";
+
+let authHandler: ((req: IncomingMessage, res: ServerResponse) => unknown) | null = null;
+async function betterAuthHandler(req: IncomingMessage, res: ServerResponse): Promise<unknown> {
+  if (!authHandler) {
+    const [{ auth }, { toNodeHandler }] = await Promise.all([import("./auth.ts"), import("better-auth/node")]);
+    authHandler = toNodeHandler(auth);
+  }
+  return authHandler(req, res);
+}
 
 // Device sign-in page: Continue with GitHub → (return signed in) → auto-approve the code.
 const DEVICE_PAGE = `<!doctype html><meta charset="utf-8"><title>Ada — sign in</title>
@@ -35,6 +58,8 @@ q('#gh').onclick=async()=>{ const u=await session(); if(u){await approve();retur
 import { assertOidcConfig, discover, isProvisionAllowed, mapIdentityToSeatFields, oidcConfig, oidcEnabled, verifyOidcToken } from "./oidc.ts";
 import { adapterFor } from "./providers/registry.ts";
 import { route } from "./router.ts";
+import { clientAbort, proxyUpstream, upstream, upstreamModels } from "./upstream.ts";
+import { hasSubscription } from "./providers/subscription-oauth.ts";
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -48,7 +73,10 @@ function readBody(req: IncomingMessage): Promise<string> {
 function locked(): boolean {
   // OIDC must lock the backend the instant ADA_OIDC_ISSUER is set — BEFORE any seat exists — else a
   // fresh SSO deployment with zero seats would fall through identify() to dev-open.
-  return enterpriseMode() || clientKeys() !== null || allowedUsers() !== null || oidcEnabled() || betterAuthEnabled() || !!process.env.ADA_REQUIRE_LOGIN;
+  // adminUsers() still locks: setting it means the operator intends a gated server, and it kept that
+  // meaning under its old name (ADA_ALLOWED_USERS). Dropping it here would silently open a backend
+  // on upgrade for anyone who only ever set that one variable.
+  return enterpriseMode() || clientKeys() !== null || adminUsers() !== null || oidcEnabled() || betterAuthEnabled() || !!process.env.ADA_REQUIRE_LOGIN;
 }
 
 /** Resolve a request to WHO is making it. Order: seat key / ADA_ADMIN_KEY (enterprise), legacy
@@ -81,7 +109,10 @@ async function identify(req: IncomingMessage): Promise<Identity | "corrupt" | nu
     // authenticate at /v1/auth/oidc/exchange and then carry a seat key, not an id_token, per request.)
     if (!oidcEnabled()) {
       const id = await verifyIdentity(token); // GitHub / Google login
-      if (id && isAllowed(id.user)) return { user: id.user, role: "dev" };
+      // No allow-list here any more. Membership was the wrong gate for a product anyone can sign up
+      // for — everyone authenticated gets in, and plans.ts decides what they're entitled to. A new
+      // account lands on `free`, which permits `:free` models only and costs nothing upstream.
+      if (id) return { user: id.user, role: "dev" };
     }
     // Better Auth session token (accounts served at /api/auth/*) — attributed to the real user.
     // GATED on betterAuthEnabled(): the /api/auth/* signup route is always mounted (pre-auth) with
@@ -89,8 +120,8 @@ async function identify(req: IncomingMessage): Promise<Identity | "corrupt" | nu
     // account and bypass a backend locked by seats / admin key / ADA_CLIENT_KEYS / allowlist / OIDC.
     // Accounts are a valid credential only when Better Auth is the intended gate. Allowlist applies too.
     if (betterAuthEnabled()) {
-      const acct = await verifyBetterAuth(token);
-      if (acct && isAllowed(acct)) return { user: acct, role: "dev" };
+      const acct = await (await import("./auth.ts")).verifyBetterAuth(token);
+      if (acct) return { user: acct, role: "dev" };
     }
   }
   return locked() ? null : { user: "dev", role: "dev" }; // dev mode: open
@@ -101,20 +132,35 @@ function json(res: ServerResponse, status: number, obj: unknown): void {
   res.end(JSON.stringify(obj));
 }
 
-// Freemium: with ADA_FREE_TIER=1, unauthenticated requests may use `:free` models only (they cost
-// nothing upstream). Signed-in users get the full catalog. Off by default — locked stays locked.
+// Freemium: with ADA_FREE_TIER=1, unauthenticated requests may use free-tier models only (`:free`
+// suffix, plus any listed in ADA_FREE_MODELS). Signed-in users get the full catalog. Off by
+// default — locked stays locked.
 function freeTierEnabled(): boolean {
   return process.env.ADA_FREE_TIER === "1" || process.env.ADA_FREE_TIER === "true";
 }
-const isFreeModel = (id: string) => /:free$/i.test(id);
 
 async function handleModels(res: ServerResponse, freeOnly = false): Promise<void> {
-  const data: Array<{ id: string; object: "model"; owned_by: string }> = [];
+  const data: Array<{ id: string; object: "model"; owned_by: string; free?: true }> = [];
   for (const p of configuredProviders()) {
     const ids = await adapterFor(p).listModels(p);
     for (const id of ids) {
-      if (freeOnly && !isFreeModel(id)) continue;
-      data.push({ id, object: "model", owned_by: p });
+      const free = isFreeModel(id);
+      if (freeOnly && !free) continue;
+      // `free` tells clients what the free tier covers — ADA_FREE_MODELS entries have no `:free`
+      // suffix, so a client guessing from the id would mark them locked.
+      data.push(free ? { id, object: "model", owned_by: p, free } : { id, object: "model", owned_by: p });
+    }
+  }
+  // Everything the upstream can serve, minus anything we already serve ourselves — a locally-held
+  // subscription must win, or the same id would be listed twice and the picker would send it to
+  // whichever entry it saw first.
+  const up = upstream();
+  if (up) {
+    const mine = new Set(data.map((m) => m.id));
+    for (const m of await upstreamModels(up)) {
+      if (mine.has(m.id)) continue;
+      if (freeOnly && m.free !== true) continue;
+      data.push(m.free ? { id: m.id, object: "model", owned_by: m.owned_by ?? "upstream", free: true } : { id: m.id, object: "model", owned_by: m.owned_by ?? "upstream" });
     }
   }
   json(res, 200, { object: "list", data });
@@ -131,9 +177,9 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
 
   const model = String(body.model ?? "");
   if (!model) return json(res, 400, { error: { message: "missing 'model'" } });
-  // Anonymous free tier may only touch `:free` models — everything else needs sign-in.
+  // Anonymous free tier may only touch free-tier models — everything else needs sign-in.
   if (who.user === "anon" && String(who.role) === "free" && !isFreeModel(model)) {
-    return json(res, 403, { error: { message: `sign in to use ${model} — without an account only :free models are available` } });
+    return json(res, 403, { error: { message: `sign in to use ${model} — without an account only free-tier models are available` } });
   }
 
   // Org policy: model allowlist (enterprise). Enforced server-side so a modified client can't skip it.
@@ -149,14 +195,55 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
     return json(res, 403, { error: { message: `model '${model}' is not allowed by org policy (allowed: ${policy.models!.join(", ")})` } });
   }
 
+  // Routed early, because whether Ada's plan applies at all depends on WHO pays for this request.
   // When an allowlist is active, IGNORE the client's `provider` hint — else a seat holder could
   // send an allowlisted model id with a different provider and leak the body to it before the
   // upstream rejects the id. Route by the model id only.
   const explicit = policy.models?.length ? undefined : typeof body.provider === "string" ? body.provider : undefined;
   const provider = route(model, explicit);
+
+  // A request served by a subscription on THIS machine is paid for by that plan, direct to the
+  // vendor — Ada never sees a token of it. Metering it against Ada's own quota would bill the user
+  // twice over: once to Anthropic/OpenAI, and again against an allowance they aren't consuming.
+  // (Only credentials held locally count. Anything forwarded upstream is metered there as before.)
+  const paidBySubscription = (provider === "anthropic" || provider === "chatgpt") && hasSubscription(provider) && isConfigured(provider);
+
+  // Requests we're about to FORWARD aren't ours to police either. The upstream applies its own
+  // plan and quota — it's the one paying — and a local gateway's plan store is a private, usually
+  // empty file in which every user looks like a fresh free account. Enforcing it here denied
+  // perfectly valid models before they ever reached the backend that would have allowed them.
+  const willForward = !isConfigured(provider) && !!upstream();
+
+  // Plan quota. Skipped for the anonymous free tier (already restricted to `:free` above, and there
+  // is no account to meter against) and for enterprise seats, which are governed by org policy and
+  // billed by contract rather than by plan.
+  if (!isAnonymous(who) && !enterpriseMode() && !paidBySubscription && !willForward) {
+    const ent = await checkEntitlement(who.user, model);
+    if (!ent.ok) {
+      appendAudit({ ts: Date.now(), user: who.user, event: ent.status === 402 ? "quota_exceeded" : "plan_denied_model", detail: model });
+      // The body carries plan/used/limit so a client can render "you're out" without a second call.
+      return json(res, ent.status!, { error: { message: ent.message, type: ent.status === 402 ? "insufficient_quota" : "plan_restricted" }, plan: ent.plan, used: ent.used, limit: ent.limit });
+    }
+  }
+
   if (!isConfigured(provider)) {
+    // Can't serve it here — but if this gateway fronts a hosted backend, that one probably can.
+    // This is what lets a local gateway use the subscription for Claude while OpenRouter, quotas
+    // and metering keep working through the hosted server exactly as before.
+    const up = upstream();
+    if (up) {
+      delete body.provider; // our routing hint, never forwarded
+      return await proxyUpstream(up, "/chat/completions", body, res, clientAbort(req, res));
+    }
     return json(res, 400, {
-      error: { message: `provider '${provider}' not configured — set ${PROVIDERS[provider].keyEnv} on the backend` },
+      error: {
+        // chatgpt has no practical API-key route — naming its env var here would send people
+        // looking for a key that doesn't exist. Point at the sign-in instead.
+        message:
+          provider === "chatgpt"
+            ? "not signed in to ChatGPT — run `ada login chatgpt` (needs a Plus/Pro plan)"
+            : `provider '${provider}' not configured — set ${PROVIDERS[provider].keyEnv} on the backend`,
+      },
     });
   }
 
@@ -168,19 +255,52 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
   // upstream reported. Wrapping res keeps this in ONE place for every adapter.
   {
     let tail = "";
+    // Timing lives here for the same reason the token count does: one place, every adapter. Split
+    // into two numbers because they fail differently — a long ttft is the model queueing or
+    // thinking before it says anything (and a throttled subscription looks exactly like this),
+    // while a long tail after first byte is just generation. One combined number hides which.
+    const started = Date.now();
+    let ttft: number | null = null;
+    // `res.write` is typed `never` here by the cast below, so the check lives in its own function
+    // where the argument can be typed honestly as unknown.
+    const firstOutput = (c: unknown): boolean =>
+      (typeof c === "string" || Buffer.isBuffer(c)) && /"(content|tool_calls|reasoning_content)":/.test(c.toString());
     const scan = (c: unknown): void => {
       if (typeof c === "string" || Buffer.isBuffer(c)) tail = (tail + c.toString()).slice(-16_384);
     };
     const write = res.write.bind(res);
     const end = res.end.bind(res);
     res.write = ((c: never, ...a: never[]) => {
+      // First chunk carrying real MODEL output, not our own opening frame. Every adapter emits a
+      // `{role:"assistant"}` chunk the moment it writes headers, so timing the first write measured
+      // us, not the model — it read as ~1ms every time and made the number worthless.
+      if (ttft === null && firstOutput(c)) {
+        ttft = Date.now() - started;
+      }
       scan(c);
       return write(c, ...a);
     }) as typeof res.write;
     res.end = ((c?: never, ...a: never[]) => {
       scan(c);
       const u = extractLastUsage(tail);
-      if (u) appendUsage({ ts: Date.now(), user: who.user, model, provider, promptTokens: u.promptTokens, completionTokens: u.completionTokens });
+      if (u) {
+        // Same row to both sinks: the file is the self-hosted record, the table is the one that
+        // survives a container restart and can therefore be billed against.
+        const row = {
+          ts: Date.now(),
+          user: who.user,
+          model,
+          provider,
+          promptTokens: u.promptTokens,
+          completionTokens: u.completionTokens,
+          ...(u.cacheRead != null ? { cacheRead: u.cacheRead } : {}),
+          ...(u.cacheWrite != null ? { cacheWrite: u.cacheWrite } : {}),
+          ms: Date.now() - started,
+          ...(ttft != null ? { ttftMs: ttft } : {}),
+        };
+        appendUsage(row);
+        void recordUsage(row); // fire-and-forget: this is response teardown, nothing can await here
+      }
       return end(c, ...a);
     }) as typeof res.end;
   }
@@ -243,7 +363,11 @@ async function handleEmbeddings(req: IncomingMessage, res: ServerResponse, who: 
   });
   const text = await upstream.text();
   const u = extractLastUsage(text); // embedding responses report prompt_tokens
-  if (u) appendUsage({ ts: Date.now(), user: who.user, model, provider, promptTokens: u.promptTokens, completionTokens: 0 });
+  if (u) {
+    const row = { ts: Date.now(), user: who.user, model, provider, promptTokens: u.promptTokens, completionTokens: 0 };
+    appendUsage(row);
+    void recordUsage(row);
+  }
   res.writeHead(upstream.status, { "content-type": "application/json" });
   res.end(text);
 }
@@ -302,7 +426,11 @@ async function handleImages(req: IncomingMessage, res: ServerResponse, who: Iden
     body: JSON.stringify({ ...body, model }),
   });
   const text = await upstream.text();
-  if (upstream.ok) appendUsage({ ts: Date.now(), user: who.user, model, provider: "openai", promptTokens: 0, completionTokens: 0 });
+  if (upstream.ok) {
+    const row = { ts: Date.now(), user: who.user, model, provider: "openai" as const, promptTokens: 0, completionTokens: 0 };
+    appendUsage(row);
+    void recordUsage(row);
+  }
   res.writeHead(upstream.status, { "content-type": "application/json" });
   res.end(text);
 }
@@ -382,15 +510,168 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       res.writeHead(200, { "content-type": "text/plain" });
       return res.end("ada backend ok");
     }
+    // The website is a different origin and reads the public billing routes from the browser
+    // (plan catalog, session status, purchase). CORS opens exactly those routes — they carry no
+    // bearer credential by design, so "*" widens nothing. Authenticated APIs stay CORS-closed.
+    if (url.pathname.startsWith("/v1/billing/")) {
+      res.setHeader("access-control-allow-origin", "*");
+      res.setHeader("access-control-allow-headers", "content-type");
+      res.setHeader("access-control-allow-methods", "GET, POST, OPTIONS");
+      if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        return res.end();
+      }
+    }
     // Pre-auth login routes (a locked backend must still let a new user authenticate).
     if (req.method === "GET" && url.pathname === "/v1/auth/methods") return await handleAuthMethods(res);
     if (req.method === "POST" && url.pathname === "/v1/auth/oidc/exchange") return await handleOidcExchange(req, res);
     // Better Auth: accounts, sessions, social login, API keys, device flow.
     if (url.pathname.startsWith("/api/auth")) return betterAuthHandler(req, res);
+    // The public plan catalog. PRE-AUTH: it powers the website's pricing/upgrade pages, which are
+    // static and unauthenticated. With Kelviq configured, plans and prices come from the Kelviq
+    // dashboard (edit there, live within a minute); PLANS in code stays the quota truth per tier.
+    if (req.method === "GET" && url.pathname === "/v1/billing/plans") {
+      if (!kelviqEnabled()) {
+        const plans = (Object.keys(PLANS) as PlanName[]).map((p) => ({
+          plan: p,
+          kelviqPlan: null,
+          label: PLANS[p].label,
+          models: PLANS[p].models,
+          monthlyTokens: PLANS[p].monthlyTokens,
+          prices: null,
+        }));
+        return json(res, 200, { source: "static", currency: "USD", symbol: "$", plans });
+      }
+      try {
+        const c = await getKelviqCatalog();
+        const plans = c.plans.map((k) => ({
+          plan: k.plan,
+          kelviqPlan: k.identifier,
+          label: k.name,
+          models: PLANS[k.plan].models,
+          monthlyTokens: PLANS[k.plan].monthlyTokens,
+          prices: k.prices,
+        }));
+        return json(res, 200, { source: "kelviq", currency: c.currency, symbol: c.symbol, plans });
+      } catch (e) {
+        return json(res, 502, { error: { message: `plan catalog unavailable: ${e instanceof Error ? e.message : e}` } });
+      }
+    }
+    // Pick a plan on a pending session → the hosted payment URL. PRE-AUTH like the session read:
+    // the 256-bit session id is the authorization, and this is the only thing it authorizes.
+    const purchase = url.pathname.match(/^\/v1\/billing\/checkout\/([^/]+)\/purchase$/);
+    if (req.method === "POST" && purchase) {
+      const s = await getCheckout(decodeURIComponent(purchase[1]!));
+      if (!s) return json(res, 404, { error: { message: "unknown or invalid checkout session" } });
+      if (s.status !== "pending") return json(res, 410, { error: { message: `this upgrade link is ${s.status}` } });
+      if (!kelviqEnabled()) return json(res, 501, { error: { message: "payments not configured on this server" } });
+      let b: { plan?: string; chargePeriod?: string };
+      try {
+        b = JSON.parse(await readBody(req));
+      } catch {
+        return json(res, 400, { error: { message: "invalid JSON body" } });
+      }
+      try {
+        const catalog = await getKelviqCatalog();
+        // Accept either our tier name ("pro") or Kelviq's identifier ("pro-monthly").
+        const want = String(b.plan ?? s.plan);
+        const target = catalog.plans.find((k) => k.identifier === want) ?? catalog.plans.find((k) => k.plan === want);
+        if (!target || target.plan === "free") return json(res, 400, { error: { message: `pick a paid plan from the catalog` } });
+        if (target.plan !== s.plan) await setCheckoutPlan(s.id, target.plan);
+        const back = checkoutUrl(s.id);
+        const co = await createKelviqCheckout({
+          kelviqPlan: target.identifier,
+          user: s.user,
+          sessionId: s.id,
+          successUrl: `${back}&paid=1`,
+          cancelUrl: back,
+          chargePeriod: typeof b.chargePeriod === "string" ? b.chargePeriod : undefined,
+        });
+        appendAudit({ ts: Date.now(), user: s.user, event: "checkout_payment_started", detail: `${target.identifier} (${target.plan})` });
+        return json(res, 200, { url: co.checkoutUrl });
+      } catch (e) {
+        return json(res, 502, { error: { message: e instanceof Error ? e.message : String(e) } });
+      }
+    }
+    // Read a checkout session. PRE-AUTH deliberately: the website that renders it is static and has
+    // no credential. Safe because the id is 256 bits of randomness and reading it reveals only the
+    // plan being bought — it grants no API access and can't be replayed once spent.
+    if (req.method === "GET" && url.pathname.startsWith("/v1/billing/checkout/")) {
+      const s = await getCheckout(decodeURIComponent(url.pathname.slice("/v1/billing/checkout/".length)));
+      if (!s) return json(res, 404, { error: { message: "unknown or invalid checkout session" } });
+      const def = PLANS[s.plan];
+      // The user id is NOT returned. The page doesn't need it, and not sending it means a leaked
+      // link can't be used to enumerate accounts.
+      return json(res, 200, {
+        plan: s.plan,
+        label: def.label,
+        models: def.models,
+        monthlyTokens: def.monthlyTokens,
+        status: s.status,
+        expiresAt: s.expiresAt,
+      });
+    }
+    // Payment provider callback — PRE-AUTH by necessity. A webhook carries no bearer token; it
+    // authenticates by signing the body, so behind identify() it would 401 forever and the provider
+    // would only ever show delivery failures. Closed until that signature check exists (see the note
+    // on billingWebhookImplemented). 501 rather than 404 so a misconfigured provider fails loudly
+    // instead of looking like a typo'd URL.
+    if (url.pathname === "/v1/billing/webhook") {
+      if (kelviqEnabled() && process.env.KELVIQ_WEBHOOK_SECRET) {
+        if (req.method !== "POST") return json(res, 405, { error: { message: "POST only" } });
+        const raw = await readBody(req);
+        const ok = verifyKelviqSignature(
+          {
+            id: String(req.headers["webhook-id"] ?? ""),
+            timestamp: String(req.headers["webhook-timestamp"] ?? ""),
+            signature: String(req.headers["webhook-signature"] ?? ""),
+          },
+          raw,
+        );
+        if (!ok) return json(res, 401, { error: { message: "invalid webhook signature" } });
+        let evt: KelviqEvent;
+        try {
+          evt = JSON.parse(raw) as KelviqEvent;
+        } catch {
+          return json(res, 400, { error: { message: "invalid JSON" } });
+        }
+        const outcome = await handleKelviqWebhook(evt);
+        if (outcome) appendAudit({ ts: Date.now(), user: "kelviq", event: "billing_webhook", detail: outcome });
+        return json(res, 200, { received: true });
+      }
+      if (!billingWebhookImplemented()) {
+        return json(res, 501, { error: { message: "billing webhook not implemented — set plans via POST /v1/plans until a payment provider is wired" } });
+      }
+    }
     // Device-flow approval page (the verification_uri the CLI prints).
     if (req.method === "GET" && url.pathname === "/device") {
       res.writeHead(200, { "content-type": "text/html" });
       return res.end(DEVICE_PAGE);
+    }
+    // Analytics dashboard shell. PRE-AUTH on purpose: the page is an empty instrument panel that
+    // holds no data — it asks for a credential and calls the (gated) API below with it.
+    if (req.method === "GET" && url.pathname === "/admin/analytics") {
+      res.writeHead(200, { "content-type": "text/html" });
+      return res.end(ANALYTICS_PAGE);
+    }
+    // Analytics via shared password. ADA_ANALYTICS_PASSWORD grants the dashboard WITHOUT an admin
+    // account — for operators who want to hand a viewer credential to someone (or themselves)
+    // before the admin list is set up. The password lives in the deployment env, never in source;
+    // unset ⇒ this path is off and only the authenticated admin route below serves the data.
+    if (req.method === "GET" && url.pathname === "/v1/admin/analytics" && process.env.ADA_ANALYTICS_PASSWORD) {
+      const h = req.headers["authorization"];
+      const token = typeof h === "string" && h.startsWith("Bearer ") ? h.slice(7) : "";
+      const want = Buffer.from(process.env.ADA_ANALYTICS_PASSWORD);
+      const got = Buffer.from(token);
+      if (got.length === want.length && timingSafeEqual(got, want)) {
+        const days = Math.min(365, Math.max(1, Number(url.searchParams.get("days")) || 30));
+        try {
+          return json(res, 200, await computeAnalytics(days));
+        } catch (e) {
+          return json(res, 500, { error: { message: e instanceof Error ? e.message : String(e) } });
+        }
+      }
+      // fall through: a non-matching token may still be a real admin identity
     }
 
     let who = await identify(req);
@@ -407,6 +688,94 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
 
     if (req.method === "GET" && url.pathname === "/v1/whoami") {
       return json(res, 200, { ok: true, user: who.user, role: who.role });
+    }
+    // What am I on, and how much is left? Self-serve: a client shouldn't have to hit a 402 to learn
+    // it's near the limit. Anonymous callers get the free plan's shape with no usage attached.
+    if (req.method === "GET" && url.pathname === "/v1/plan") {
+      if (isAnonymous(who)) return json(res, 200, { plan: "free", status: "active", used: 0, limit: PLANS.free.monthlyTokens, models: PLANS.free.models });
+      const up = await planFor(who.user);
+      const since = periodStart(up);
+      // Billable only: free-tier model tokens cost nothing upstream and don't count against quota.
+      const used = await billableUsageSince(who.user, since).then((u) => u.promptTokens + u.completionTokens).catch(() => 0);
+      // God mode mirrors checkEntitlement: env-listed admins are unmetered, and the UI should say so
+      // rather than show "free — upgrade" to an account the gate will never stop.
+      if (adminUsers()?.includes(who.user)) {
+        return json(res, 200, { plan: "team", subscribed: up.plan, status: "active", models: "all", used, limit: Number.MAX_SAFE_INTEGER, remaining: Number.MAX_SAFE_INTEGER, periodStart: since, paidThrough: null, god: true });
+      }
+      // effectivePlan, not a second copy of the rule: this endpoint had its own
+      // `status === "active" ? plan : "free"` and would have kept reporting a lapsed plan as live.
+      const def = effectivePlan(up);
+      const limit = up.maxTokens ?? def.monthlyTokens; // per-user override beats the plan's cap
+      return json(res, 200, {
+        plan: def.name, // what they actually GET — a lapsed pro is a free account
+        subscribed: up.plan, // what they signed up for, so the UI can say "expired" rather than lie
+        status: up.status,
+        models: def.models,
+        used,
+        limit,
+        remaining: Math.max(0, limit - used),
+        periodStart: since,
+        paidThrough: up.paidThrough,
+      });
+    }
+    // Start a checkout. Authenticated: this is where the identity comes from, and it is the ONLY
+    // place it does — everything downstream carries the session id, never a credential.
+    if (req.method === "POST" && url.pathname === "/v1/billing/checkout") {
+      if (isAnonymous(who)) return json(res, 401, { error: { message: "sign in to upgrade" } });
+      let b: { plan?: string };
+      try {
+        b = JSON.parse(await readBody(req));
+      } catch {
+        return json(res, 400, { error: { message: "invalid JSON body" } });
+      }
+      const plan = String(b.plan ?? "");
+      if (!(plan in PLANS) || plan === "free") {
+        return json(res, 400, { error: { message: `pick a paid plan (${Object.keys(PLANS).filter((p) => p !== "free").join(", ")})` } });
+      }
+      const s = await createCheckout(who.user, plan as PlanName);
+      appendAudit({ ts: Date.now(), user: who.user, event: "checkout_started", detail: plan });
+      return json(res, 200, { url: checkoutUrl(s.id), expiresAt: s.expiresAt, plan });
+    }
+    // Admin: the analytics aggregate — usage, funnel, revenue, and computed improvement areas.
+    // Same gate as plan administration; on a dev-open backend the operator IS the only user.
+    if (req.method === "GET" && url.pathname === "/v1/admin/analytics") {
+      const admin = who.role === "admin" || (adminUsers()?.includes(who.user) ?? false) || !locked();
+      if (!admin) return json(res, 403, { error: { message: "admin only" } });
+      const days = Math.min(365, Math.max(1, Number(url.searchParams.get("days")) || 30));
+      try {
+        return json(res, 200, await computeAnalytics(days));
+      } catch (e) {
+        return json(res, 500, { error: { message: e instanceof Error ? e.message : String(e) } });
+      }
+    }
+    // Admin: set a plan. Payment webhooks will call setPlan() directly; until then this is how a
+    // subscription becomes real. Admin identity comes from env, never from the table it edits.
+    if (req.method === "POST" && url.pathname === "/v1/plans") {
+      const admin = who.role === "admin" || (adminUsers()?.includes(who.user) ?? false);
+      if (!admin) return json(res, 403, { error: { message: "admin only" } });
+      let b: { user?: string; plan?: string; status?: string; maxTokens?: number | null };
+      try {
+        b = JSON.parse(await readBody(req));
+      } catch {
+        return json(res, 400, { error: { message: "invalid JSON body" } });
+      }
+      if (!b.user || !b.plan) return json(res, 400, { error: { message: "need { user, plan }" } });
+      if (!(b.plan in PLANS)) return json(res, 400, { error: { message: `unknown plan '${b.plan}' (${Object.keys(PLANS).join(", ")})` } });
+      const status = (b.status ?? "active") as import("./plans.ts").PlanStatus;
+      if (!["active", "past_due", "canceled", "banned"].includes(status)) {
+        return json(res, 400, { error: { message: `unknown status '${status}' (active, past_due, canceled, banned)` } });
+      }
+      // maxTokens: absent = leave any override alone, null = clear it, a positive number = set it.
+      let maxTokens: number | null | undefined;
+      if ("maxTokens" in b) {
+        maxTokens = b.maxTokens === null ? null : Number(b.maxTokens);
+        if (maxTokens !== null && (!Number.isFinite(maxTokens) || maxTokens <= 0)) {
+          return json(res, 400, { error: { message: "maxTokens must be a positive number, or null to clear" } });
+        }
+      }
+      await setPlan(b.user, b.plan as PlanName, status, true, null, maxTokens);
+      appendAudit({ ts: Date.now(), user: who.user, event: "plan_set", detail: `${b.user} -> ${b.plan}/${status}${maxTokens !== undefined ? ` max=${maxTokens}` : ""}` });
+      return json(res, 200, { ok: true, user: b.user, plan: b.plan, status, ...(maxTokens !== undefined ? { maxTokens } : {}) });
     }
     if (req.method === "GET" && url.pathname === "/v1/models") {
       return await handleModels(res, isAnon);
@@ -458,6 +827,32 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
         savePolicy(v.policy);
         return json(res, 200, { ok: true });
       }
+    }
+    if (url.pathname === "/v1/allowed-users" || url.pathname.startsWith("/v1/allowed-users/")) {
+      // Managed by the env-seeded founders (or an enterprise admin). The env list is the
+      // key to this door on purpose: a bad DB write can never lock the founders out.
+      const admin = who.role === "admin" || (adminUsers()?.includes(who.user) ?? false);
+      if (!admin) return json(res, 403, { error: { message: "admins only — users in env ADA_ALLOWED_USERS" } });
+      if (req.method === "GET" && url.pathname === "/v1/allowed-users") {
+        return json(res, 200, { env: adminUsers() ?? [], db: await listAllowed() });
+      }
+      if (req.method === "POST" && url.pathname === "/v1/allowed-users") {
+        let user = "";
+        try {
+          user = String((JSON.parse(await readBody(req)) as { user?: string }).user ?? "").trim();
+        } catch {
+          /* falls through to the check below */
+        }
+        if (!user) return json(res, 400, { error: { message: "missing 'user' (an email or GitHub login)" } });
+        await addAllowed(user, who.user);
+        return json(res, 200, { ok: true, user });
+      }
+      if (req.method === "DELETE" && url.pathname.startsWith("/v1/allowed-users/")) {
+        const user = decodeURIComponent(url.pathname.slice("/v1/allowed-users/".length)).trim();
+        if (!user) return json(res, 400, { error: { message: "missing user in path" } });
+        return json(res, 200, { ok: true, removed: await removeAllowed(user) });
+      }
+      return json(res, 405, { error: { message: "GET, POST or DELETE" } });
     }
     if (url.pathname === "/v1/users") {
       if (who.role !== "admin") return json(res, 403, { error: { message: "admin only" } });
@@ -551,7 +946,7 @@ export function startAdaServer(port: number = PORT): Server {
       : oidcEnabled()
         ? `OIDC SSO (0 seats — awaiting first login)`
         : locked()
-          ? `auth ON (client keys + GitHub/Google login${allowedUsers() ? `, allowlist: ${allowedUsers()!.length}` : ""})`
+          ? `auth ON (client keys + GitHub/Google login${adminUsers() ? `, admins: ${adminUsers()!.length}` : ""})`
           : "AUTH DISABLED (dev) — set ADA_CLIENT_KEYS or ADA_ADMIN_KEY to lock down";
     const provs = configuredProviders();
     console.log(`ada backend → http://localhost:${port}  [${auth}]`);

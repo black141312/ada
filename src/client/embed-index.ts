@@ -14,6 +14,7 @@ import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { projectRootOf } from "./brain.ts";
+import { ensureAdaDir, workspaceDirs } from "./settings.ts";
 import { LOCAL_MODEL, embedLocal } from "./embed-local.ts";
 
 // Embeddings run LOCALLY by default (in-process, no key/backend — see embed-local.ts). Set
@@ -150,7 +151,7 @@ function loadManifest(root: string): Manifest {
 }
 function saveManifest(root: string, m: Manifest): void {
   try {
-    mkdirSync(adaDir(root), { recursive: true });
+    ensureAdaDir(adaDir(root));
     writeFileSync(manifestPath(root), JSON.stringify(m));
   } catch {
     /* best-effort */
@@ -183,7 +184,7 @@ function compact(root: string, m: Manifest): void {
     f.base = cur;
     cur += n;
   }
-  mkdirSync(adaDir(root), { recursive: true });
+  ensureAdaDir(adaDir(root));
   writeFileSync(blobPath(root), Buffer.from(out.buffer, out.byteOffset, out.byteLength));
   m.used = cur;
   m.dead = 0;
@@ -197,7 +198,7 @@ export async function refreshIndex(root = process.cwd(), onProgress?: (msg: stri
   // Fresh manifest (first run, or format/scheme change) → start the blob clean so old bytes can't leak.
   if (m.used === 0) {
     try {
-      mkdirSync(adaDir(root), { recursive: true });
+      ensureAdaDir(adaDir(root));
       writeFileSync(blobPath(root), Buffer.alloc(0));
     } catch {
       /* best-effort */
@@ -254,32 +255,37 @@ export async function refreshIndex(root = process.cwd(), onProgress?: (msg: stri
 
 export interface Hit {
   file: string;
+  /** The workspace folder this hit came from — `file` is relative to it. */
+  root: string;
   start: number;
   end: number;
   score: number;
   snippet: string;
 }
 
-/** Top-k chunks most similar to the query. Refreshes the index first (incremental). */
-export async function searchCodebase(query: string, k = 6, root = process.cwd()): Promise<Hit[]> {
+/** Score one folder's index against an ALREADY-EMBEDDED query. Split out so a workspace search
+ *  embeds the query once instead of once per folder — the embedding is the slow part. */
+async function scoreRoot(qvec: Float32Array | number[], root: string): Promise<Hit[]> {
   await refreshIndex(root);
   const m = loadManifest(root);
   const blob = readBlob(root);
   const dim = m.dim;
-  const [qvec] = await embed([query], "query");
   const hits: Hit[] = [];
   for (const [rel, f] of Object.entries(m.files)) {
     for (let i = 0; i < f.chunks.length; i++) {
       const off = f.base + i * dim;
       const c = f.chunks[i]!;
-      hits.push({ file: rel, start: c.start, end: c.end, score: cosine(qvec!, blob.subarray(off, off + dim)), snippet: "" });
+      hits.push({ file: rel, root, start: c.start, end: c.end, score: cosine(qvec as never, blob.subarray(off, off + dim)), snippet: "" });
     }
   }
-  hits.sort((a, b) => b.score - a.score);
-  const top = hits.slice(0, k);
+  return hits;
+}
+
+/** Fill in the source lines for the hits that survived ranking — never for all of them. */
+function addSnippets(top: Hit[]): Hit[] {
   for (const h of top) {
     try {
-      h.snippet = readFileSync(resolve(root, h.file), "utf8")
+      h.snippet = readFileSync(resolve(h.root, h.file), "utf8")
         .split("\n")
         .slice(h.start - 1, h.end)
         .join("\n")
@@ -289,4 +295,33 @@ export async function searchCodebase(query: string, k = 6, root = process.cwd())
     }
   }
   return top;
+}
+
+/** Top-k chunks most similar to the query, in one folder. */
+export async function searchCodebase(query: string, k = 6, root = process.cwd()): Promise<Hit[]> {
+  const [qvec] = await embed([query], "query");
+  const hits = await scoreRoot(qvec!, root);
+  hits.sort((a, b) => b.score - a.score);
+  return addSnippets(hits.slice(0, k));
+}
+
+/**
+ * Top-k across EVERY folder of the workspace. Scores are cosine similarities from the same model,
+ * so they are directly comparable between folders — the merge is a plain sort, not a per-folder
+ * quota. A folder whose index fails (unreadable, mid-write) is skipped rather than taking the whole
+ * search down with it: half an answer beats none.
+ */
+export async function searchWorkspace(query: string, k = 6, roots?: string[]): Promise<Hit[]> {
+  const dirs = roots ?? workspaceDirs();
+  const [qvec] = await embed([query], "query"); // once, not once per folder
+  const all: Hit[] = [];
+  for (const root of dirs) {
+    try {
+      all.push(...(await scoreRoot(qvec!, root)));
+    } catch {
+      /* skip this folder */
+    }
+  }
+  all.sort((a, b) => b.score - a.score);
+  return addSnippets(all.slice(0, k));
 }

@@ -6,6 +6,165 @@ All notable changes to ada are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — the browser tool can actually automate things
+
+Looking at a page and *driving* one are different jobs. The tool could do the first well and the
+second barely: refs came only from an accessibility-tree `read` and went stale on every navigation,
+every wait was a blind 300 ms sleep, and there was no way to fill a form, pick from a dropdown,
+attach a file, or read structured data back out.
+
+- **Target elements by CSS `selector` or by visible text (`find`)**, not just `ref_N`. Selectors and
+  text survive re-renders; refs do not.
+- **New verbs**: `wait` (for a selector, page text, or load — with `timeout`), `select`, `hover`,
+  `fill` (many inputs in one pass), `upload`, `eval`, `drag`, `back`, `forward`, `reload`, `pdf`.
+- `fill` and `select` write through the native value setter and dispatch `input`+`change`, so React
+  and Vue see the value instead of silently ignoring it.
+- `drag` walks the cursor in ten steps — HTML5 drag handlers ignore a teleporting mouse.
+- **`screenshot` now shows the image inline as well as saving the file.** Saving one and not being
+  able to see it was a strange default; `look` remains inline-only for loops that would otherwise
+  flood the transcript.
+
+### Changed — ada drives the system default browser, in a profile that remembers you
+
+- The browser is now found by asking the OS which one opens `https://` (Windows registry, macOS
+  LaunchServices, `xdg-settings`) instead of guessing Chrome-then-Edge. Non-Chromium defaults fall
+  back to the old list, since only Chromium speaks CDP.
+- **The profile persists** at `~/.ada/browser-profile` (override with `ADA_BROWSER_PROFILE`) instead
+  of a fresh temp directory per run, so signing into a site is a one-time cost rather than a
+  per-run one.
+- **Headed by default.** Headless only under `ADA_BROWSER_HEADLESS=1`, in CI, or on a display-less
+  Linux box. Automating real sites means occasionally seeing what went wrong and taking over.
+
+### Fixed
+- `Page.navigate` no longer hangs the tool for 30 s. Some pages — anything running aggressive bot
+  detection, or opening a JS dialog — never acknowledge the command even though the navigation
+  commits. It now uses a 10 s timeout and ignores a missing ack; the `readyState` poll that follows
+  is the real completion signal.
+
+### Added — `npm run browser:login` and `npm run browser:profile`
+`browser:login <site>...` opens ada's browser visibly with a tab per site so a human can sign in
+once, by hand, with credentials that never pass through ada.
+
+`browser:profile` clones a real Chrome profile's preferences, history and localStorage — but **not**
+its logins, and it now says so loudly. Measured on Chrome 151: a profile with 3879 app-bound (`v20`)
+cookies and 4 `li_at` entries came back with zero of each, because Chrome discards app-bound cookies
+on first launch against a copy. Nor is there a flag around it — both `--remote-debugging-port` and
+`--remote-debugging-pipe` refuse to attach to the default profile directory ("DevTools remote
+debugging requires a non-default data directory"). Driving an already-logged-in Chrome would take a
+browser extension using `chrome.debugger`; ada's own persistent profile is the supported path.
+
+## [0.15.0] — 2026-07-30
+
+### Added — plans and token quotas (replaces the allow-list)
+An allow-list answers *"may this person in?"*. For a product anyone can sign up for the question is
+*"what is this person entitled to?"*. Membership no longer gates chat: everyone authenticated gets
+in, lands on `free`, and the plan decides the rest.
+
+| plan | models | tokens / period |
+|---|---|---|
+| free | `:free` only | 2M |
+| pro | all | 25M |
+| team | all | 120M |
+
+- **`403` vs `402`** — 403 means your plan doesn't include this model, 402 means you're out of quota.
+  Collapsing them tells someone to upgrade when they already had.
+- **A lapsed subscription degrades to free**, it doesn't lock out — an expired card should cost you
+  the paid models, not your account. Unknown plan strings and failed lookups also resolve to `free`,
+  which permits only `:free` models and so fails closed at zero upstream cost.
+- **Paid periods anchor to the subscription date**, so the window matches what was charged; free
+  gets the UTC calendar month.
+- `GET /v1/plan` (self-serve) and `POST /v1/plans` (admin) — admin identity comes from
+  `ADA_ADMIN_USERS` (still reading `ADA_ALLOWED_USERS` under its old name) and never from the table
+  it edits, so a bad write can't lock the operator out of the server that would fix it.
+
+### Added — usage persisted to the database
+`appendUsage` writes JSONL to the data directory — right for a self-hosted box, useless for a hosted
+one, since Cloud Run's disk is ephemeral and scales to zero. Nothing could be billed on it.
+`usage_events` now carries the same row in Postgres (sqlite when self-hosting), indexed on
+`(user_id, ts)` — the only query a quota makes. Stored as **tokens, not cost**: prices change, tokens
+don't, so cost is derived at read time from the model on each row.
+
+### Added — checkout sessions
+Upgrading happens on the website, which is static and has no way to know who's asking. Rather than
+putting the account token in a URL — where it lands in browser history and in the `Referer` of every
+third-party asset — the app mints a session server-side and opens a link carrying only its id: 256
+bits of randomness, single-use, 30-minute expiry, revealing nothing but the plan being bought.
+`completeCheckout()` is idempotent, because payment providers replay events out of order.
+`/v1/billing/webhook` answers **501** and is deliberately not stubbed: a webhook that accepts a body
+and grants a plan is an unauthenticated way to give yourself Pro, and signature verification *is* the
+security of a webhook.
+
+## [0.14.1] — 2026-07-29
+
+### Fixed — caching now works *within* a session, not just across identical requests
+0.14.0 gave Claude prompt caching, but only repeated identical requests hit; turns inside a session
+still missed. Anthropic folds every system message into one parameter that sits ahead of the whole
+transcript, and the repo map (stable all session) shared that message with the per-turn hints
+(memory recall, skill routing, plan mode) — so one changed byte of guidance rewrote the prefix and
+invalidated everything behind it. The cache could not hit twice in a session by construction.
+
+They're now sent separately: the repo map stays in `system` where it's byte-identical every turn,
+and per-turn hints move to a trailing user message — after the cache breakpoint, so they cost their
+own tokens and nothing else's. The breakpoint also moves one turn back, to the second-to-last
+user/assistant message, since the newest turn can be transient; anchoring there would mint a fresh
+cache entry every request and never read one.
+
+| one session, three files read | tokens | cache | cost |
+|---|---|---|---|
+| before | 13,212 | none | $0.0786 |
+| after | 15,550 | **32% hit** | **$0.0715** |
+
+## [0.14.0] — 2026-07-29
+
+### Fixed — headless runs were missing half the agent
+- **`ada -p` registered no skills, no memory tools, and no `spawn_agent`.** Every headless and
+  scripted run went out with none of the built-in skills loaded and no ability to delegate. Benchmark
+  runs showing zero delegation read as "the model chose not to" — the tool was never registered.
+- **`--json` silently disabled skill routing and memory recall.** It set `quiet`, and `quiet` also
+  gated routing, so an output format changed what the agent did. Now split: `quiet` is stdout only,
+  `delegated` marks a turn a parent agent already scoped.
+- **`--strategy plan` failed on every run, and `--strategy multi` could not complete one.** Both
+  appended a system message mid-orchestration; providers hoist system messages into a separate
+  parameter, leaving the conversation ending on the assistant's own message — an assistant prefill,
+  which Claude rejects with a 400. The Engine primitive is now `addUser`.
+
+### Added — prompt caching for Claude on the OpenAI-compatible path
+Claude is the only model family that must be *asked* to cache; DeepSeek, Kimi and OpenAI do it
+automatically. Routed through OpenRouter nothing set `cache_control`, so every turn of every Claude
+session re-sent the whole transcript at full price. Measured, same prompt twice: **$0.0323 → $0.0028
+(100% cache hit)**.
+- Requests `usage: { include: true }` from OpenRouter, which otherwise omits the cache breakdown and
+  leaves a hit invisible.
+- Reads both spellings — OpenRouter's `cache_write_tokens` and the native adapter's
+  `cache_creation_tokens`. Reading one billed cache writes as fresh input.
+- *Known limit:* turns **within** a session still miss. Per-turn extras (repo map, recalled memories,
+  skill hints) ride as a trailing system message, and Anthropic folds all system messages into one
+  parameter — so the system block changes each turn and invalidates the prefix behind it.
+
+### Fixed — cost reporting
+- Cached tokens were priced at the full input rate; cache reads bill ~0.1x and writes ~1.25x.
+- Sub-agent spend wasn't counted at all, so a delegated run reported roughly a third of its cost.
+- Tokens are tracked per model that served them, so `/model` mid-session no longer misprices.
+
+### Changed — context
+- Skill bodies are scoped to the request that loaded them instead of persisting in the transcript.
+- Over-long tool output keeps its **head and tail** — for `npm install` or a test run the verdict is
+  in the last lines, and head-only truncation hid it, costing a follow-up call to find it.
+- Compaction triggers off the provider's real token count rather than a chars/4 estimate, and its
+  summariser keeps both ends of the transcript (the tail alone lost the user's original goal).
+
+### Removed — `--strategy multi`
+It never reduced cost. On the same task it used **29x** the input tokens of plain `react`, and only
+looked cheaper because workers ran on a model cheap enough to absorb the extra work; on the user's own
+model it cost 2x `react` for worse output. Splitting one cohesive artifact along file lines leaves
+nobody holding the whole design — the worker owning `script.js` wrote 5,096 bytes for a page that
+needed 1,154, while the page lost gradients, an animation and a section. An unknown strategy falls
+back to `react`, so existing scripts keep working.
+
+Delegation itself stays: `spawn_agent` / `background_task` on a configurable cheap model
+(`settings.subagentModel` / `ADA_SUBAGENT_MODEL`), each worker isolated in its own git worktree, with
+a 50k prompt-token budget (`ADA_WORKER_BUDGET`).
+
 ### Added — built-in PPTX generation
 - **`generate_pptx` tool.** ada can now produce a real, editable PowerPoint deck with zero external
   dependencies — no Python, no npm. The model emits structured JSON (slides with titles, subtitles,

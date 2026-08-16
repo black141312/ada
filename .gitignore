@@ -10,3 +10,12 @@ node_modules/
 .wrangler/
 
 ada-auth.db
+runs/
+
+# subagent-driven-development scratch
+.superpowers/
+  
+# the bridge's shared secret, generated per machine  
+extension/token.txt  
+tmp-*.txt  
+tmp-*.ts  

@@ -18,7 +18,7 @@ import { confidentSkill, rankSkills } from "./client/skill-router.ts";
 import { getDiagnostics } from "./client/lsp.ts";
 import { snapshot } from "./client/snapshot.ts";
 import { renderJobs, startJob } from "./client/background.ts";
-import { formatFile, htmlToText, isDestructive, registerTool, setAsker, toolByName } from "./client/tools.ts";
+import { askOptions, formatFile, htmlToText, isDestructive, registerTool, setAsker, toolByName } from "./client/tools.ts";
 import * as checkpoint from "./client/checkpoint.ts";
 import { renderTodos, setTodos } from "./client/todos.ts";
 import { deleteCredential, getCredential, setCredential } from "./server/credentials.ts";
@@ -57,6 +57,21 @@ async function main(): Promise<void> {
   // bash
   r = await tool("bash").run({ command: "echo hi" });
   assert.ok(r.output.includes("hi"), r.output);
+
+  // --- browser: a11y tree serializer (pure, no browser needed) ---
+  const { formatAxTree, bridgeBlocks } = await import("./client/browser.ts");
+  const ax = formatAxTree([
+    { nodeId: "1", role: { value: "RootWebArea" }, name: { value: "T" }, childIds: ["2", "3", "4"] },
+    { nodeId: "2", parentId: "1", role: { value: "button" }, name: { value: "Do thing" }, backendDOMNodeId: 10 },
+    { nodeId: "3", parentId: "1", role: { value: "textbox" }, name: { value: "Name" }, value: { value: "bob" }, backendDOMNodeId: 11 },
+    { nodeId: "4", parentId: "1", ignored: true, childIds: ["5"] },
+    { nodeId: "5", parentId: "4", role: { value: "StaticText" }, name: { value: "hi" } },
+  ]);
+  assert.ok(ax.text.includes('button "Do thing" [ref_1]'), ax.text);
+  assert.ok(ax.text.includes('textbox "Name" = "bob" [ref_2]'), ax.text);
+  assert.ok(ax.text.includes('StaticText "hi"'), ax.text); // ignored wrapper skipped, child kept
+  assert.equal(ax.refs.get("ref_1"), 10);
+  assert.equal(ax.refs.get("ref_2"), 11);
 
   // grep / ls / glob
   await tool("write_file").run({ path: join(dir, "hello.txt"), content: "alpha\nNEEDLE here\nbeta" });
@@ -271,9 +286,16 @@ async function main(): Promise<void> {
 
   // --- ask_user via a stub asker ---
   const askTool = toolByName.get("ask_user")!;
-  setAsker(async (_q, opts) => (opts ? opts[0]! : "the-answer"));
+  setAsker(async (_q, opts) => (opts ? `${opts[0]!.label}|${opts[0]!.description}` : "the-answer"));
   assert.ok(/the-answer/.test((await askTool.run({ question: "?" })).output), "ask_user returns the answer");
   assert.ok(/picked-A/.test((await askTool.run({ question: "?", options: ["picked-A", "B"] })).output), "ask_user with options");
+  // Options may carry a description, and a bare string still has to survive alongside them.
+  assert.ok(
+    /picked-A\|what it means/.test((await askTool.run({ question: "?", options: [{ label: "picked-A", description: "what it means" }, "B"] })).output),
+    "ask_user options carry descriptions",
+  );
+  assert.equal(askOptions(["a", { label: "b", description: "d" }, { description: "no label" }, 3])?.length, 3, "askOptions drops entries with no label");
+  assert.equal(askOptions([]), undefined, "askOptions treats an empty list as no options");
   setAsker(null);
   assert.equal((await askTool.run({ question: "?" })).isError, true, "ask_user errors when no asker is installed");
 
@@ -292,6 +314,18 @@ async function main(): Promise<void> {
   assert.equal(permPhrase("write_file", false), "create or modify files on disk", "write phrase");
   assert.ok(permPhrase("merchant__x", false).includes("connector"), "MCP phrase mentions the connector");
 
+  // --- browser approval rendering ---
+  assert.equal(describeCall("browser", { action: "click", ref: "ref_2" }).detail, "click ref_2");
+  assert.ok(permPhrase("browser", true).toLowerCase().includes("enter"), "press-Enter phrase should warn about submitting");
+
+  // Nothing is blocked by default - the block list is opt-in via ADA_BRIDGE_BLOCKED. Matching must
+  // cover subdomains without catching lookalike domains, and must not throw on junk input.
+  assert.ok(!bridgeBlocks("https://www.instagram.com/"), "nothing should be blocked by default");
+  assert.ok(bridgeBlocks("https://www.instagram.com/", ["instagram.com"]), "an opted-in host must match, subdomains included");
+  assert.ok(!bridgeBlocks("https://notinstagram.com/", ["instagram.com"]), "suffix match must not catch lookalike domains");
+  assert.ok(!bridgeBlocks("not a url", ["instagram.com"]), "a malformed url must not throw");
+  assert.ok(!permPhrase("browser", false).startsWith("run the"), "browser needs its own perm phrase");
+
   // --- baked offline catalog seeds pricing/limits (no network) ---
   {
     const { priceOf, contextOf, catalogSize, catalogText } = await import("./client/models-dev.ts");
@@ -301,6 +335,171 @@ async function main(): Promise<void> {
     assert.ok((contextOf("claude-opus-4-8") ?? 0) >= 200000, "contextOf resolves a baked model offline");
     assert.ok(/anthropic/.test(catalogText()) && /openai/.test(catalogText()) && /cloudflare/.test(catalogText()), "catalogText lists the popular providers");
     assert.ok(/claude-opus-4-8/.test(catalogText("anthropic")), "catalogText <provider> lists its models");
+  }
+
+  // --- reading the paid-through date out of a provider payload ---
+  {
+    const { paidThroughOf } = await import("./server/kelviq.ts");
+    const ms = Date.UTC(2027, 0, 15);
+    assert.equal(paidThroughOf({ currentPeriodEnd: ms }), ms, "milliseconds pass through");
+    assert.equal(paidThroughOf({ current_period_end: Math.floor(ms / 1000) }), ms, "seconds are scaled up");
+    assert.equal(paidThroughOf({ expiresAt: "2027-01-15T00:00:00.000Z" }), ms, "an ISO string parses");
+    // Anything unrecognised must yield null — which means "never expires", i.e. today's behaviour.
+    // Guessing wrong here would cut off a paying customer, so the failure has to be the safe way.
+    assert.equal(paidThroughOf({}), null, "no date means no expiry");
+    assert.equal(paidThroughOf({ currentPeriodEnd: "not a date" }), null, "garbage means no expiry");
+    assert.equal(paidThroughOf({ periodEnd: Number.NaN }), null, "NaN means no expiry");
+  }
+
+  // --- a paid plan must lapse on its own, not only when a webhook says so ---
+  {
+    const { effectivePlan, PLANS } = await import("./server/plans.ts");
+    const now = Date.UTC(2026, 7, 3, 12);
+    const p = (over: Record<string, unknown>) =>
+      ({ user: "u", plan: "pro", status: "active", periodStart: null, paidThrough: null, ...over }) as never;
+
+    // null = never expires. Plans granted by hand must not die because nobody wrote a date —
+    // every existing row in production has a null here.
+    assert.equal(effectivePlan(p({}), now).name, "pro", "no paid-through date means it never lapses");
+
+    assert.equal(effectivePlan(p({ paidThrough: now + 86_400_000 }), now).name, "pro", "paid through tomorrow is still pro");
+    // THE POINT: without this, the only thing that ever revokes a plan is a cancellation webhook
+    // being delivered AND processed. A missed one grants a paid tier forever.
+    assert.equal(effectivePlan(p({ paidThrough: now - 1 }), now).name, "free", "one ms past the paid period is free");
+    assert.equal(effectivePlan(p({ paidThrough: now }), now).name, "free", "the boundary itself is over");
+
+    // A lapsed plan drops to free QUOTAS too, not just the label — otherwise it keeps the paid cap.
+    assert.equal(effectivePlan(p({ paidThrough: now - 1 }), now).monthlyTokens, PLANS.free.monthlyTokens, "lapsed gets the free quota");
+    // Status still wins independently: a cancelled plan is free even if paid through next year.
+    assert.equal(effectivePlan(p({ status: "canceled", paidThrough: now + 1e10 }), now).name, "free", "status still applies");
+  }
+
+  // --- a bad billing anchor must not switch metering off ---
+  {
+    const { periodStart } = await import("./server/plans.ts");
+    const now = Date.UTC(2026, 7, 2, 12); // 2 Aug 2026
+    const augustFirst = Date.UTC(2026, 7, 1);
+    const plan = (periodStartValue: number | null) =>
+      ({ user: "u", plan: "pro", status: "active", periodStart: periodStartValue }) as never;
+
+    assert.equal(periodStart(plan(null), now), augustFirst, "no anchor means the calendar month");
+
+    // THE ONE THAT MATTERS. A future anchor makes usageSince() look at a window that has not begun:
+    // used reads 0, `used >= limit` never fires, and the account bills nothing forever. Found in
+    // production as 12321313123123 — the year 2360.
+    assert.equal(periodStart(plan(12321313123123), now), augustFirst, "an anchor in the future falls back to the month");
+    assert.ok(periodStart(plan(12321313123123), now) <= now, "a period can never start in the future");
+
+    // Garbage that isn't even a number must not produce NaN, which compares false against everything.
+    assert.equal(periodStart(plan(Number.NaN), now), augustFirst, "NaN falls back to the month");
+
+    // A real anchor still anchors: subscribed on the 20th, so the period runs from the 20th.
+    assert.equal(
+      periodStart(plan(Date.UTC(2026, 5, 20, 9, 30)), now),
+      Date.UTC(2026, 6, 20, 9, 30),
+      "an anchor rolls forward to the period containing now",
+    );
+    // An old anchor rolls forward rather than reaching back years.
+    assert.ok(periodStart(plan(Date.UTC(1970, 4, 23)), now) > Date.UTC(2026, 5, 1), "a 1970 anchor still lands in 2026");
+  }
+
+  // --- .ada must not litter someone else's repo ---
+  {
+    const { ensureAdaDir } = await import("./client/settings.ts");
+    const tmp = join(tmpdir(), `ada-gitignore-${Date.now()}`);
+    const ada = join(tmp, ".ada");
+    ensureAdaDir(ada);
+    const gi = readFileSync(join(ada, ".gitignore"), "utf8");
+    // The index is over a megabyte. Unignored it shows up in the user's `git status` and is one
+    // `git add .` from being committed into their history.
+    for (const cache of ["index.vec", "index.json", "brain.json", "graph.db"])
+      assert.ok(gi.includes(cache), `.ada/.gitignore must cover ${cache}`);
+    // Self-ignoring, so a .ada holding only caches leaves the repo completely clean.
+    assert.ok(gi.includes(".gitignore"), ".ada/.gitignore must ignore itself");
+    // But memory and skills are the user's, and meant to be committed and shared with the team.
+    assert.ok(!/^memory\/?$/m.test(gi) && !/^skills\/?$/m.test(gi), "memory and skills must stay committable");
+
+    // A second call must not clobber a file the user has edited — but an install from before
+    // jobs.json existed still needs the line appended, or that project shows `?? .ada/jobs.json`
+    // forever. Append, don't rewrite.
+    writeFileSync(join(ada, ".gitignore"), "# mine\n");
+    ensureAdaDir(ada);
+    const gi2 = readFileSync(join(ada, ".gitignore"), "utf8");
+    assert.ok(gi2.startsWith("# mine\n"), "the user's existing content is preserved, not rewritten");
+    assert.ok(/^jobs\.json$/m.test(gi2), "jobs.json is appended for installs that predate it");
+
+    // Calling again must not append a second copy of the line.
+    ensureAdaDir(ada);
+    assert.equal(readFileSync(join(ada, ".gitignore"), "utf8"), gi2, "appending jobs.json is idempotent");
+    rmSync(tmp, { recursive: true, force: true });
+  }
+
+  // --- workspaceDirs: the prompt and the search must agree about which folders exist ---
+  {
+    const { workspaceDirs } = await import("./client/settings.ts");
+    const before = process.env.ADA_EXTRA_DIRS;
+    const sep = process.platform === "win32" ? ";" : ":";
+    try {
+      delete process.env.ADA_EXTRA_DIRS;
+      assert.deepEqual(workspaceDirs(), [process.cwd()], "no extras means just the working directory");
+
+      // Platform-shaped paths: on POSIX the list separator is ":", which is also the character a
+      // Windows drive letter uses — "C:/x" in a colon-separated list is two segments, not one.
+      const [one, two] = process.platform === "win32" ? ["C:/x/one", "C:/x/two"] : ["/x/one", "/x/two"];
+      process.env.ADA_EXTRA_DIRS = [one, two].join(sep);
+      assert.equal(workspaceDirs().length, 3, "cwd plus both extras");
+
+      // Adding the folder you are already in must not search it twice — the same hits would come
+      // back doubled and crowd out everything else.
+      process.env.ADA_EXTRA_DIRS = [process.cwd(), one].join(sep);
+      assert.equal(workspaceDirs().length, 2, "cwd repeated as an extra is dropped");
+
+      process.env.ADA_EXTRA_DIRS = sep + sep;
+      assert.deepEqual(workspaceDirs(), [process.cwd()], "empty segments are not folders");
+    } finally {
+      if (before === undefined) delete process.env.ADA_EXTRA_DIRS;
+      else process.env.ADA_EXTRA_DIRS = before;
+    }
+  }
+
+  // --- project_map: a folder's map ON DEMAND, so extra workspace folders cost nothing per turn ---
+  {
+    const pm = tool("project_map");
+    const here = process.cwd();
+    const r = await pm.run({ path: here });
+    assert.ok(!r.isError && r.output.length > 0, "project_map maps the folder it is given");
+    // The default has to be cwd, or a model that omits the argument silently maps nothing.
+    assert.equal((await pm.run({})).output, r.output, "no path means the working directory");
+    const bad = await pm.run({ path: join(here, "definitely-not-here-9x") });
+    assert.ok(bad.isError, "a folder that isn't there is an error, not an empty map");
+    // Free until called: the whole point is that extra folders don't ride on every turn.
+    assert.equal(pm.needsApproval, false, "reading a map is not a destructive act");
+    assert.ok(!pm.lazy, "project_map must always be offered — it is how the model reaches other folders");
+  }
+
+  // --- compaction fires at a share of the model's own window, not a flat number ---
+  {
+    const base = { client: {} as never, session: Session.create(), onApprove: async (): Promise<"yes"> => "yes" };
+    const limitFor = (model: string, compactAt?: number) => new Agent({ ...base, model, compactAt }).compactLimit();
+    const { contextOf } = await import("./client/models-dev.ts");
+
+    assert.equal(limitFor("claude-opus-4-5"), 150_000, "200k window -> 150k");
+    assert.equal(limitFor("claude-opus-4-8"), 750_000, "1M window -> 750k, not the old flat 100k");
+    assert.equal(limitFor("no-such-model-xyz"), 100_000, "an uncatalogued model keeps the flat fallback");
+    assert.equal(limitFor("claude-opus-4-5", 42_000), 42_000, "an explicit compactAt always wins");
+
+    // The threshold must stay UNDER the window it came from — the whole point is compacting before
+    // the provider refuses the request, so a share that ever rounded past the window would be worse
+    // than the flat number it replaced.
+    for (const m of ["claude-opus-4-5", "claude-opus-4-8", "gemini-2.5-pro"])
+      assert.ok(limitFor(m) < contextOf(m)!, `${m}: threshold must sit below its own window`);
+
+    // setModel must move it: a session switched onto a smaller window and left on the bigger
+    // threshold would never compact, and would die on the provider's hard limit instead.
+    const a = new Agent({ ...base, model: "claude-opus-4-8" });
+    const big = a.compactLimit();
+    a.setModel("claude-opus-4-5");
+    assert.ok(a.compactLimit() < big, "switching to a smaller window lowers the threshold");
   }
 
   // --- provider routing (incl. the new cloudflare + groq/together disambiguation) ---
@@ -458,6 +657,9 @@ async function main(): Promise<void> {
   {
     const dir = join(tmpdir(), `ada-mem-${Date.now()}`);
     process.env.ADA_MEMORY_DIR = dir;
+    // Semantic recall off: the selfcheck must stay offline and deterministic, and this also asserts
+    // the real guarantee — every behaviour below holds on the lexical path alone.
+    process.env.ADA_MEMORY_SEMANTIC = "0";
     const mem = await import("./client/memory.ts");
     try {
       assert.ok(mem.rememberFact({ text: "We deploy from the release branch", scope: "project", type: "decision" }).ok, "remember a project fact");
@@ -496,26 +698,76 @@ async function main(): Promise<void> {
       assert.ok(!mem.rememberFact({ text: "the template marker is <!-- here -->" }).ok, "a comment marker in fact text is refused");
 
       // recall: relevant surfaces, off-topic injects nothing
-      const hit = mem.recallBlock("what branch do we deploy from", true);
+      const hit = await mem.recallBlock("what branch do we deploy from", true);
       assert.ok(hit && hit.includes("release branch"), "recall surfaces the relevant fact");
-      const off = mem.recallBlock("quantum chromodynamics lunch menu roster", true);
+      const off = await mem.recallBlock("quantum chromodynamics lunch menu roster", true);
       assert.ok(!(off ?? "").includes("release branch") && !(off ?? "").includes("test runner"), "off-topic recall surfaces no ranked project facts (floor)");
 
       // pinned is always recalled regardless of query
       const g = mem.rememberFact({ text: "prod migrations need ops on-call sign-off", scope: "project", type: "gotcha" });
       assert.ok(g.ok);
-      mem.memoryCommand(["pin", (g as { memory: { id: string } }).memory.id], true);
-      const pinnedBlock = mem.recallBlock("some entirely unrelated question about widgets", true);
+      await mem.memoryCommand(["pin", (g as { memory: { id: string } }).memory.id], true);
+      const pinnedBlock = await mem.recallBlock("some entirely unrelated question about widgets", true);
       assert.ok(pinnedBlock && pinnedBlock.includes("ops on-call sign-off"), "pinned fact is recalled for any query");
 
       // reference: the body is never in the recall block (only the title)
       mem.rememberFact({ text: "release runbook", scope: "project", type: "reference", body: "STEP-BODY-SECRET-MARKER: do the release" });
-      const refBlock = mem.recallBlock("release runbook steps", true);
+      const refBlock = await mem.recallBlock("release runbook steps", true);
       assert.ok(!(refBlock ?? "").includes("STEP-BODY-SECRET-MARKER"), "reference body is not auto-injected");
+
+      // judged write: explicit supersedes retires the named ids and REPLACES the subject heuristic,
+      // so a reworded fact the bigram guess would miss still retires the one it contradicts.
+      const oldF = mem.rememberFact({ text: "the staging box is rebuilt nightly", scope: "project" });
+      assert.ok(oldF.ok);
+      const oldId = (oldF as { memory: { id: string } }).memory.id;
+      const merged = mem.rememberFact({ text: "staging is rebuilt every night at 02:00 UTC", scope: "project", supersedes: [oldId] });
+      assert.ok(merged.ok, "judged write stores");
+      const live = mem.loadMemories(true).filter((m) => m.text.includes("staging"));
+      assert.equal(live.length, 1, "explicit supersedes retires the target");
+      assert.ok(live[0]!.text.includes("02:00"), "the judged wording is what stays live");
+      // a target that no longer exists must be a no-op, never a thrown write
+      assert.ok(mem.rememberFact({ text: "the linter is biome", scope: "project", supersedes: ["m-does-not-exist"] }).ok, "unknown supersede target is harmless");
+
+      // usage signal: recall records that a fact was used, and is throttled to once per fact per day
+      // so the hot path can't rewrite the ledger every turn.
+      const hitsOf = (): number => mem.loadMemories(true).find((m) => m.text.includes("biome"))!.hits;
+      assert.equal(hitsOf(), 0, "a never-recalled fact has no hits");
+      await mem.recallBlock("which linter biome", true);
+      assert.equal(hitsOf(), 1, "recall records usage");
+      await mem.recallBlock("which linter biome", true);
+      assert.equal(hitsOf(), 1, "a second recall the same day does not rewrite the ledger");
+      const stillOff = await mem.recallBlock("quantum chromodynamics lunch menu roster", true);
+      assert.ok(!(stillOff ?? "").includes("release branch"), "a recalled-often fact still respects the relevance floor");
     } finally {
       delete process.env.ADA_MEMORY_DIR;
+      delete process.env.ADA_MEMORY_SEMANTIC;
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+
+  // --- memory LLM passes: reply parsing is tolerant, and never trusts what it wasn't shown ---
+  {
+    const llm = await import("./client/memory-llm.ts");
+    assert.deepEqual(llm.parseFacts("[]"), [], "empty extraction is a valid answer");
+    assert.deepEqual(llm.parseFacts("total nonsense, no json here"), [], "unparseable extraction yields nothing");
+    const fenced = llm.parseFacts('```json\n[{"text":"the test runner is vitest","type":"convention","scope":"project"}]\n```');
+    assert.equal(fenced.length, 1, "a fenced reply still parses");
+    assert.equal(fenced[0]!.type, "convention");
+    assert.equal(llm.parseFacts('[{"text":"short","type":"fact"}]').length, 0, "a too-short fact is dropped");
+    assert.equal(llm.parseFacts(`[{"text":"${"x".repeat(300)}","type":"fact"}]`).length, 0, "a paragraph-length 'fact' is a summary, dropped");
+    assert.equal(llm.parseFacts('[{"text":"a fact one here","type":"nonsense"}]')[0]!.type, "fact", "an unknown type falls back to fact");
+    // Asserted against the exported constant, not a literal — the cap is a tuned value (raised from
+    // 3 to 6 after bench/extraction.ts showed it capping recall on dense sessions) and the invariant
+    // being tested is "there IS a cap", not what it currently equals.
+    const many = Array.from({ length: llm.MAX_PER_PASS + 4 }, (_, i) => `{"text":"durable fact number ${i}"}`).join(",");
+    assert.equal(llm.parseFacts(`[${many}]`).length, llm.MAX_PER_PASS, "extraction is capped per pass");
+
+    const offered = new Set(["m1", "m2"]);
+    assert.equal(llm.parseJudgment('{"action":"skip","targets":[],"text":"x"}', "new fact", offered).action, "skip");
+    assert.deepEqual(llm.parseJudgment('{"action":"update","targets":["m1","m9"],"text":"merged wording"}', "new fact", offered).targets, ["m1"], "a hallucinated target id is discarded");
+    assert.equal(llm.parseJudgment('{"action":"update","targets":["m9"],"text":"merged wording"}', "new fact", offered).action, "store", "an update with no surviving target degrades to store, never a silent drop");
+    assert.equal(llm.parseJudgment("garbage", "new fact", offered).action, "store", "an unparseable judgment defaults to store");
+    assert.equal(llm.parseJudgment("garbage", "new fact", offered).text, "new fact", "…keeping the original wording");
   }
 
   // --- org policy merge: restrictive wins, org can tighten but never loosen ---
@@ -568,12 +820,16 @@ async function main(): Promise<void> {
 
   // --- autostart helpers: URL classification + /health derivation ---
   {
-    const { isLocalBackend, healthUrl } = await import("./client/autostart.ts");
+    const { isLocalBackend, healthUrl, modelsUrl } = await import("./client/autostart.ts");
     assert.ok(isLocalBackend("http://localhost:8787/v1"), "localhost is local");
     assert.ok(isLocalBackend("http://127.0.0.1:8787/v1"), "127.0.0.1 is local");
     assert.ok(!isLocalBackend("https://ada.example.com/v1"), "remote URL is not local");
     assert.equal(healthUrl("http://localhost:8787/v1"), "http://localhost:8787/health", "/v1 base → /health");
     assert.equal(healthUrl("http://localhost:8787"), "http://localhost:8787/health", "bare base → /health");
+    // /models keeps the /v1 — it is an API path, unlike /health which sits at the root. Getting
+    // this wrong is what makes a third-party gateway look dead and sends ada off to spawn its own.
+    assert.equal(modelsUrl("http://localhost:20128/v1"), "http://localhost:20128/v1/models", "/v1 base → /v1/models");
+    assert.equal(modelsUrl("http://localhost:20128/v1/"), "http://localhost:20128/v1/models", "a trailing slash is not a path segment");
     // Remote URL → ensureBackend short-circuits to "remote" without spawning anything.
     const { ensureBackend } = await import("./client/autostart.ts");
     const v = await ensureBackend("https://ada.example.com/v1", { quiet: true, waitMs: 200 });
@@ -584,6 +840,128 @@ async function main(): Promise<void> {
   const jid = startJob("selfcheck job", async () => "job-done-ok");
   await new Promise((r) => setTimeout(r, 30));
   assert.ok(renderJobs().includes(jid) && /job-done-ok/.test(renderJobs()), "background job runs and reports its result");
+
+  // --- jobs survive a restart, and a restart does not lie about what was running ---
+  {
+    const { reviveJobs } = await import("./client/background.ts");
+
+    // A job still marked "running" belongs to a process that is gone. Loading it faithfully would
+    // show it running forever — a worse bug, and a permanent one, than the unreachable result this
+    // whole change is about.
+    const stale = reviveJobs([
+      { id: "j1", task: "was running when serve died", status: "running", started: 1 },
+      { id: "j2", task: "finished cleanly", status: "done", result: "the answer", started: 2, ended: 3 },
+    ]);
+    assert.equal(stale.jobs.length, 2, "revive keeps both jobs");
+    assert.equal(stale.jobs[0]!.status, "error", "a running job loads as interrupted, not running");
+    assert.match(stale.jobs[0]!.result ?? "", /restart/i, "and says why it is interrupted");
+    assert.equal(stale.jobs[1]!.status, "done", "a finished job loads untouched");
+    assert.equal(stale.jobs[1]!.result, "the answer", "with its result intact — the point of persisting");
+
+    // Ids are `j${++seq}` off a module counter. Without continuing the sequence, a restart hands
+    // out j1 again and silently overwrites the persisted j1 — destroying the very result we saved.
+    assert.equal(reviveJobs([{ id: "j7", task: "t", status: "done", started: 1 }]).nextSeq, 7, "seq continues from the highest id");
+    assert.equal(reviveJobs([]).nextSeq, 0, "an empty store starts the sequence at zero");
+
+    // A corrupt or hand-edited file must not take the agent down with it.
+    assert.deepEqual(reviveJobs(null), { jobs: [], nextSeq: 0 }, "null parses to an empty store");
+    assert.deepEqual(reviveJobs("nonsense"), { jobs: [], nextSeq: 0 }, "a non-array parses to an empty store");
+    assert.equal(reviveJobs([{ nope: true }, { id: "j3", task: "ok", status: "done", started: 1 }]).jobs.length, 1, "junk entries are dropped, good ones kept");
+    assert.equal(reviveJobs([{ nope: true }, { id: "j3", task: "ok", status: "done", started: 1 }]).nextSeq, 3, "and junk does not disturb the sequence");
+
+    // save() must merge with disk, not clobber it: a second `ada` in the same folder — the app's
+    // serve for the open project, say, beside a terminal `ada` — has its own Map and writes the same
+    // file. Blind overwrite means each one's save() erases whatever the other added since its own
+    // load(). A job this process never created should still be there after a save() of its own.
+    {
+      const jobsPath = join(process.cwd(), ".ada", "jobs.json");
+      const onDisk = existsSync(jobsPath) ? JSON.parse(readFileSync(jobsPath, "utf8")) : [];
+      const foreignId = "j_selfcheck_foreign";
+      // A recent `started` matters: capJobs keeps the *newest* finished jobs, and this file already
+      // has decades of prior selfcheck runs' entries in it — an old timestamp would make the foreign
+      // job look stale and get pruned for a reason that has nothing to do with the merge being tested.
+      const now = Date.now();
+      writeFileSync(
+        jobsPath,
+        JSON.stringify(
+          [...onDisk, { id: foreignId, task: "left by another ada in this folder", status: "done", result: "not ours", started: now, ended: now }],
+          null,
+          2,
+        ),
+      );
+      // Any startJob() triggers a save() as a side effect — that is the real code path, not a
+      // reach into internals.
+      startJob("triggers a save so the merge above actually runs", async () => "ok");
+      await new Promise((r) => setTimeout(r, 30));
+      const after = JSON.parse(readFileSync(jobsPath, "utf8"));
+      assert.ok(Array.isArray(after) && after.some((j: { id?: string }) => j.id === foreignId), "save() merges in a job it never created instead of overwriting the file with only its own");
+    }
+
+    // Pruning ranks by start time, which would age out a job that is still running once enough newer
+    // jobs pile up — losing the one result the whole file exists to keep. A running job must never
+    // be dropped for being old, even past the 50-job cap; only finished jobs are ever trimmed.
+    const { listJobs } = await import("./client/background.ts");
+    for (let i = 0; i < 55; i++) startJob(`long job ${i}`, () => new Promise<string>(() => {})); // never resolves
+    const stillRunning = listJobs().filter((j) => j.status === "running" && j.task.startsWith("long job"));
+    assert.equal(stillRunning.length, 55, "every running job survives a prune, even past the 50-job cap");
+  }
+
+  // --- a tool learns which session called it -------------------------------------------------
+  {
+    const { registerTool, toolByName } = await import("./client/tools.ts");
+    let seen: string | undefined = "unset";
+    registerTool({
+      name: "selfcheck_ctx_echo",
+      description: "selfcheck only",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+      needsApproval: false,
+      async run(_args, ctx) {
+        seen = ctx?.sessionId;
+        return { output: "ok" };
+      },
+    });
+    // Called the way the agent calls it, rather than through a whole turn: the contract under test
+    // is "the ctx reaches run()", and a live model round trip would prove nothing extra.
+    await toolByName.get("selfcheck_ctx_echo")!.run({}, { sessionId: "sess-abc" });
+    assert.equal(seen, "sess-abc", "a tool receives the calling session's id");
+    await toolByName.get("selfcheck_ctx_echo")!.run({});
+    assert.equal(seen, undefined, "and undefined when the caller has no session — a terminal agent");
+  }
+
+  // --- a job remembers which chat started it -------------------------------------------------
+  {
+    const { startJob, listJobs, reviveJobs } = await import("./client/background.ts");
+    const withId = startJob("attributed job", async () => "done", "sess-xyz");
+    const without = startJob("terminal job", async () => "done");
+    await new Promise((r) => setTimeout(r, 30));
+    const all = listJobs();
+    assert.equal(all.find((j) => j.id === withId)?.sessionId, "sess-xyz", "a job records the session that started it");
+    assert.equal(all.find((j) => j.id === without)?.sessionId, undefined, "a job with no session is still valid — a terminal agent has none");
+
+    // The field has to survive a restart, or attribution silently resets to unscoped.
+    const revived = reviveJobs([{ id: "j99", task: "t", status: "done", result: "r", started: 1, ended: 2, sessionId: "sess-xyz" }]);
+    assert.equal(revived.jobs[0]!.sessionId, "sess-xyz", "reviveJobs carries sessionId across a restart");
+
+    // The branch above is the easy one — status "done" never gets rewritten. The interrupted branch
+    // is the one a crash actually exercises, and it is also the one that rebuilds the job object
+    // field by field, so it is exactly where a forgotten sessionId would go unnoticed.
+    const revivedInterrupted = reviveJobs([{ id: "j98", task: "was running when serve died", status: "running", started: 1, sessionId: "sess-xyz" }]);
+    assert.equal(revivedInterrupted.jobs[0]!.status, "error", "a running job with a session still loads as interrupted");
+    assert.equal(revivedInterrupted.jobs[0]!.sessionId, "sess-xyz", "and the interrupted branch keeps its sessionId too");
+  }
+
+  // A burst of running jobs must not squeeze the finished log to nothing — that destroyed results
+  // on the next save, which is the whole thing persistence protects against.
+  {
+    const { listJobs } = await import("./client/background.ts");
+    // The premise this block depends on — the 55 "long job" running jobs started earlier — lives in
+    // an unrelated block above. Assert it explicitly, so a future edit that shrinks or moves that
+    // loop makes this test fail loudly instead of passing without ever exercising the cap.
+    const runningCount = listJobs().filter((j) => j.status === "running").length;
+    assert.ok(runningCount > 50, "setup actually has more running jobs than the cap, or the assertion below proves nothing");
+    const finishedKept = listJobs().filter((j) => j.status !== "running").length;
+    assert.ok(finishedKept > 0, "finished jobs survive even when running jobs outnumber the cap");
+  }
 
   // --- agent-server helpers: SSE framing, id uniqueness, approval correlation (no live model needed) ---
   {
@@ -716,6 +1094,23 @@ async function main(): Promise<void> {
   assert.ok(!isAllowed("carol"), "off-allowlist user rejected");
   delete process.env.ADA_ALLOWED_USERS;
 
+  // --- db-backed allowlist (sqlite fallback here; postgres takes the same SQL shape) ---
+  {
+    process.env.ADA_AUTH_DB = join(tmpdir(), `ada-allow-${Date.now()}.db`);
+    const { addAllowed, isAllowedUser, listAllowed, removeAllowed } = await import("./server/allowlist.ts");
+    assert.ok(await isAllowedUser("anyone"), "empty env + empty table -> open");
+    await addAllowed("vikash@example.com", "selfcheck");
+    assert.ok(await isAllowedUser("vikash@example.com"), "db row admits");
+    assert.ok(!(await isAllowedUser("mallory@example.com")), "non-empty table -> gate active");
+    process.env.ADA_ALLOWED_USERS = "founder";
+    assert.ok(await isAllowedUser("founder"), "env and db union");
+    assert.ok(await isAllowedUser("vikash@example.com"), "db entry survives env being set");
+    delete process.env.ADA_ALLOWED_USERS;
+    assert.equal((await listAllowed()).length, 1, "one row listed");
+    assert.ok(await removeAllowed("vikash@example.com"), "remove reports true");
+    assert.ok(await isAllowedUser("anyone"), "empty again -> open");
+  }
+
   // --- popular-model picker: newest per family, deduped, valid ids only ---
   {
     const live = [
@@ -774,6 +1169,175 @@ async function main(): Promise<void> {
     const srv = createAdaServer();
     assert.ok(!srv.listening, "createAdaServer() builds the server without calling listen()");
     srv.close();
+  }
+
+  // --- cancelling a running job --------------------------------------------------------------
+  {
+    const { startJob, cancelJob, listJobs, reviveJobs } = await import("./client/background.ts");
+    // A job that only settles when its signal fires, so the test controls exactly when it ends.
+    const id = startJob("cancel me", (signal) => new Promise<string>((_res, rej) => {
+      signal?.addEventListener("abort", () => rej(new Error("aborted")));
+    }));
+    const j = cancelJob(id);
+    assert.equal(j?.status, "cancelled", "cancelJob settles the job as cancelled");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(listJobs().find((x) => x.id === id)?.status, "cancelled", "and the rejection does not overwrite it with error");
+
+    assert.equal(cancelJob("j-nope"), null, "cancelling an unknown job is null, not a throw");
+    const settled = startJob("already done", async () => "fine");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(cancelJob(settled)?.status, "done", "cancelling a settled job is a no-op, not an error");
+
+    // Without this, a restart relabels a deliberate stop as a success — the coercion sends anything
+    // unrecognised to "done".
+    const revived = reviveJobs([{ id: "j98", task: "t", status: "cancelled", started: 1, ended: 2 }]);
+    assert.equal(revived.jobs[0]!.status, "cancelled", "reviveJobs preserves cancelled rather than coercing it to done");
+
+    // The real sub-agent RESOLVES on abort (send() unwinds and returns whatever partial text it had)
+    // rather than rejecting — model the runner on that, not on a throw, to cover the path that
+    // actually happens in production.
+    const partialId = startJob("cancel with partial", (signal) => new Promise<string>((res) => {
+      signal?.addEventListener("abort", () => res("half an answer"));
+    }));
+    cancelJob(partialId);
+    await new Promise((r) => setTimeout(r, 30));
+    const partial = listJobs().find((x) => x.id === partialId);
+    assert.equal(partial?.status, "cancelled", "a late resolve does not move the status off cancelled");
+    assert.equal(partial?.result, "half an answer", "but its partial text is kept — the spec promises this");
+  }
+
+  // --- a nested job inherits the chat ---------------------------------------------------------
+  {
+    const { startJob, listJobs } = await import("./client/background.ts");
+    // Stands in for the nested call: a sub-agent carrying an inherited sessionId reaches exactly
+    // this path when its own background_task fires. The hop that cannot be exercised here is the
+    // live sub-agent turn; the hop that can is that an inherited id lands on the record.
+    const nested = startJob("nested job", async () => "done", "sess-parent");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(listJobs().find((j) => j.id === nested)?.sessionId, "sess-parent", "a job started with an inherited session id records it");
+  }
+
+  // --- self-awareness tools (live.ts): registry, messaging, goal, context, notes ---------------
+  {
+    const { registerRun, endRun, liveRuns } = await import("./client/live.ts");
+    // A stub that satisfies AgentHandle — the tools only read these five methods.
+    const stubAgent = (model = "stub") => ({
+      contextTokens: () => 1234,
+      compactLimit: () => 10_000,
+      compactNow: async () => "compacted (stub)",
+      usageRaw: () => ({ model, promptTokens: 500, completionTokens: 100, cost: null }),
+      lastText: () => "stub said this",
+    });
+
+    const steerA: string[] = [];
+    const steerB: string[] = [];
+    const a = registerRun("task A: refactor the parser", steerA, stubAgent());
+    const b = registerRun("task B: write the tests", steerB, stubAgent());
+    assert.equal(liveRuns().length, 2, "both runs visible");
+
+    let r = await tool("list_agents").run({}, { runId: a });
+    assert.ok(r.output.includes("(you)") && r.output.includes("task B"), "list marks self and shows others");
+
+    r = await tool("peek_agent").run({ id: b });
+    assert.ok(r.output.includes("stub said this"), "peek shows the target's last text");
+    r = await tool("peek_agent").run({ id: "nope" });
+    assert.ok(r.isError, "peeking a dead run errors");
+
+    r = await tool("send_agent_message").run({ id: b, message: "focus on edge cases" }, { runId: a });
+    assert.ok(!r.isError, r.output);
+    assert.ok(steerB[0]!.includes("focus on edge cases") && steerB[0]!.includes(a), "message lands in the target's steer queue, attributed");
+    r = await tool("send_agent_message").run({ id: a, message: "hi me" }, { runId: a });
+    assert.ok(r.isError, "self-messaging is rejected");
+
+    // goal: set → get reports spend since set → done closes
+    const agentForGoal = stubAgent();
+    r = await tool("goal").run({ action: "set", objective: "ship the feature", token_budget: 9000 }, { agent: agentForGoal });
+    assert.ok(r.output.includes("ship the feature"), r.output);
+    r = await tool("goal").run({ action: "get" }, { agent: agentForGoal });
+    assert.ok(r.output.includes("active") && r.output.includes("9000"), "goal get reports status and budget");
+    r = await tool("goal").run({ action: "done" }, { agent: agentForGoal });
+    assert.ok(r.output.includes("closed"), r.output);
+
+    r = await tool("context_status").run({}, { agent: stubAgent() });
+    assert.ok(r.output.includes("1234") && r.output.includes("12%"), "context status reports tokens and percent");
+    r = await tool("compact_now").run({}, { agent: stubAgent() });
+    assert.equal(r.output, "compacted (stub)");
+
+    // heartbeat: create pushes into own steer on a timer; endRun clears it
+    r = await tool("heartbeat").run({ action: "create", instruction: "check the build", every_seconds: 1 }, { runId: a });
+    assert.ok(!r.isError, r.output); // min interval clamps to 15s — creation is what's under test
+    r = await tool("heartbeat").run({ action: "list" }, { runId: a });
+    assert.ok(r.output.includes("check the build"), "heartbeat listed");
+    r = await tool("heartbeat").run({ action: "cancel", id: 1 }, { runId: a });
+    assert.ok(r.output.includes("cancelled"), r.output);
+
+    endRun(a);
+    endRun(b);
+    assert.equal(liveRuns().length, 0, "endRun clears the registry");
+
+    // refine_note appends to .ada/notes.md in cwd — run it from a temp cwd so the repo stays clean
+    const notesDir = join(tmpdir(), `ada-notes-${Date.now()}`);
+    mkdirSync(notesDir, { recursive: true });
+    const oldCwd = process.cwd();
+    process.chdir(notesDir);
+    try {
+      const { readNotes } = await import("./client/live.ts");
+      r = await tool("refine_note").run({ note: "always run tests from repo root" });
+      assert.ok(!r.isError, r.output);
+      assert.ok(readNotes().includes("always run tests from repo root"), "note readable back for the system prompt");
+    } finally {
+      process.chdir(oldCwd);
+      rmSync(notesDir, { recursive: true, force: true });
+    }
+  }
+
+  // --- job notifications reach the owning agent (live.notify) ----------------------------------
+  {
+    const { registerRun, endRun, notify } = await import("./client/live.ts");
+    const stub = { contextTokens: () => 0, compactLimit: () => 1, compactNow: async () => "", usageRaw: () => ({ model: "stub", promptTokens: 0, completionTokens: 0, cost: null }), lastText: () => "" };
+
+    // Live delivery: a run in flight for the session gets the message in its steer queue.
+    const steer: string[] = [];
+    const run = registerRun("chat turn", steer, stub, "sess-live");
+    notify("sess-live", "[background job j9 done] result text");
+    assert.ok(steer.some((s) => s.includes("j9")), "notify lands in the live run's steer queue");
+    endRun(run);
+
+    // Parked delivery: no run in flight — the message waits and drains into the session's NEXT turn.
+    notify("sess-idle", "[background job j10 done] later result");
+    const steer2: string[] = [];
+    const run2 = registerRun("next turn", steer2, stub, "sess-idle");
+    assert.ok(steer2.some((s) => s.includes("j10")), "a parked notification drains into the next turn");
+    endRun(run2);
+
+    // A different session's turn must NOT receive it.
+    notify("sess-a", "[job for a]");
+    const steerB: string[] = [];
+    const runB = registerRun("b's turn", steerB, stub, "sess-b");
+    assert.equal(steerB.length, 0, "notifications never cross sessions");
+    endRun(runB);
+  }
+
+  // --- post-edit verification (verifyEdits + auto-detection) -----------------------------------
+  {
+    const { verifyEdits, detectVerifyCommand } = await import("./client/agent.ts");
+
+    // Auto-detection: npm script wins, then other ecosystems, then nothing.
+    const vDir = join(tmpdir(), `ada-verify-${Date.now()}`);
+    mkdirSync(vDir, { recursive: true });
+    writeFileSync(join(vDir, "package.json"), JSON.stringify({ scripts: { typecheck: "tsc --noEmit" } }));
+    assert.equal(detectVerifyCommand(vDir), "npm run typecheck", "package.json typecheck script is detected");
+    writeFileSync(join(vDir, "package.json"), "{}");
+    writeFileSync(join(vDir, "Cargo.toml"), "[package]");
+    assert.equal(detectVerifyCommand(vDir), "cargo check --quiet", "cargo project detected when npm has no scripts");
+    rmSync(vDir, { recursive: true, force: true });
+    assert.equal(detectVerifyCommand(join(tmpdir(), "ada-verify-none")), null, "no project markers → nothing to run");
+    const fail = await verifyEdits([], `node -e "console.error('boom');process.exit(1)"`);
+    assert.ok(fail && fail.includes("boom") && fail.includes("exited 1"), "failing verify command reports its output");
+    const ok = await verifyEdits([], `node -e "process.exit(0)"`);
+    assert.equal(ok, null, "clean verify command reports nothing");
+    const none = await verifyEdits([], undefined);
+    assert.equal(none, null, "no command and no LSP-checkable paths → silently clean");
   }
 
   console.log("selfcheck OK");

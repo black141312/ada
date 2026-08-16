@@ -3,14 +3,14 @@
 // their env creds are present. Docs: https://www.better-auth.com
 import { betterAuth } from "better-auth";
 import { bearer, deviceAuthorization } from "better-auth/plugins";
-import Database from "better-sqlite3";
-import { Pool } from "pg";
+import { authDatabase } from "./db.ts";
 
 // Storage: a hosted Postgres (Supabase) when DATABASE_URL is set — makes the backend STATELESS, so it
 // runs on any serverless/container host without a persistent disk. Falls back to local SQLite for dev.
-const authDatabase = process.env.DATABASE_URL
-  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
-  : new Database(process.env.ADA_AUTH_DB ?? "ada-auth.db");
+// Exported so the allowlist can live in the same store (Postgres in prod, SQLite in dev).
+// The store moved to db.ts so importing it no longer opens a database — see the note there.
+// Re-exported: callers of this module still expect these names.
+export { authDatabase, usingPostgres } from "./db.ts";
 
 const socialProviders: Record<string, { clientId: string; clientSecret: string }> = {};
 if (process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET) {
@@ -33,7 +33,7 @@ if (betterAuthEnabled() && authSecret === DEV_SECRET) {
 export const auth = betterAuth({
   baseURL: process.env.BETTER_AUTH_URL ?? `http://localhost:${process.env.PORT ?? 8787}`,
   secret: authSecret,
-  database: authDatabase,
+  database: authDatabase(),
   emailAndPassword: { enabled: true },
   socialProviders,
   plugins: [

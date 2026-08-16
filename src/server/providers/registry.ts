@@ -9,11 +9,13 @@
 import type { ProviderName } from "../../shared/types.ts";
 import type { Adapter } from "./adapter.ts";
 import { anthropicAdapter } from "./anthropic.ts";
+import { codexAdapter } from "./codex.ts";
 import { openAICompatAdapter } from "./openai-compat.ts";
 
 const ADAPTERS: Record<ProviderName, Adapter> = {
   anthropic: anthropicAdapter, // native: Anthropic Messages API
   openai: openAICompatAdapter,
+  chatgpt: codexAdapter, // native: OpenAI Responses API, via the ChatGPT subscription endpoint
   google: openAICompatAdapter, // via Google's OpenAI-compatible endpoint
   mistral: openAICompatAdapter,
   openrouter: openAICompatAdapter,
@@ -25,6 +27,7 @@ const ADAPTERS: Record<ProviderName, Adapter> = {
   copilot: openAICompatAdapter, // GitHub Copilot's OpenAI-compatible endpoint (+ custom headers in the adapter)
   cloudflare: openAICompatAdapter, // Cloudflare Workers AI / AI Gateway (OpenAI-compatible)
   ollama: openAICompatAdapter,
+  omniroute: openAICompatAdapter, // a local OmniRoute gateway, OpenAI-compatible by design
 };
 
 export function adapterFor(provider: ProviderName): Adapter {

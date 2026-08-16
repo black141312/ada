@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "ada bridge",
+  "version": "0.1.0",
+  "description": "Lets ada drive this browser - the real one, with your existing logins - over the DevTools protocol.",
+  "permissions": ["debugger", "tabs", "alarms", "scripting"],
+  "host_permissions": ["http://127.0.0.1/*", "<all_urls>"],
+  "background": { "service_worker": "background.js" }
+}

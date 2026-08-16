@@ -10,11 +10,14 @@ import TextInput from "ink-text-input";
 // this repo's tsconfig and falls back to the classic JSX transform (React.createElement).
 import React, { type JSX, useEffect, useRef, useState } from "react";
 import type { Agent } from "./agent.ts";
+import { subscriptionFor, subscriptionLogin } from "../server/providers/subscription-oauth.ts";
 import { setAsker } from "./tools.ts";
+import type { AskOption } from "./tools.ts";
 
 const GOLD = "#ffaf00"; // ada accent (xterm 214)
 const WORDS = ["Cogitating", "Pondering", "Noodling", "Percolating", "Ruminating", "Tinkering", "Untangling", "Brewing", "Mulling", "Crunching"];
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const THINKING_TAIL = 600; // chars of live thinking kept on screen — roughly a screenful
 
 type Item =
   | { id: number; kind: "header"; text: string }
@@ -68,10 +71,13 @@ function AdaApp({ agent, model }: { agent: Agent; model: string }): JSX.Element 
   const [input, setInput] = useState("");
   const [queued, setQueued] = useState<string[]>([]);
   const [live, setLive] = useState("");
+  // Shown while the turn runs and dropped once the answer lands — thinking is not part of the
+  // reply, so it never joins the transcript.
+  const [thinking, setThinking] = useState("");
   const [running, setRunning] = useState(false);
   const [tokens, setTokens] = useState(agent.contextTokens());
   const [confirm, setConfirm] = useState<{ risk: string; detail: string; danger: boolean; resolve: (d: "yes" | "all" | "no") => void } | null>(null);
-  const [asking, setAsking] = useState<{ options?: string[]; resolve: (s: string) => void } | null>(null);
+  const [asking, setAsking] = useState<{ options?: AskOption[]; resolve: (s: string) => void } | null>(null);
   const [word, setWord] = useState(WORDS[0]!);
   const [secs, setSecs] = useState(0);
   const [spin, setSpin] = useState(0);
@@ -97,7 +103,10 @@ function AdaApp({ agent, model }: { agent: Agent; model: string }): JSX.Element 
   setAsker(
     (question, options) =>
       new Promise((resolve) => {
-        push("ask", options?.length ? `${question}\n${options.map((o, i) => `  ${i + 1}. ${o}`).join("\n")}` : question);
+        push(
+          "ask",
+          options?.length ? `${question}\n${options.map((o, i) => `  ${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ""}`).join("\n")}` : question,
+        );
         setAsking({ options, resolve });
       }),
   );
@@ -133,6 +142,10 @@ function AdaApp({ agent, model }: { agent: Agent; model: string }): JSX.Element 
             liveRef.current += e.delta;
             setLive(liveRef.current);
             setQueued((q) => (q.length === steerRef.current.length ? q : [...steerRef.current])); // reflect drained steers
+          } else if (e.type === "reasoning") {
+            // Keep only the tail: a high-effort thought is longer than the terminal, and the
+            // interesting part is always the most recent line.
+            setThinking((t) => (t + e.delta).slice(-THINKING_TAIL));
           } else if (e.type === "done" && e.context) setTokens(e.context);
         },
       });
@@ -143,6 +156,7 @@ function AdaApp({ agent, model }: { agent: Agent; model: string }): JSX.Element 
       if (error) push("error", error);
       liveRef.current = "";
       setLive("");
+      setThinking("");
       setQueued([]);
       setRunning(false);
       runningRef.current = false;
@@ -157,13 +171,30 @@ function AdaApp({ agent, model }: { agent: Agent; model: string }): JSX.Element 
       setAsking(null);
       const n = Number(text);
       const opts = asking.options;
-      asking.resolve(opts?.length && Number.isInteger(n) && n >= 1 && n <= opts.length ? opts[n - 1]! : text);
+      asking.resolve(opts?.length && Number.isInteger(n) && n >= 1 && n <= opts.length ? opts[n - 1]!.label : text);
       return;
     }
     if (!text) return;
     hist.current.list.push(text);
     hist.current.i = -1;
     if (text === "/exit" || text === "/quit") return exit();
+    // /login is handled here (rather than falling through to the stub below) because a plan sign-in
+    // is the one command you may need BEFORE the TUI can talk to a model at all — being told to
+    // restart without --tui to run it would be a dead end.
+    if (text === "/login" || text.startsWith("/login ")) {
+      push("user", text);
+      const arg = text.slice("/login".length).trim().toLowerCase();
+      const provider = subscriptionFor(arg);
+      if (!provider) {
+        push("info", `  usage: /login claude | /login chatgpt${arg ? `  (unknown: ${arg})` : ""}`);
+        return;
+      }
+      push("info", "  opening your browser — finish the sign-in there…");
+      void subscriptionLogin(provider, (s) => {
+        for (const line of s.split("\n")) if (line.trim()) push("info", `  ${line}`);
+      }).catch((e: unknown) => push("error", `login failed: ${e instanceof Error ? e.message : String(e)}`));
+      return;
+    }
     if (text.startsWith("/") && !text.includes(" ") && text.length > 1) {
       // ponytail: TUI only implements /exit; other commands live in the plain REPL for now
       push("user", text);
@@ -221,6 +252,14 @@ function AdaApp({ agent, model }: { agent: Agent; model: string }): JSX.Element 
   return (
     <Box flexDirection="column">
       <Static items={items}>{(item) => <ItemView key={item.id} item={item} />}</Static>
+      {thinking.trim() && !live.trim() ? (
+        <Box flexDirection="column" marginTop={1}>
+          <Text dimColor>{"✻ Thinking…"}</Text>
+          <Text dimColor italic>
+            {thinking.replace(/^\s+/, "")}
+          </Text>
+        </Box>
+      ) : null}
       {live.trim() ? (
         <Box marginTop={1}>
           <Text color={GOLD}>{"◆ "}</Text>

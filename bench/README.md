@@ -86,3 +86,5 @@ tests, and reports the **resolved rate** plus a per-instance breakdown.
 ```bash
 node bench/swebench.mjs --selftest     # offline: validates the prompt/prediction/arg helpers
 ```
+
+---

@@ -1,6 +1,6 @@
 {
   "name": "ada-agent",
-  "version": "0.13.0",
+  "version": "0.15.0",
   "description": "A from-zero terminal coding agent with a Cursor-style routing backend, ~285 skills, MCP connectors, and ask/plan/auto modes",
   "type": "module",
   "license": "MIT",
@@ -55,11 +55,19 @@
     "start": "tsx src/client/cli.ts",
     "server": "tsx src/server/index.ts",
     "typecheck": "tsc --noEmit",
+    "sqlite:abi": "node scripts/sqlite-abi.mjs",
+    "postinstall": "node scripts/sqlite-abi.mjs || exit 0",
     "typecheck:worker": "tsc -p src/worker/tsconfig.json --noEmit",
     "selfcheck": "tsx src/selfcheck.ts",
+    "check:browser": "tsx src/browsercheck.ts",
+    "bench:memory": "tsx bench/memory.ts",
+    "bench:extraction": "tsx bench/extraction.ts",
     "bench:swebench": "node bench/swebench.mjs",
     "catalog:refresh": "node scripts/refresh-catalog.mjs",
-    "release": "node scripts/release.mjs"
+    "release": "node scripts/release.mjs",
+    "browser:profile": "tsx src/clone-profile.ts",
+    "browser:login": "tsx src/browser-login.ts",
+    "browser:bridge": "tsx src/browser-bridge.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.106.0",
@@ -74,7 +82,13 @@
     "tsx": "^4.22.4"
   },
   "optionalDependencies": {
-    "node-pty": "^1.1.0"
+    "node-pty": "^1.1.0",
+    "sharp": "^0.35.3"
+  },
+  "//overrides": "Two high-severity advisories reach us only through @huggingface/transformers, and there is no upstream fix to wait for: transformers 4.2.0 is the latest and pins onnxruntime-node 1.24.3 exactly, while even onnxruntime-node 1.27.0 still asks for adm-zip ^0.5.16. sharp is the one that matters — convert_image runs it on arbitrary local files, so the libvips CVEs are reachable. adm-zip is only used by onnxruntime-node to unpack its own bundled binaries, never attacker-controlled input, so that one is hygiene. Drop these once transformers ships ranges that resolve clean.",
+  "overrides": {
+    "adm-zip": "^0.6.0",
+    "sharp": "^0.35.3"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260702.1",
