@@ -177,29 +177,9 @@ async function run(cmd) {
   throw new Error(`unknown op: ${cmd.op}`);
 }
 
-/** Long-poll ada for the next command, run it, post the result, repeat. A dropped connection is
- *  normal (MV3 kills idle service workers); the alarm below wakes us up again. */
-async function pump() {
-  const t = await token();
-  if (!t) return;
-  let res;
-  try {
-    res = await fetch(`${BRIDGE}/poll?token=${encodeURIComponent(t)}`);
-  } catch {
-    // ada is not running (or just restarted). Waiting for the 30s alarm would make every ada start
-    // look like "no extension" for half a minute, so retry soon instead.
-    setTimeout(pump, 2000);
-    return;
-  }
-  if (!res.ok) {
-    setTimeout(pump, 2000);
-    return;
-  }
-  const cmd = await res.json().catch(() => null);
-  if (!cmd || !cmd.id) {
-    pump();
-    return;
-  }
+/** Run one command and post the answer back. Deliberately not awaited by the reader, so a slow
+ *  command cannot stall the stream behind it. */
+async function handle(cmd, t) {
   let body;
   try {
     body = { id: cmd.id, result: await run(cmd) };
@@ -207,8 +187,43 @@ async function pump() {
     body = { id: cmd.id, error: String((e && e.message) || e) };
   }
   await fetch(`${BRIDGE}/result`, { method: "POST", body: JSON.stringify({ token: t, ...body }) }).catch(() => {});
-  pump(); // straight back to waiting
 }
+
+/** Hold one connection open and read commands as ada writes them.
+ *
+ *  This replaces a long-poll loop. Polling left a gap: between one poll being answered and the next
+ *  going out, a command had nowhere to land, and if Chrome tore this worker down in that window it
+ *  waited for the 30s alarm - which looked like the bridge silently ignoring commands. A stream has
+ *  no gap, and ada's heartbeat every 15s counts as activity, so the worker is not torn down at all. */
+async function connect() {
+  const t = await token();
+  if (!t) return;
+  try {
+    const res = await fetch(`${BRIDGE}/stream?token=${encodeURIComponent(t)}`);
+    if (!res.ok || !res.body) throw new Error(`stream ${res.status}`);
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        const line = frame.split("\n").find((l) => l.startsWith("data: "));
+        if (!line) continue; // heartbeat
+        const cmd = JSON.parse(line.slice(6));
+        if (cmd && cmd.id) handle(cmd, t);
+      }
+    }
+  } catch {
+    /* ada restarted or is not running */
+  }
+  setTimeout(connect, 2000); // reconnect promptly; the alarm is only a backstop
+}
+const pump = connect;
 
 chrome.runtime.onInstalled.addListener(() => pump());
 chrome.runtime.onStartup.addListener(() => pump());

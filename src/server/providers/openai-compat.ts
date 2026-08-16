@@ -19,8 +19,21 @@ const ADA_VERSION = (() => {
   }
 })();
 
-type Part = { type: string; text?: string; cache_control?: { type: string } };
+type Part = { type: string; text?: string; cache_control?: { type: string; ttl?: string } };
 type Msg = { role?: string; content?: unknown };
+
+/** How long a cache entry lives. `ADA_CACHE_TTL=1h` opts into Anthropic's extended cache; anything
+ *  else leaves the 5-minute default. Measured through OpenRouter against claude-haiku-4.5: a write
+ *  with no `ttl` bills 1.25x input, a write with `ttl:"1h"` bills 2.00x — so it IS forwarded, and no
+ *  `anthropic-beta` header is needed. Reads bill 0.1x under either.
+ *
+ *  Which to pick is a question about the gap between turns, not about the model. Under 5 minutes the
+ *  default already reads at 0.1x and 1h only costs you the extra 0.75x on the write. Over 5 minutes
+ *  the default has expired and every turn re-writes at 1.25x, while 1h reads at 0.1x — so 1h pays for
+ *  itself on the second turn and wins by more on every one after. Human-paced sessions clear that
+ *  bar constantly; a tight agentic loop does not. */
+const CACHE_TTL_1H = process.env.ADA_CACHE_TTL === "1h";
+const cacheControl = (): { type: string; ttl?: string } => (CACHE_TTL_1H ? { type: "ephemeral", ttl: "1h" } : { type: "ephemeral" });
 
 /** Claude is the only family that has to be ASKED to cache. DeepSeek, Kimi and OpenAI cache
  *  automatically — which is why their runs report a hit rate and Claude's report none at all.
@@ -33,10 +46,18 @@ type Msg = { role?: string; content?: unknown };
  *  those map to tool_result blocks upstream and rewriting their content shape risks breaking the
  *  mapping for a marginal gain.
  *
- *  ponytail: the system prompt is left alone on purpose. Ada appends per-turn extras (repo map,
- *  recalled memories, skill hints) as a trailing system message, and Anthropic folds every system
- *  message into one parameter — so the system block changes each turn and can't be cached as-is.
- *  Making it cacheable means moving the transient parts out of `system` first. */
+ *  A second breakpoint goes on the LAST system message. That used to be impossible: Ada put the
+ *  per-turn extras (recalled memories, skill hints) in a trailing system message, Anthropic folds
+ *  every system message into one parameter, and a single per-turn byte in there changed the prefix.
+ *  The agent now sends only stable content as `system` — the repo map, built once per session — and
+ *  the per-turn hints as a trailing USER message, so the folded system param is finally stable.
+ *
+ *  Marking system also caches the TOOL SCHEMAS, which is the bigger prize: Anthropic's cache prefix
+ *  runs tools → system → messages, so a breakpoint on system covers everything ahead of it. ~57
+ *  registered tools were being re-sent at full price on every iteration of every agent loop. We do
+ *  NOT put `cache_control` on the tool objects themselves the way the native anthropic.ts path can —
+ *  it isn't part of the OpenAI tool schema, and an unexpected field is a 400 from several providers.
+ *  Going through the system block gets the same coverage without that risk. */
 export function markCacheable(body: Record<string, unknown>): Record<string, unknown> {
   const model = String(body.model ?? "");
   if (!/claude/i.test(model) && !model.startsWith("anthropic/")) return body;
@@ -53,17 +74,33 @@ export function markCacheable(body: Record<string, unknown>): Record<string, unk
     if (role === "user" || role === "assistant") turns.push(j);
   }
   const i = turns.length >= 2 ? turns[1]! : (turns[0] ?? -1);
-  if (i < 0) return body;
 
-  const m = msgs[i] as Msg;
-  const parts: Part[] | null =
-    typeof m.content === "string" ? [{ type: "text", text: m.content }] : Array.isArray(m.content) ? [...(m.content as Part[])] : null;
-  if (!parts?.length) return body; // assistant turns can be tool_calls with null content
-
-  parts[parts.length - 1] = { ...parts[parts.length - 1]!, cache_control: { type: "ephemeral" } };
   const out = msgs.slice();
-  out[i] = { ...m, content: parts };
-  return { ...body, messages: out };
+  let marked = false;
+
+  /** Rewrite one message's content to block form and put the breakpoint on its last block. */
+  const mark = (at: number): void => {
+    const m = out[at] as Msg;
+    const parts: Part[] | null =
+      typeof m.content === "string" ? [{ type: "text", text: m.content }] : Array.isArray(m.content) ? [...(m.content as Part[])] : null;
+    if (!parts?.length) return; // assistant turns can be tool_calls with null content
+    if (parts.some((p) => p.cache_control)) return; // already marked — don't spend a second breakpoint
+    parts[parts.length - 1] = { ...parts[parts.length - 1]!, cache_control: cacheControl() };
+    out[at] = { ...m, content: parts };
+    marked = true;
+  };
+
+  // The LAST system message, so the breakpoint sits after every system block upstream folds together
+  // — and therefore after the tool schemas too.
+  for (let j = msgs.length - 1; j >= 0; j--) {
+    if ((msgs[j] as Msg)?.role === "system") {
+      mark(j);
+      break;
+    }
+  }
+
+  if (i >= 0) mark(i);
+  return marked ? { ...body, messages: out } : body;
 }
 
 async function authHeaders(provider: ProviderName): Promise<Record<string, string>> {

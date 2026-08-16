@@ -42,7 +42,7 @@ Q4  █████████████████████████�
 
 ## Route 2 — mermaid (fastest real chart; renders on GitHub and in most viewers)
 
-Put it in a ` ```mermaid ` fence in a doc, or render + open it with the **render-diagram** skill.
+Put it in a ` ```mermaid ` fence in a doc, or render + open it with the **diagram** skill.
 
 ```
 xychart-beta
@@ -55,7 +55,7 @@ xychart-beta
 
 Also: `pie title Share` with `"Label" : 42` rows; `quadrantChart`; `sankey-beta` (plain
 `source,target,value` CSV rows); `gantt`; `timeline`. The `-beta` types need a current mermaid — the
-render-diagram template pulls the latest from a CDN, so they need internet.
+diagram skill's HTML template pulls the latest from a CDN, so they need internet.
 
 ## Route 3 — SVG file (offline, any chart type, embeds anywhere)
 

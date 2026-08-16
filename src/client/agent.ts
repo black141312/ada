@@ -1420,7 +1420,11 @@ export class Agent {
   }
 
   /** Cost of this agent's own traffic. Cache reads bill ~0.1x and writes ~1.25x — pricing every
-   *  prompt token at the full input rate over-reports by exactly the cache's savings. */
+   *  prompt token at the full input rate over-reports by exactly the cache's savings.
+   *  Under `ADA_CACHE_TTL=1h` a write bills 2x instead (measured, see openai-compat), so the
+   *  multiplier follows the same switch or the estimate silently under-reports the first turn of
+   *  every session. A client talking to a backend that sets it and doesn't set it itself will still
+   *  under-report — the honest ceiling of a `~$` estimate computed from token counts alone. */
   private ownCost(): number | null {
     // Priced per model that served the tokens, not per agent — see byModel.
     const buckets = this.byModel.size ? [...this.byModel.entries()] : [[this.model, { prompt: this.promptTokens, completion: this.completionTokens, cached: this.cachedTokens, cacheWrite: this.cacheWriteTokens }] as const];
@@ -1431,7 +1435,8 @@ export class Agent {
       if (!p) continue; // unknown model: leave it out rather than guess at the wrong rate
       priced = true;
       const fresh = Math.max(0, b.prompt - b.cached - b.cacheWrite);
-      total += (fresh / 1e6) * p[0] + (b.cached / 1e6) * p[0] * 0.1 + (b.cacheWrite / 1e6) * p[0] * 1.25 + (b.completion / 1e6) * p[1];
+      const writeMult = process.env.ADA_CACHE_TTL === "1h" ? 2 : 1.25;
+      total += (fresh / 1e6) * p[0] + (b.cached / 1e6) * p[0] * 0.1 + (b.cacheWrite / 1e6) * p[0] * writeMult + (b.completion / 1e6) * p[1];
     }
     return priced ? total : null;
   }

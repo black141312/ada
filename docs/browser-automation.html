@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>How ada drives your real browser</title>
+    <style>
+      :root {
+        --bg: #0b0d10;
+        --panel: #14171c;
+        --edge: #232830;
+        --text: #e8ecf1;
+        --muted: #98a2b0;
+        --faint: #5f6875;
+        --accent: #7c6cf0;
+        --ok: #35c07f;
+        --bad: #e5545b;
+        --warn: #d9a441;
+        --mono: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+        --sans: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 400 15px/1.65 var(--sans);
+        padding: 48px 24px 80px;
+      }
+      .wrap { max-width: 1080px; margin: 0 auto; }
+      h1 { font-size: 30px; margin: 0 0 6px; letter-spacing: -0.02em; }
+      .sub { color: var(--muted); margin: 0 0 40px; font-size: 16px; }
+      h2 {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: var(--faint);
+        margin: 44px 0 14px;
+        font-weight: 600;
+      }
+      .panel { background: var(--panel); border: 1px solid var(--edge); border-radius: 12px; padding: 20px; }
+      code, .mono { font-family: var(--mono); font-size: 13px; }
+
+      /* ---- blocked routes ---- */
+      .routes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+      .route { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px; padding: 16px; position: relative; overflow: hidden; }
+      .route::after {
+        content: "✕";
+        position: absolute;
+        top: 12px;
+        right: 14px;
+        color: var(--bad);
+        font-size: 15px;
+      }
+      .route h3 { margin: 0 0 8px; font: 600 13px var(--mono); color: var(--text); }
+      .route p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+
+      /* ---- architecture ---- */
+      .arch { display: grid; grid-template-columns: 1fr 92px 1fr 92px 1fr; align-items: center; gap: 0; }
+      .node { background: var(--panel); border: 1px solid var(--edge); border-radius: 12px; padding: 18px; text-align: center; }
+      .node.live { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(124, 108, 240, 0.25); }
+      .node .t { font: 600 14px var(--sans); margin-bottom: 4px; }
+      .node .d { color: var(--muted); font-size: 12.5px; line-height: 1.45; }
+      .node .tag { display: inline-block; margin-top: 8px; font: 500 10.5px var(--mono); color: var(--faint); border: 1px solid var(--edge); border-radius: 999px; padding: 2px 8px; }
+      .arrow { text-align: center; color: var(--faint); font-size: 13px; line-height: 1.5; padding: 0 6px; }
+      .arrow .lbl { display: block; font: 500 10px var(--mono); color: var(--accent); margin: 1px 0 7px; letter-spacing: -0.01em; }
+      .arrow .lbl:last-child { margin-bottom: 0; }
+
+      /* ---- flow ---- */
+      .flow { counter-reset: step; display: grid; gap: 8px; }
+      .step { display: grid; grid-template-columns: 30px 148px 1fr 78px; gap: 14px; align-items: center; background: var(--panel); border: 1px solid var(--edge); border-radius: 10px; padding: 12px 16px; }
+      .step .n { width: 24px; height: 24px; border-radius: 50%; background: rgba(124, 108, 240, 0.14); color: var(--accent); display: grid; place-items: center; font: 600 12px var(--mono); }
+      .step .verb { font: 600 13px var(--mono); color: var(--text); }
+      .step .what { color: var(--muted); font-size: 13px; }
+      .step .what b { color: var(--text); font-weight: 500; }
+      .step .ms { text-align: right; font: 500 12px var(--mono); color: var(--faint); }
+      .step.gate { border-color: rgba(217, 164, 65, 0.4); }
+      .step.gate .n { background: rgba(217, 164, 65, 0.14); color: var(--warn); }
+
+      /* ---- before/after ---- */
+      .cmp { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+      .cmp .col { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px; padding: 16px; }
+      .cmp .col.bad { border-color: rgba(229, 84, 91, 0.35); }
+      .cmp .col.ok { border-color: rgba(53, 192, 127, 0.35); }
+      .cmp h3 { margin: 0 0 10px; font: 600 12px var(--mono); }
+      .cmp .col.bad h3 { color: var(--bad); }
+      .cmp .col.ok h3 { color: var(--ok); }
+      .cmp ul { margin: 0; padding-left: 16px; color: var(--muted); font-size: 13px; line-height: 1.7; }
+      .cmp li b { color: var(--text); font-weight: 500; }
+
+      /* ---- bugs ---- */
+      .bug { display: grid; grid-template-columns: 26px 1fr; gap: 12px; padding: 14px 0; border-top: 1px solid var(--edge); }
+      .bug:first-child { border-top: none; }
+      .bug .ic { color: var(--warn); font-size: 15px; }
+      .bug h3 { margin: 0 0 3px; font-size: 14px; font-weight: 600; }
+      .bug p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
+      .bug .fix { color: var(--ok); }
+
+      .out { background: #0f1216; border: 1px solid var(--edge); border-radius: 10px; padding: 16px 18px; font-family: var(--mono); font-size: 12.5px; line-height: 1.9; color: var(--muted); white-space: pre; overflow-x: auto; }
+      .out .hi { color: var(--ok); }
+      .out .dim { color: var(--faint); }
+      footer { margin-top: 46px; color: var(--faint); font-size: 12.5px; border-top: 1px solid var(--edge); padding-top: 16px; }
+      @media (max-width: 900px) {
+        .routes, .arch, .cmp { grid-template-columns: 1fr; }
+        .arrow { padding: 6px 0; }
+        .step { grid-template-columns: 26px 1fr; }
+        .step .ms, .step .what { grid-column: 2; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>How ada sends a message from your own browser</h1>
+      <p class="sub">Driving the Chrome you are already signed into — no second profile, no logging in twice.</p>
+
+      <h2>The problem — three routes into your real profile, all closed</h2>
+      <div class="routes">
+        <div class="route">
+          <h3>--remote-debugging-port</h3>
+          <p>Chrome 136+ refuses to open the port when the profile directory is the one Chrome itself is using. The port silently never opens.</p>
+        </div>
+        <div class="route">
+          <h3>--remote-debugging-pipe</h3>
+          <p>Same wall, stated out loud: <span class="mono">“DevTools remote debugging requires a non-default data directory.”</span></p>
+        </div>
+        <div class="route">
+          <h3>copy the profile</h3>
+          <p>Cookies are app-bound (<span class="mono">v20</span>). Chrome discards every one on first launch against a copy — measured here: 3879 cookies → 0.</p>
+        </div>
+      </div>
+
+      <h2>The answer — get inside the browser instead of knocking on it</h2>
+      <div class="arch">
+        <div class="node">
+          <div class="t">ada</div>
+          <div class="d">browser.ts<br />verbs: read, click, type…</div>
+          <span class="tag">node</span>
+        </div>
+        <div class="arrow">──▶<span class="lbl">commands</span>◀──<span class="lbl">results</span></div>
+        <div class="node live">
+          <div class="t">ada bridge</div>
+          <div class="d">MV3 extension<br />holds one open connection</div>
+          <span class="tag">in chrome</span>
+        </div>
+        <div class="arrow">──▶<span class="lbl">inject</span></div>
+        <div class="node">
+          <div class="t">the page</div>
+          <div class="d">your logged-in<br />Instagram tab</div>
+          <span class="tag">your session</span>
+        </div>
+      </div>
+      <p style="color: var(--muted); font-size: 13.5px; margin-top: 14px">
+        The key idea: <b style="color: var(--text)">the extension dials out to ada</b>, so nothing on your machine listens for inbound connections — and because it
+        lives inside Chrome, it inherits every login you already have.
+      </p>
+
+      <h2>Reading the page: two ways, one of them cheap</h2>
+      <div class="cmp">
+        <div class="col bad">
+          <h3>chrome.debugger (old)</h3>
+          <ul>
+            <li>attaches a debugger — Chrome shows <b>“ada bridge started debugging this browser”</b></li>
+            <li>a protocol round trip per query</li>
+            <li>clicks land on <b>coordinates</b>, so an overlay silently eats them</li>
+          </ul>
+        </div>
+        <div class="col ok">
+          <h3>content script (now)</h3>
+          <ul>
+            <li>shares the page's DOM directly — <b>no banner</b></li>
+            <li>one message returns the whole snapshot</li>
+            <li>clicks the <b>element</b>, so overlays are irrelevant</li>
+          </ul>
+        </div>
+      </div>
+
+      <h2>What a page looks like to ada</h2>
+      <div class="out"><span class="dim">https://www.instagram.com/direct/inbox/</span>
+
+button "vikash You: ada test · 1h" <span class="hi">[ref_18]</span> <span class="dim">@72,298</span>
+button "Valo 2.0 Ashwani sent an attachment. · 19h" [ref_19] <span class="dim">@72,370</span>
+link   "Open the profile page of its__vikash__" <span class="hi">[ref_28]</span> <span class="dim">@488,16</span>
+textbox <span class="hi">[ref_40]</span> <span class="dim">@538,897</span></div>
+      <p style="color: var(--muted); font-size: 13.5px; margin-top: 12px">
+        Every interactive element, named and numbered. Acting is then just <span class="mono" style="color: var(--text)">click {ref: "ref_18"}</span> — no DOM
+        archaeology, no guessing at selectors.
+      </p>
+
+      <h2>Sending “hi” — the whole run, 9.7 seconds</h2>
+      <div class="flow">
+        <div class="step">
+          <div class="n">1</div>
+          <div class="verb">open</div>
+          <div class="what">the DM inbox, in <b>your</b> Chrome</div>
+          <div class="ms">2.5s</div>
+        </div>
+        <div class="step">
+          <div class="n">2</div>
+          <div class="verb">read</div>
+          <div class="what">snapshot → the 1:1 row is <b>ref_18</b> <span class="dim">(the group “vikash ಮತ್ತು Abhay” is excluded)</span></div>
+          <div class="ms">0.2s</div>
+        </div>
+        <div class="step">
+          <div class="n">3</div>
+          <div class="verb">click ref_18</div>
+          <div class="what">opens the thread</div>
+          <div class="ms">2.5s</div>
+        </div>
+        <div class="step gate">
+          <div class="n">!</div>
+          <div class="verb">read → gate</div>
+          <div class="what">header must show <b>exactly one</b> profile, and it must be <b>its__vikash__</b> — otherwise abort before typing</div>
+          <div class="ms">0.2s</div>
+        </div>
+        <div class="step">
+          <div class="n">4</div>
+          <div class="verb">type</div>
+          <div class="what">“hi” into the composer <b>ref_40</b></div>
+          <div class="ms">0.9s</div>
+        </div>
+        <div class="step">
+          <div class="n">5</div>
+          <div class="verb">click Send</div>
+          <div class="what">the Send control only exists once there is text → <b>ref_41</b></div>
+          <div class="ms">2.5s</div>
+        </div>
+        <div class="step">
+          <div class="n">✓</div>
+          <div class="verb">verify</div>
+          <div class="what">inbox row now reads <b>“vikash — You: hi · 1m”</b></div>
+          <div class="ms">0.9s</div>
+        </div>
+      </div>
+
+      <h2>Three bugs that cost the afternoon</h2>
+      <div class="panel">
+        <div class="bug">
+          <div class="ic">◆</div>
+          <div>
+            <h3>A click that lands but does nothing</h3>
+            <p>
+              A coordinate click hit an overlay sitting on the row. The page received a perfectly <span class="mono">isTrusted: true</span> event and ignored it —
+              no error, nothing to debug. <span class="fix">Fix: check the target is topmost via elementFromPoint; if not, dispatch on the element itself.</span>
+            </p>
+          </div>
+        </div>
+        <div class="bug">
+          <div class="ic">◆</div>
+          <div>
+            <h3>Commands falling into the gap between polls</h3>
+            <p>
+              The extension long-polled. Between one poll being answered and the next going out, a command had nowhere to land — and if Chrome tore the service
+              worker down in that window, it waited for the 30s alarm. <span class="fix">Fix: one open stream + a 15s heartbeat. Worst latency now 7ms.</span>
+            </p>
+          </div>
+        </div>
+        <div class="bug">
+          <div class="ic">◆</div>
+          <div>
+            <h3>A stale service worker</h3>
+            <p>
+              Chrome's reload button kept serving an older <span class="mono">background.js</span>, so newly added ops timed out instead of erroring — which
+              looked exactly like the bug that had just been fixed. <span class="fix">Fix: remove and re-add the unpacked extension.</span>
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <footer>
+        Measured on Chrome 151, Windows. Source: <span class="mono">cos0/extension/</span>, <span class="mono">src/client/bridge.ts</span>,
+        <span class="mono">src/client/browser.ts</span> — branch <span class="mono">browser-automation</span>.
+      </footer>
+    </div>
+  </body>
+</html>

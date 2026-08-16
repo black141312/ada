@@ -20,4 +20,4 @@ Reach for this when you can't see what the code is doing and a debugger isn't pr
 - Log values, not just "got here" — `console.log('count', count)` beats `console.log('here')`.
 - For loops or hot paths, gate logging or log only the boundary case so output stays readable.
 - Don't commit debug logs; if a log is genuinely worth keeping, promote it to a real logger at the right level deliberately.
-- Beware that logging can mask timing bugs — see the heisenbug skill if the bug vanishes once logs are added.
+- Beware that logging can mask timing bugs — see the fix-flaky-tests skill if the bug vanishes once logs are added.

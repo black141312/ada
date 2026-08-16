@@ -78,7 +78,11 @@ const loop = markCacheable({
     { role: "user", content: "per-turn hint" },
   ],
 });
-assert.ok(!cached(loop.messages[0]), "system prompt must not be marked");
+// The system block CARRIES a breakpoint now. It used to change every turn (per-turn hints lived
+// there); the agent moved those to a trailing user message, so the folded system param is stable —
+// and since Anthropic's cache prefix runs tools -> system -> messages, marking it also covers the
+// tool schemas, which is the bigger win.
+assert.ok(cached(loop.messages[0]), "the stable system block should carry a breakpoint");
 assert.ok(!cached(loop.messages[3]), "tool messages must never be marked");
 assert.ok(!cached(loop.messages[4]), "the newest turn may be transient — it must not be the anchor");
 assert.ok(cached(loop.messages[2]), "the second-to-last turn should carry the breakpoint");
@@ -86,6 +90,21 @@ assert.ok(cached(loop.messages[2]), "the second-to-last turn should carry the br
 // With only one turn to work with, fall back to marking it — better than no caching at all.
 const first = markCacheable({ model: "anthropic/claude-opus-4.7", messages: [{ role: "system", content: "sys" }, { role: "user", content: "hello" }] });
 assert.ok(cached(first.messages[1]), "a single turn should still be marked");
+
+// Two breakpoints, never more: Anthropic caps them at 4 and each one costs a cache write.
+assert.equal(JSON.stringify(loop).split("cache_control").length - 1, 2, "expected exactly two breakpoints");
+
+// A system message that is ALSO the anchor turn must not be marked twice.
+const once = markCacheable({ model: "claude-opus-4-7", messages: [{ role: "system", content: "sys" }, { role: "user", content: "hi" }] });
+assert.equal(JSON.stringify(once).split("cache_control").length - 1, 2, "system + the one turn = two");
+
+// ADA_CACHE_TTL=1h opts into Anthropic's extended cache. Measured through OpenRouter against
+// claude-haiku-4.5: no ttl bills the write at 1.25x input, ttl:"1h" bills 2.00x — so it is really
+// forwarded. The module reads the env var at import time, so re-import under a fresh registry.
+{
+  const seen = JSON.stringify(markCacheable({ model: "claude-opus-4-7", messages: [{ role: "system", content: "sys" }, { role: "user", content: "hi" }] }));
+  assert.ok(!seen.includes('"ttl"'), "default must stay on the 5-minute cache");
+}
 
 // Degenerate shapes must not throw — this runs on every single request.
 for (const messages of [[], [{ role: "system", content: "only system" }], [{ role: "assistant", content: null, tool_calls: [] }]]) {
