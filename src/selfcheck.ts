@@ -1059,15 +1059,35 @@ async function main(): Promise<void> {
 
   // --- connector catalog (read-only; does not touch .ada/mcp.json) ---
   const catalog = listConnectors();
-  assert.ok(catalog.length >= 8 && catalog.some((c) => c.name === "github"), "connector catalog populated");
-  assert.ok(catalog.find((c) => c.name === "github")?.needsEnv.includes("GITHUB_PERSONAL_ACCESS_TOKEN"), "github connector declares its env var");
+  assert.ok(catalog.length >= 8, "connector catalog populated");
+  // "github" was the stdio package you pasted a personal access token into. It is gone, along with
+  // every other token-pasting entry — the hosted server you sign in to replaced it.
+  assert.ok(
+    catalog.some((c) => c.name === "github-remote"),
+    "the hosted GitHub connector is listed",
+  );
+  // The catalog is OAuth-or-nothing, and this is the assertion that keeps it that way: a connector
+  // that wants a pasted key or header would reintroduce the setup box the whole design removed.
+  for (const c of catalog) {
+    assert.equal(c.needsEnv.length, 0, `${c.name} asks for a pasted credential — the catalog is OAuth-only`);
+    assert.equal(c.needsHeader.length, 0, `${c.name} asks for a pasted header — the catalog is OAuth-only`);
+  }
+  // (There used to be an assertion here that the github connector declared
+  // GITHUB_PERSONAL_ACCESS_TOKEN. That connector, and the pasted token it needed, are exactly what
+  // the loop above now forbids.)
 
-  // --- toolsmith path end-to-end via a real stub MCP server (skips if a real .ada/mcp.json exists) ---
+  // --- toolsmith path end-to-end via a real stub MCP server ---
+  // Points ADA_MCP_CONFIG at a throwaway file rather than writing `./.ada/mcp.json`. Connectors are
+  // global now, so the project-local file this used to create was no longer read at all — the stub
+  // never loaded and the assertions ran against whatever the person running the check happens to
+  // have connected. Isolating it is also what stops this from touching a real setup.
   const adaDir = join(process.cwd(), ".ada");
-  const mcpCfg = join(adaDir, "mcp.json");
-  if (!existsSync(mcpCfg) && existsSync(join(process.cwd(), "test", "stub-mcp.mjs"))) {
+  const mcpCfg = join(tmpdir(), `ada-selfcheck-mcp-${process.pid}.json`);
+  const priorMcpCfg = process.env.ADA_MCP_CONFIG;
+  if (existsSync(join(process.cwd(), "test", "stub-mcp.mjs"))) {
     mkdirSync(adaDir, { recursive: true });
     writeFileSync(mcpCfg, JSON.stringify({ servers: { stub: { command: "node", args: ["test/stub-mcp.mjs"] } } }));
+    process.env.ADA_MCP_CONFIG = mcpCfg;
     try {
       const loaded = await loadMcpServers(true);
       assert.ok(loaded.some((l) => l.startsWith("stub")), "stub MCP server connected + tools registered");
@@ -1084,6 +1104,8 @@ async function main(): Promise<void> {
     } finally {
       rmSync(mcpCfg, { force: true });
       rmSync(join(adaDir, "skills", "stub-echo"), { recursive: true, force: true });
+      if (priorMcpCfg === undefined) delete process.env.ADA_MCP_CONFIG;
+      else process.env.ADA_MCP_CONFIG = priorMcpCfg;
     }
   }
 
@@ -1145,6 +1167,44 @@ async function main(): Promise<void> {
     assert.equal(route("claude-opus-4-8"), "anthropic");
   }
 
+  // --- MCP OAuth (remote connectors: discovery, PKCE, token identity) ---
+  // Each of these fails SILENTLY when wrong: a bad metadata URL 404s and reads as "this server
+  // doesn't support OAuth", and a sloppy resource URI mints a token a different server on the same
+  // host would accept.
+  {
+    const oauth = await import("./client/mcp-oauth.ts");
+
+    // The path is part of the identity — two MCP servers on one host must not share a token.
+    assert.equal(oauth.canonicalResource("https://mcp.example.com/mcp"), "https://mcp.example.com/mcp");
+    assert.equal(oauth.canonicalResource("HTTPS://MCP.Example.com/mcp#frag"), "https://mcp.example.com/mcp", "scheme/host lowercased, fragment dropped");
+    assert.equal(oauth.canonicalResource("https://mcp.example.com/"), "https://mcp.example.com", "a bare root carries no trailing slash");
+    assert.equal(oauth.canonicalResource("https://mcp.example.com/server/mcp/"), "https://mcp.example.com/server/mcp");
+    assert.notEqual(oauth.canonicalResource("https://a.com/one"), oauth.canonicalResource("https://a.com/two"), "two servers on one host are two identities");
+
+    assert.equal(
+      oauth.parseWwwAuthenticate('Bearer realm="x", resource_metadata="https://s.example/.well-known/oauth-protected-resource"'),
+      "https://s.example/.well-known/oauth-protected-resource",
+    );
+    assert.equal(oauth.parseWwwAuthenticate('Bearer realm="x"'), null, "absent resource_metadata is not an error");
+    assert.equal(oauth.parseWwwAuthenticate(null), null);
+
+    // RFC 8414 puts the well-known segment BEFORE the issuer's path. The intuitive append-style
+    // reading 404s on every multi-tenant authorization server.
+    const urls = oauth.metadataUrls("https://as.example.com/tenant1");
+    assert.equal(urls[0], "https://as.example.com/.well-known/oauth-authorization-server/tenant1");
+    assert.ok(urls.includes("https://as.example.com/tenant1/.well-known/openid-configuration"), "the OIDC form is tried too — real servers use both");
+    const bare = oauth.metadataUrls("https://as.example.com");
+    assert.equal(bare[0], "https://as.example.com/.well-known/oauth-authorization-server", "a bare origin must not double its slashes");
+
+    const a = oauth.pkce();
+    const b = oauth.pkce();
+    assert.ok(a.verifier.length >= 43, "RFC 7636 wants at least 43 characters");
+    assert.notEqual(a.verifier, b.verifier, "a fresh verifier every time");
+    assert.ok(/^[A-Za-z0-9_-]+$/.test(a.verifier) && /^[A-Za-z0-9_-]+$/.test(a.challenge), "base64url, unpadded");
+    const { createHash } = await import("node:crypto");
+    assert.equal(a.challenge, createHash("sha256").update(a.verifier).digest("base64url"), "S256, not plain");
+  }
+
   // --- secret-env scrub (env handed to bash / MCP subprocesses) ---
   {
     const { isSecretEnvKey, scrubbedEnv } = await import("./client/secret-env.ts");
@@ -1156,6 +1216,13 @@ async function main(): Promise<void> {
     assert.ok(!("ZZ_API_KEY" in e), "scrub removes a provider-shaped key");
     assert.equal(e.ZZ_SAFE, "ok", "scrub keeps ordinary vars");
     assert.equal(scrubbedEnv({ ZZ_API_KEY: "provided" }).ZZ_API_KEY, "provided", "explicitly-provided (MCP-own) creds survive the scrub");
+    // Catalog entries ship creds as `{ TOKEN: "" }` placeholders. Layering an unfilled one over the
+    // environment used to CLOBBER a variable the user had correctly exported, so the server started
+    // with no token and the user got blamed for it.
+    process.env.ZZ_TOKEN = "from-the-users-shell";
+    assert.equal(scrubbedEnv({ ZZ_TOKEN: "" }).ZZ_TOKEN, "from-the-users-shell", "an unfilled placeholder must not clobber a real env var");
+    assert.equal(scrubbedEnv({ ZZ_TOKEN: "explicit" }).ZZ_TOKEN, "explicit", "a filled-in one still wins");
+    delete process.env.ZZ_TOKEN;
     delete process.env.ZZ_API_KEY;
     delete process.env.ZZ_SAFE;
   }

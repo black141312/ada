@@ -1,0 +1,36 @@
+# What `gcloud run deploy --source .` uploads to Cloud Build.
+#
+# Without this file gcloud infers the list from .gitignore, which is a different file written for a
+# different purpose — it happens to cover .env today, and nothing keeps it doing so. The build
+# context is the one place a local .env would leave this machine, so the exclusion is stated here
+# rather than inherited.
+#
+# .dockerignore covers what lands in the IMAGE; this covers what leaves the machine at all. They
+# overlap on purpose.
+
+# --- credentials and local state: never upload -------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.production.example
+.dev.vars
+google-client.json
+ada-auth.db
+.ada/
+.cos0/
+
+# --- not needed to build the server ------------------------------------------------------------
+node_modules
+.git
+.github
+bench
+docs
+test
+skills
+scratchpad
+out
+out-*
+runs/
+.wrangler/
+*.log
+*.tsbuildinfo
