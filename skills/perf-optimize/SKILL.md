@@ -16,8 +16,10 @@ Reach for this when something is measurably slow and you need to speed it up wit
 6. Add a regression guard (benchmark in CI or a perf assertion) so the gain doesn't silently erode.
 
 ## Rules
-- Measure before and after with the same inputs and a warm/steady state — one cold run is noise.
+- Measure before and after with the same inputs and a warm/steady state — one cold run is noise, so warm the runtime (JIT, caches) and run enough iterations to beat it.
 - Optimize the actual bottleneck the profiler shows, not the code that "looks slow".
+- Read self time, not cumulative time — a function high in cumulative time is often just calling the real culprit.
+- Profile a realistic workload; microbenchmarks lie about cache, allocation, and I/O behavior.
 - Algorithmic wins (O(n^2) -> O(n log n)) beat micro-optimizations; check complexity before tuning constants.
 - Don't sacrifice correctness or readability for a speedup you can't measure.
 - State the numbers in the result: "X ms -> Y ms (Nx)" so the win is auditable.

@@ -21,3 +21,4 @@ Use this when turning on `strict` (or its sub-flags) in a TypeScript project tha
 - Don't add `// @ts-ignore`/`// @ts-expect-error` to bulk-clear errors; reserve them for known upstream typing bugs and prefer `@ts-expect-error` so they self-remove when fixed.
 - Keep `tsconfig` changes and code fixes in lockstep; turning on a flag without fixing its errors breaks the build for everyone.
 - Don't loosen library types you don't own — wrap them in a typed adapter instead.
+- Tighten at the edges first (public APIs, I/O boundaries); internal inference often follows for free.
