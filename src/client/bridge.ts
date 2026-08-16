@@ -98,7 +98,10 @@ export class Bridge implements BridgeLike {
     });
     // A finished script should exit. Without this the listening socket kept the event loop alive, so
     // every run left a bridge behind and the next one had to kill it before it could start.
+    // Unref'ing the server is not enough on its own: the extension's long-poll is an open connection,
+    // and a live socket holds the loop up by itself for as long as the poll is parked.
     server.unref();
+    server.on("connection", (s) => s.unref());
     return self;
   }
 
