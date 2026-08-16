@@ -8,7 +8,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { Bridge, isAttachable } from "./bridge.ts";
+import { Bridge, RemoteBridge, isAttachable, type BridgeLike } from "./bridge.ts";
 
 const PORT = Number(process.env.ADA_CDP_PORT) || 9222;
 const ORIGIN = `http://127.0.0.1:${PORT}`;
@@ -138,7 +138,7 @@ let selectedTabId: string | null = null;
 
 // ---- transport: the extension bridge when it is there, the debug port otherwise ----
 
-let bridge: Bridge | null = null;
+let bridge: BridgeLike | null = null;
 let bridgeChecked = false;
 /** Decided once per process. Re-deciding per action let a single run start in ada's own profile and
  *  then silently switch to the user's real browser halfway through. */
@@ -147,7 +147,7 @@ let bridgeMode: boolean | null = null;
 /** The bridge drives the user's REAL browser (their logins, their tabs) via a loaded extension;
  *  the debug port drives ada's own profile. Prefer the bridge when the extension is actually
  *  connected, because that is the browser the user means. ADA_BROWSER_BRIDGE=0 opts out. */
-async function getBridge(): Promise<Bridge | null> {
+async function getBridge(): Promise<BridgeLike | null> {
   if (process.env.ADA_BROWSER_BRIDGE === "0") return null;
   if (bridgeMode !== null) return bridgeMode ? bridge : null;
   if (bridgeChecked) return null;
@@ -159,10 +159,18 @@ async function getBridge(): Promise<Bridge | null> {
   try {
     bridge = await Bridge.start();
   } catch {
-    // Port busy usually means another ada already owns the bridge; fall back rather than fight.
+    // The port is taken. If the holder is a live ada bridge, borrow it - the old behaviour was to
+    // give up (or make the caller kill the holder), which turned every second run into a taskkill.
+    const remote = await RemoteBridge.connect();
+    if (remote) {
+      bridge = remote;
+      bridgeMode = remote.connected;
+      if (!bridgeMode && strict) throw new Error("ADA_BROWSER_BRIDGE=1: borrowed another ada's bridge, but its extension is not connected.");
+      return bridgeMode ? bridge : null;
+    }
     bridge = null;
     bridgeMode = false;
-    if (strict) throw new Error("ADA_BROWSER_BRIDGE=1 but port 9223 is already taken - another ada already owns the bridge.");
+    if (strict) throw new Error("ADA_BROWSER_BRIDGE=1 but port 9223 is held by something that is not an ada bridge.");
     return null;
   }
   // The extension retries every 2s, so this window is generous enough to catch a live one and short
@@ -227,7 +235,7 @@ interface CdpLike {
 /** CDP over the extension. chrome.debugger speaks the same protocol, so only the wire changes. */
 class BridgeSession implements CdpLike {
   constructor(
-    private b: Bridge,
+    private b: BridgeLike,
     private tabId: number,
   ) {}
   get logs(): string[] {
@@ -650,6 +658,30 @@ export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {})
       if (!quad || quad.length < 8) throw new Error("element is not visible");
       return { x: (quad[0]! + quad[2]! + quad[4]! + quad[6]!) / 4, y: (quad[1]! + quad[3]! + quad[5]! + quad[7]!) / 4 };
     };
+
+    /** Dispatch a click on the element ITSELF, not at a point in space. Needed when something else
+     *  sits on top of the target: the synthetic click then lands on the overlay, the page receives a
+     *  perfectly trusted event, and nothing happens - which reads exactly like a broken click. */
+    const domClick = async (backendNodeId: number): Promise<void> => {
+      const r = (await cdp.send("DOM.resolveNode", { backendNodeId })) as { object?: { objectId?: string } };
+      const objectId = r.object?.objectId;
+      if (!objectId) throw new Error("could not reach that element to click it");
+      await cdp.send("Runtime.callFunctionOn", { objectId, functionDeclaration: "function(){ this.click(); }", awaitPromise: true });
+    };
+
+    /** Is the target actually the topmost thing at its own centre? */
+    const isOnTop = async (backendNodeId: number, x: number, y: number): Promise<boolean> => {
+      const r = (await cdp.send("DOM.resolveNode", { backendNodeId })) as { object?: { objectId?: string } };
+      const objectId = r.object?.objectId;
+      if (!objectId) return true;
+      const res = (await cdp.send("Runtime.callFunctionOn", {
+        objectId,
+        returnByValue: true,
+        functionDeclaration: `function(x, y){ const top = document.elementFromPoint(x, y); return !!top && (top === this || this.contains(top) || top.contains(this)); }`,
+        arguments: [{ value: x }, { value: y }],
+      })) as { result?: { value?: boolean } };
+      return res.result?.value !== false;
+    };
     const evalJs = async (expression: string): Promise<unknown> => {
       const r = (await cdp.send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true })) as {
         result?: { value?: unknown };
@@ -679,19 +711,26 @@ export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {})
         // canvas/games have no DOM refs — click straight at viewport coordinates
         const x = Number(opts.x);
         const y = Number(opts.y);
-        await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-        await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
-        await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+        await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, buttons: 0 });
+        await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
+        await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
         await settle();
         return { text: `clicked (${x}, ${y}) on ${here}` };
       }
       const backendNodeId = await nodeFor();
       const { x, y } = await centerOf(backendNodeId);
-      await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-      await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
-      await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+      const target = String(opts.ref ?? opts.selector ?? opts.find);
+      if (!(await isOnTop(backendNodeId, x, y))) {
+        // Covered by something. A real mouse could not reach it either, so stop pretending to be one.
+        await domClick(backendNodeId);
+        await settle();
+        return { text: `clicked ${target} on ${here} (element was covered - dispatched on the element itself)` };
+      }
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, buttons: 0 });
+      await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
+      await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
       await settle();
-      return { text: `clicked ${opts.ref ?? opts.selector ?? opts.find} on ${here}` };
+      return { text: `clicked ${target} on ${here}` };
     }
     if (action === "type") {
       const backendNodeId = await nodeFor();

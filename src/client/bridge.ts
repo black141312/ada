@@ -26,6 +26,16 @@ export interface BridgeTab {
   active: boolean;
 }
 
+/** What browser.ts needs from a bridge, whether it owns the port or is borrowing someone else's. */
+export interface BridgeLike {
+  readonly connected: boolean;
+  readonly logs: string[];
+  call(op: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
+  cdp(tabId: number, method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<Record<string, unknown>>;
+  tabs(): Promise<BridgeTab[]>;
+  targets(): Promise<BridgeTab[]>;
+}
+
 /** Chrome refuses chrome.debugger on its own pages and on the Web Store - attaching there fails with
  *  "Cannot access a chrome:// URL". Filter them out rather than offering targets that can never work. */
 export function isAttachable(url: string | undefined): boolean {
@@ -53,7 +63,7 @@ function stableToken(): string {
   return t;
 }
 
-export class Bridge {
+export class Bridge implements BridgeLike {
   private server: Server;
   private token = stableToken();
   private queue: Record<string, unknown>[] = [];
@@ -86,6 +96,9 @@ export class Bridge {
         ok();
       });
     });
+    // A finished script should exit. Without this the listening socket kept the event loop alive, so
+    // every run left a bridge behind and the next one had to kill it before it could start.
+    server.unref();
     return self;
   }
 
@@ -127,6 +140,26 @@ export class Bridge {
         clearTimeout(timer);
         send(200, cmd ?? {});
       };
+      return;
+    }
+
+    // Is a live bridge already here? Lets another ada borrow this one instead of fighting for 9223.
+    if (url.pathname === "/health") {
+      if (url.searchParams.get("token") !== this.token) return send(403, { error: "bad token" });
+      return send(200, { ok: true, connected: this.seenExtension });
+    }
+
+    // Run one command on behalf of another ada process and hand the answer back.
+    if (url.pathname === "/call") {
+      void this.body(req).then(async (b) => {
+        if (b.token !== this.token) return send(403, { error: "bad token" });
+        const { token: _t, op, ...rest } = b;
+        try {
+          send(200, { result: await this.call(String(op ?? ""), rest as Record<string, unknown>) });
+        } catch (e) {
+          send(200, { error: e instanceof Error ? e.message : String(e) });
+        }
+      });
       return;
     }
 
@@ -204,5 +237,63 @@ export class Bridge {
 
   get extensionDir(): string {
     return EXT_DIR;
+  }
+}
+
+/** A bridge owned by ANOTHER ada process. Same interface, commands forwarded over /call. Killing the
+ *  holder to take the port was the old workaround; borrowing it is what a second process should do. */
+export class RemoteBridge implements BridgeLike {
+  private up = false;
+  /** Console output lives in the owning process; not worth proxying for the `console` verb. */
+  readonly logs: string[] = [];
+
+  private constructor(private token: string) {}
+
+  /** Returns a client only if a live ada bridge answers on the port. */
+  static async connect(): Promise<RemoteBridge | null> {
+    const token = stableToken();
+    try {
+      const r = await fetch(`http://127.0.0.1:${PORT}/health?token=${encodeURIComponent(token)}`, { signal: AbortSignal.timeout(1500) });
+      if (!r.ok) return null;
+      const j = (await r.json()) as { ok?: boolean; connected?: boolean };
+      if (!j.ok) return null;
+      const self = new RemoteBridge(token);
+      self.up = Boolean(j.connected);
+      return self;
+    } catch {
+      return null; // something else owns the port, or it died between the bind failing and this check
+    }
+  }
+
+  get connected(): boolean {
+    return this.up;
+  }
+
+  async call(op: string, params: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<unknown> {
+    const r = await fetch(`http://127.0.0.1:${PORT}/call`, {
+      method: "POST",
+      body: JSON.stringify({ token: this.token, op, ...params }),
+      signal: AbortSignal.timeout(timeoutMs + 2000),
+    }).catch((e: unknown) => {
+      // "The operation was aborted due to timeout" says nothing about whose bridge or why.
+      const why = e instanceof Error && e.name === "TimeoutError" ? "the ada that owns the bridge did not answer - is its extension still connected?" : String(e);
+      throw new Error(`bridge: ${op} failed - ${why}`);
+    });
+    const j = (await r.json()) as { result?: unknown; error?: string };
+    if (j.error) throw new Error(j.error);
+    return j.result;
+  }
+
+  cdp(tabId: number, method: string, params: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<Record<string, unknown>> {
+    return this.call("cdp", { tabId, method, params }, timeoutMs) as Promise<Record<string, unknown>>;
+  }
+
+  async tabs(): Promise<BridgeTab[]> {
+    return (await this.call("tabs")) as BridgeTab[];
+  }
+
+  async targets(): Promise<BridgeTab[]> {
+    const all = await this.tabs();
+    return all.filter((t) => isAttachable(t.url)).sort((a, b) => Number(b.active) - Number(a.active));
   }
 }

@@ -9,6 +9,8 @@ const page = `<!doctype html><title>check</title>
 <input aria-label="Name">
 <input id="email">
 <select id="plan"><option value="a">Alpha</option><option value="b">Beta</option></select>
+<div id="row" style="position:absolute;top:300px;left:0;width:200px;height:50px" onclick="document.getElementById('out').textContent='row'">covered</div>
+<div id="veil" style="position:absolute;top:300px;left:0;width:200px;height:50px;z-index:9"></div>
 <div id="out"></div>
 <div id="later"></div>
 <script>setTimeout(() => { document.getElementById("later").textContent = "arrived late"; }, 800);</script>
@@ -88,6 +90,15 @@ async function main(): Promise<void> {
       (e) => String(e),
     );
     assert.ok(/timed out/.test(timedOut), `wait should time out, got: ${timedOut || "(no error)"}`);
+
+    // An element covered by a sibling overlay: a coordinate click lands on the overlay and the real
+    // handler never runs, which is indistinguishable from a broken click. Must fall back to
+    // dispatching on the element itself.
+    await browserAction("open", { url });
+    const covered = await browserAction("click", { selector: "#row" });
+    r = await browserAction("eval", { expression: "document.getElementById('out').textContent" });
+    assert.ok(r.text.includes("row"), `covered element's handler never ran:\n${r.text}`);
+    assert.ok(/covered/.test(covered.text), `the fallback should say it was used: ${covered.text}`);
 
     // hover, reload and pdf must all survive a round trip
     await browserAction("hover", { find: "Do thing" });
