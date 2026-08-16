@@ -68,6 +68,8 @@ export class Bridge implements BridgeLike {
   private token = stableToken();
   private queue: Record<string, unknown>[] = [];
   private waitingPoll: ((cmd: Record<string, unknown> | null) => void) | null = null;
+  /** The extension's open event stream, when it has one. */
+  private stream: ServerResponse | null = null;
   private pending = new Map<number, Pending>();
   private nextId = 1;
   private seenExtension = false;
@@ -126,6 +128,28 @@ export class Bridge implements BridgeLike {
       res.writeHead(code, { "content-type": "application/json" });
       res.end(JSON.stringify(body));
     };
+
+    // The extension holds this open and commands are written into it the moment they arrive. The
+    // old /poll cycle had a hole: between one poll being answered and the next arriving, a command
+    // sat in the queue - and if Chrome had torn the service worker down in that window, it stayed
+    // there until the 30s alarm woke it, which surfaced as a command timing out for no reason.
+    // A stream has no such gap, and its heartbeat keeps the worker alive so there is nothing to wake.
+    if (url.pathname === "/stream") {
+      if (url.searchParams.get("token") !== this.token) return send(403, { error: "bad token" });
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+      this.stream = res;
+      this.seenExtension = true;
+      for (const cmd of this.queue.splice(0)) this.push(cmd); // anything queued before it connected
+      const beat = setInterval(() => {
+        if (this.stream === res) res.write(":hb\n\n");
+      }, 15_000);
+      beat.unref?.();
+      res.on("close", () => {
+        clearInterval(beat);
+        if (this.stream === res) this.stream = null;
+      });
+      return;
+    }
 
     if (url.pathname === "/poll") {
       if (url.searchParams.get("token") !== this.token) return send(403, { error: "bad token" });
@@ -199,6 +223,10 @@ export class Bridge implements BridgeLike {
     send(404, { error: "not found" });
   }
 
+  private push(cmd: Record<string, unknown>): void {
+    this.stream?.write(`data: ${JSON.stringify(cmd)}\n\n`);
+  }
+
   /** Queue one command for the extension and wait for its answer. */
   call(op: string, params: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<unknown> {
     const id = this.nextId++;
@@ -208,7 +236,9 @@ export class Bridge implements BridgeLike {
       setTimeout(() => {
         if (this.pending.delete(id)) fail(new Error(`bridge: ${op} timed out - is the ada bridge extension loaded and enabled?`));
       }, timeoutMs);
-      if (this.waitingPoll) {
+      if (this.stream) {
+        this.push(cmd);
+      } else if (this.waitingPoll) {
         const w = this.waitingPoll;
         this.waitingPoll = null;
         w(cmd);

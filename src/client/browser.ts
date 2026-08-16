@@ -195,6 +195,7 @@ async function getBridge(): Promise<BridgeLike | null> {
     }
   }
   bridgeMode = bridge.connected;
+  if (process.env.ADA_BROWSER_DEBUG) console.error(`[bridge] own=true connected=${bridgeMode}`);
   if (!bridgeMode && strict) {
     throw new Error(
       "ADA_BROWSER_BRIDGE=1 but the ada bridge extension never connected. Open the Chrome profile it is loaded in " +
