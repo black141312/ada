@@ -7,7 +7,13 @@ import { browserAction, tabAction } from "./client/browser.ts";
 const page = `<!doctype html><title>check</title>
 <button onclick="document.getElementById('out').textContent='clicked'">Do thing</button>
 <input aria-label="Name">
+<input id="email">
+<select id="plan"><option value="a">Alpha</option><option value="b">Beta</option></select>
+<div id="row" style="position:absolute;top:300px;left:0;width:200px;height:50px" onclick="document.getElementById('out').textContent='row'">covered</div>
+<div id="veil" style="position:absolute;top:300px;left:0;width:200px;height:50px;z-index:9"></div>
 <div id="out"></div>
+<div id="later"></div>
+<script>setTimeout(() => { document.getElementById("later").textContent = "arrived late"; }, 800);</script>
 <script>
   addEventListener("mousedown", (e) => { document.getElementById("out").textContent = e.clientX + "," + e.clientY; });
   addEventListener("keydown", (e) => { document.getElementById("out").textContent = "key=" + e.key; });
@@ -57,6 +63,48 @@ async function main(): Promise<void> {
     await browserAction("press", { key: "space", hold: 300 }); // held key must not throw
     const shot = await browserAction("screenshot", {});
     assert.ok(shot.screenshot && shot.screenshot.length > 1024, "screenshot too small to be a real PNG");
+
+    // targeting without a `read` first: CSS selector and visible text both reach the element
+    await browserAction("open", { url });
+    await browserAction("click", { find: "Do thing" });
+    let body = await browserAction("eval", { expression: "document.getElementById('out').textContent" });
+    assert.ok(body.text.includes("clicked"), `find-by-text click did not land:\n${body.text}`);
+    await browserAction("type", { selector: "#email", text: "a@b.c" });
+    body = await browserAction("eval", { expression: "document.getElementById('email').value" });
+    assert.ok(body.text.includes("a@b.c"), `selector type did not land:\n${body.text}`);
+
+    // fill writes through the native setter (what React listens to), select matches by label
+    await browserAction("fill", { fields: { "#email": "filled@example.com" } });
+    body = await browserAction("eval", { expression: "document.getElementById('email').value" });
+    assert.ok(body.text.includes("filled@example.com"), `fill did not land:\n${body.text}`);
+    await browserAction("select", { selector: "#plan", value: "Beta" });
+    body = await browserAction("eval", { expression: "document.getElementById('plan').value" });
+    assert.ok(body.text.includes("b"), `select did not land:\n${body.text}`);
+
+    // wait blocks for content that shows up after load, and reports a timeout otherwise
+    await browserAction("open", { url });
+    const waited = await browserAction("wait", { find: "arrived late", timeout: 5000 });
+    assert.ok(/after \d+ms/.test(waited.text), waited.text);
+    const timedOut = await browserAction("wait", { selector: "#nope", timeout: 600 }).then(
+      () => "",
+      (e) => String(e),
+    );
+    assert.ok(/timed out/.test(timedOut), `wait should time out, got: ${timedOut || "(no error)"}`);
+
+    // An element covered by a sibling overlay: a coordinate click lands on the overlay and the real
+    // handler never runs, which is indistinguishable from a broken click. Must fall back to
+    // dispatching on the element itself.
+    await browserAction("open", { url });
+    const covered = await browserAction("click", { selector: "#row" });
+    r = await browserAction("eval", { expression: "document.getElementById('out').textContent" });
+    assert.ok(r.text.includes("row"), `covered element's handler never ran:\n${r.text}`);
+    assert.ok(/covered/.test(covered.text), `the fallback should say it was used: ${covered.text}`);
+
+    // hover, reload and pdf must all survive a round trip
+    await browserAction("hover", { find: "Do thing" });
+    await browserAction("reload", {});
+    const pdf = await browserAction("pdf", {});
+    assert.ok(pdf.pdf && pdf.pdf.subarray(0, 4).toString() === "%PDF", "pdf output is not a PDF");
 
     // tabs: list shows origins, new adds one, close removes it
     const before = (await tabAction("tabs")).split("\n").length;

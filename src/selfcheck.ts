@@ -59,7 +59,7 @@ async function main(): Promise<void> {
   assert.ok(r.output.includes("hi"), r.output);
 
   // --- browser: a11y tree serializer (pure, no browser needed) ---
-  const { formatAxTree } = await import("./client/browser.ts");
+  const { formatAxTree, bridgeBlocks } = await import("./client/browser.ts");
   const ax = formatAxTree([
     { nodeId: "1", role: { value: "RootWebArea" }, name: { value: "T" }, childIds: ["2", "3", "4"] },
     { nodeId: "2", parentId: "1", role: { value: "button" }, name: { value: "Do thing" }, backendDOMNodeId: 10 },
@@ -317,6 +317,13 @@ async function main(): Promise<void> {
   // --- browser approval rendering ---
   assert.equal(describeCall("browser", { action: "click", ref: "ref_2" }).detail, "click ref_2");
   assert.ok(permPhrase("browser", true).toLowerCase().includes("enter"), "press-Enter phrase should warn about submitting");
+
+  // Nothing is blocked by default - the block list is opt-in via ADA_BRIDGE_BLOCKED. Matching must
+  // cover subdomains without catching lookalike domains, and must not throw on junk input.
+  assert.ok(!bridgeBlocks("https://www.instagram.com/"), "nothing should be blocked by default");
+  assert.ok(bridgeBlocks("https://www.instagram.com/", ["instagram.com"]), "an opted-in host must match, subdomains included");
+  assert.ok(!bridgeBlocks("https://notinstagram.com/", ["instagram.com"]), "suffix match must not catch lookalike domains");
+  assert.ok(!bridgeBlocks("not a url", ["instagram.com"]), "a malformed url must not throw");
   assert.ok(!permPhrase("browser", false).startsWith("run the"), "browser needs its own perm phrase");
 
   // --- baked offline catalog seeds pricing/limits (no network) ---
