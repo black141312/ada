@@ -48,6 +48,31 @@ export const MEMORY_MODEL = process.env.ADA_MEMORY_EMBED_MODEL || "Xenova/bge-sm
 const FALLBACK_SPEC: ModelSpec = { query: "", doc: "", noiseFloor: 0.22 };
 export const specFor = (model: string): ModelSpec => SPECS[model] ?? FALLBACK_SPEC;
 
+/**
+ * How many texts go through the encoder at once. Peak memory is dominated by attention, which scales
+ * with batch x seq^2 — and an 80-line code chunk fills all 512 positions, so a batch is always at the
+ * model's worst case. Measured on this model (96 chunks, same total work):
+ *
+ *   batch 32 -> 2085 MB peak, 3002 ms      batch 8 -> ~680 MB peak, ~2400 ms
+ *
+ * Smaller is both leaner AND faster here: 32 spills out of cache without buying any parallelism that
+ * CPU inference can use. This is not a tuning nicety — callers used to hand the encoder 32 at once,
+ * and on a loaded machine the ~1.4 GB spike aborted the process. onnxruntime runs under Electron's
+ * allocator when the CLI is spawned by the desktop app (ELECTRON_RUN_AS_NODE), and that allocator
+ * turns a failed native allocation into an immediate fatal trap rather than a catchable error, so
+ * the whole `ada serve` backend died and the UI reported it as a dropped connection.
+ * Lower it further on a memory-tight machine; raising it past ~16 gives back nothing.
+ */
+const BATCH = Math.max(1, Number(process.env.ADA_EMBED_BATCH) || 8);
+
+/**
+ * onnxruntime's BFC arena keeps every block it has ever grown to — after one index pass the process
+ * stays at ~96% of its peak forever, which matters because `ada serve` is long-lived. Turning the
+ * arena off returns memory between batches (625 MB -> 500 MB resident, measured) at ~25% slower
+ * embedding, so it is opt-in rather than the default.
+ */
+const LOW_MEMORY = process.env.ADA_EMBED_LOW_MEMORY === "1";
+
 // transformers.js is ESM-only and heavy — import it lazily so unrelated commands never pay for it,
 // and cache each extractor pipeline across calls (keyed by model: memory and codebase search can
 // legitimately want different ones, and a single slot would thrash between them).
@@ -61,7 +86,8 @@ async function getExtractor(model: string): Promise<Extractor> {
       const { env, pipeline } = await import("@huggingface/transformers");
       env.cacheDir = process.env.ADA_MODEL_DIR || join(homedir(), ".ada", "models");
       env.allowRemoteModels = true; // fetch once, then served from cache
-      return (await pipeline("feature-extraction", model, { dtype: "q8" })) as unknown as Extractor;
+      const session_options = LOW_MEMORY ? { enableCpuMemArena: false } : {};
+      return (await pipeline("feature-extraction", model, { dtype: "q8", session_options })) as unknown as Extractor;
     })().catch((e) => {
       extractors.delete(model); // let a later call retry (e.g. after connectivity returns)
       throw new Error(
@@ -75,10 +101,17 @@ async function getExtractor(model: string): Promise<Extractor> {
 
 /** Embed texts locally. Returns one 384-dim unit vector per input, in order.
  *  Callers must apply the model's query/doc prefix themselves (see specFor) — this stays dumb so the
- *  same helper serves both the asymmetric memory path and the unprefixed codebase path. */
+ *  same helper serves both the asymmetric memory path and the unprefixed codebase path.
+ *  Sub-batching lives HERE rather than at the call sites: the callers batch for their own reasons
+ *  (an HTTP request wants a big payload, this encoder wants a small one), and only this side knows
+ *  what the encoder can afford. A caller can still pass thousands of texts in one call. */
 export async function embedLocal(texts: string[], model: string = LOCAL_MODEL): Promise<number[][]> {
   if (!texts.length) return [];
   const extractor = await getExtractor(model);
-  const out = await extractor(texts, { pooling: "mean", normalize: true });
-  return out.tolist();
+  const out: number[][] = [];
+  for (let i = 0; i < texts.length; i += BATCH) {
+    const part = await extractor(texts.slice(i, i + BATCH), { pooling: "mean", normalize: true });
+    out.push(...part.tolist());
+  }
+  return out;
 }
