@@ -1493,27 +1493,6 @@ async function main(): Promise<void> {
         });
         return;
       }
-      const answerMatch = req.method === "POST" && url.pathname.match(/^\/v1\/sessions\/([^/]+)\/answer$/);
-      if (answerMatch) {
-        const rec = sessions.get(answerMatch[1]!);
-        if (!rec) {
-          res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: "unknown session" }));
-          return;
-        }
-        let body = "";
-        req.on("data", (c) => (body += c));
-        req.on("end", () => {
-          let ok = false;
-          try {
-            const { id, answer } = JSON.parse(body || "{}") as { id?: string; answer?: string };
-            if (id) ok = rec.questions.settle(id, String(answer ?? ""));
-          } catch {
-            /* ok stays false */
-          }
-          res.writeHead(ok ? 200 : 404, { "content-type": "application/json" }).end(JSON.stringify({ ok }));
-        });
-        return;
-      }
       const approveMatch = req.method === "POST" && url.pathname.match(/^\/v1\/sessions\/([^/]+)\/approve$/);
       if (approveMatch) {
         const rec = sessions.get(approveMatch[1]!);
