@@ -20,6 +20,7 @@ export interface Settings {
   reasoning?: "low" | "medium" | "high";
   autoApprove?: boolean;
   compactAt?: number;
+  verify?: string; // command run after a turn that edited files (e.g. "npm run typecheck"); failures are fed back to the model. Env ADA_VERIFY overrides. Unset = LSP diagnostics on the edited files.
   trustedDirs?: string[];
   keybindings?: { interrupt?: string };
   protectedPaths?: string[];
@@ -163,12 +164,23 @@ export function ensureAdaDir(dir: string): string {
           "index.json",
           "index.vec",
           "graph.db",
+          "jobs.json",
           "sessions/",
           "tmp/",
           "worktrees/",
           "",
         ].join("\n"),
       );
+    } catch {
+      /* read-only checkout — the caches still work, they are just visible to git */
+    }
+  } else {
+    // An install from before jobs.json existed already has this file, and ensureAdaDir only writes
+    // it when absent — so those projects would start showing `?? .ada/jobs.json`, the exact noise
+    // this whole helper exists to prevent. Append rather than rewrite: the file may be hand-edited.
+    try {
+      const cur = readFileSync(f, "utf8");
+      if (!/^jobs\.json$/m.test(cur)) writeFileSync(f, `${cur.endsWith("\n") ? cur : `${cur}\n`}jobs.json\n`);
     } catch {
       /* read-only checkout — the caches still work, they are just visible to git */
     }

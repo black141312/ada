@@ -11,9 +11,10 @@ import OpenAI from "openai";
 import { Agent, type AgentEvent, type ApprovalDecision, type OnApprove } from "./agent.ts";
 import { ApprovalRegistry, QuestionRegistry, newId, sseFrame } from "./agent-server.ts";
 import { expandPrompt, loadPrompts } from "./prompts.ts";
-import { Session, list, type SessionMeta } from "./session.ts";
+import { Session, list, removeStore, resolveTranscript, stores, type SessionMeta } from "./session.ts";
 import { deleteCredential, getCredential, listCredentials, setCredential } from "../server/credentials.ts";
 import { deviceGrant, deviceLogin, oauthConfig } from "../server/oauth.ts";
+import { subscriptionFor, subscriptionLogin } from "../server/providers/subscription-oauth.ts";
 import { addTrust, isTrusted, loadSettings, setActiveAgentPermissions, setGlobal, setOrgPermissions, workspaceDirs, type PermRule, type Settings } from "./settings.ts";
 import { getCommands, loadExtensions } from "./extensions.ts";
 import { registerTool, setAsker } from "./tools.ts";
@@ -31,7 +32,7 @@ import { catalogText, prefetch } from "./models-dev.ts";
 import { ensureBackend, isLocalBackend } from "./autostart.ts";
 import { popularModels } from "./models.ts";
 import { route } from "../server/router.ts"; // pure model-id → provider mapping (static table, safe client-side)
-import { registerSubagentTools, renderJobs } from "./background.ts";
+import { cancelJob, listJobs, registerSubagentTools, renderJobs } from "./background.ts";
 import { renderTodos } from "./todos.ts";
 import { track } from "./telemetry.ts";
 
@@ -231,7 +232,12 @@ function thinkingSpinner(): () => void {
     if (i === 0 && Math.random() < 0.5) verb = THINK_VERBS[Math.floor(Math.random() * THINK_VERBS.length)]!;
     draw();
   }, 90);
+  // Idempotent: the second call must NOT re-issue "erase line" — by then real output is on that
+  // line, and clearing it would eat the first line of the reply.
+  let stopped = false;
   return () => {
+    if (stopped) return;
+    stopped = true;
     clearInterval(t);
     stdout.write("\r\x1b[2K");
   };
@@ -581,6 +587,19 @@ async function accountLogin(): Promise<boolean> {
 async function loginFlow(provider: string): Promise<boolean> {
   if (provider === "account" || provider === "email") return accountLogin();
   if (provider === "oidc" || provider === "sso") return oidcLogin();
+  // Subscription sign-in (Claude Pro/Max, ChatGPT Plus/Pro): a browser PKCE flow, not the device
+  // flow, because that's what those OAuth apps are registered for. Aliases so both the plan name
+  // and the provider name work — `ada login claude` and `ada login anthropic` are the same thing.
+  const sub = subscriptionFor(provider);
+  if (sub) {
+    try {
+      await subscriptionLogin(sub, (s) => console.log(s));
+      return true;
+    } catch (e) {
+      console.error(`login failed: ${e instanceof Error ? e.message : e}`);
+      return false;
+    }
+  }
   const cfg = oauthConfig(provider);
   if (!cfg) {
     console.log(`No OAuth config for ${provider}. Set ADA_OAUTH_${provider.toUpperCase()}_{CLIENT_ID,DEVICE_URL,TOKEN_URL}.`);
@@ -662,17 +681,26 @@ async function authCommand(sub: string, provider?: string): Promise<void> {
     console.log(`logged out ${provider}`);
     return;
   }
-  if (!(await loginFlow(provider))) process.exit(1);
+  // finish(), not process.exit(): login runs network calls, and exiting on top of them aborts.
+  if (!(await loginFlow(provider))) finish(1);
 }
 
 // Providers the local backend can route to (each just needs an API key stored in the credential store).
 const CONNECTABLE = ["openrouter", "openai", "anthropic", "cloudflare", "groq", "google", "mistral", "deepseek", "xai", "together", "dashscope"];
+
+// Plans you sign into instead of pasting a key. Listed after CONNECTABLE in the /connect menu, and
+// they run the browser flow rather than prompting for a key — see subscriptionLogin.
+const SUBSCRIBABLE: Array<{ id: "anthropic" | "chatgpt"; label: string; provider: string }> = [
+  { id: "anthropic", label: "Claude Pro/Max  \x1b[2m(sign in — no API key)\x1b[0m", provider: "anthropic" },
+  { id: "chatgpt", label: "ChatGPT Plus/Pro  \x1b[2m(sign in — no API key)\x1b[0m", provider: "chatgpt" },
+];
 
 /** /connect — pick a provider (saves its API key; the local backend routes to it) or a backend
  *  endpoint (saves the URL/key so new sessions point there). Interactive menu, or /connect <name|url>. */
 async function connectCommand(rl: RL, arg?: string): Promise<void> {
   if (arg) {
     if (/^https?:\/\//.test(arg)) return connectBackend(rl, arg);
+    if (arg === "claude" || arg === "chatgpt" || arg === "codex") return void (await loginFlow(arg));
     if (CONNECTABLE.includes(arg)) return connectProvider(rl, arg);
     console.log(`unknown target "${arg}". Run /connect for the menu, or pass a provider name or a backend URL.`);
     return;
@@ -682,10 +710,16 @@ async function connectCommand(rl: RL, arg?: string): Promise<void> {
   // we don't claim "✓ connected" from them (would be a false positive).
   const backendProvs = await fetchProviders();
   const connected = (p: string): boolean => (backendProvs ? !!backendProvs.find((b) => b.name === p)?.configured : LOCAL_BACKEND && !!getCredential(p)?.key);
-  const items = [...CONNECTABLE.map((p) => `${p}${connected(p) ? "  \x1b[2m✓ connected\x1b[0m" : ""}`), "custom backend / Cloudflare Worker URL…"];
+  const items = [
+    ...SUBSCRIBABLE.map((s) => `${s.label}${connected(s.provider) ? "  \x1b[2m✓ connected\x1b[0m" : ""}`),
+    ...CONNECTABLE.map((p) => `${p}${connected(p) ? "  \x1b[2m✓ connected\x1b[0m" : ""}`),
+    "custom backend / Cloudflare Worker URL…",
+  ];
   const i = await select(rl, "Connect ada to:", items);
   if (i == null) return;
-  return i < CONNECTABLE.length ? connectProvider(rl, CONNECTABLE[i]!) : connectBackend(rl);
+  if (i < SUBSCRIBABLE.length) return void (await loginFlow(SUBSCRIBABLE[i]!.id));
+  const j = i - SUBSCRIBABLE.length;
+  return j < CONNECTABLE.length ? connectProvider(rl, CONNECTABLE[j]!) : connectBackend(rl);
 }
 
 async function connectProvider(rl: RL, p: string): Promise<void> {
@@ -801,7 +835,7 @@ async function printBanner(): Promise<void> {
 }
 
 /** Subcommands that don't touch the backend — no point spawning a server for these. */
-const NO_BACKEND = new Set(["mcp", "skill", "worktree", "wt", "catalog", "share", "memory"]);
+const NO_BACKEND = new Set(["mcp", "skill", "worktree", "wt", "catalog", "share", "memory", "sessions"]);
 
 async function main(): Promise<void> {
   const sub = process.argv[2];
@@ -840,6 +874,37 @@ async function main(): Promise<void> {
   }
   if (sub === "update") {
     selfUpdate();
+    return;
+  }
+  if (sub === "sessions") {
+    if (process.argv[3] !== "prune") {
+      console.error("usage: ada sessions prune [--yes]");
+      process.exit(1);
+    }
+    const all = stores();
+    const gone = all.filter((s) => s.missing);
+    const unknown = all.filter((s) => !s.project);
+    const kept = all.length - gone.length - unknown.length;
+    if (!gone.length) {
+      console.log(`Nothing to prune — ${kept} store${kept === 1 ? "" : "s"} in use.`);
+    }
+    for (const s of gone) {
+      console.log(`  ${s.sessions} session${s.sessions === 1 ? "" : "s"}  \x1b[2m${s.project}\x1b[0m`);
+    }
+    // A folder on an unplugged drive or a disconnected share reads exactly like a deleted one, and
+    // these are whole conversations. So this never deletes on its own — it shows, and waits.
+    if (gone.length && !process.argv.includes("--yes")) {
+      const total = gone.reduce((n, s) => n + s.sessions, 0);
+      console.log(`\n${total} session${total === 1 ? "" : "s"} from ${gone.length} folder${gone.length === 1 ? "" : "s"} that no longer exist.`);
+      console.log("Check the paths above are really gone (an unplugged drive looks the same), then: ada sessions prune --yes");
+    } else if (gone.length) {
+      for (const s of gone) removeStore(s.dir);
+      console.log(`\nPruned ${gone.length} store${gone.length === 1 ? "" : "s"}.`);
+    }
+    if (unknown.length) {
+      const n = unknown.length;
+      console.log(`\n\x1b[2m${n} store${n === 1 ? " predates" : "s predate"} this and cannot be attributed — left alone. Each gets a note the next time its project runs ada.\x1b[0m`);
+    }
     return;
   }
   if (sub === "memory") {
@@ -1082,6 +1147,22 @@ async function main(): Promise<void> {
 
     const port = Number(process.env.ADA_HTTP_PORT) || 8788;
 
+    // Orphan watchdog. The Ada app spares this serve on quit when it still has running background
+    // jobs (so a long job survives the app closing) and hands us its pid; once that parent is gone
+    // AND no job is running, exit rather than linger as a leaked process. The finished results are
+    // already in .ada/jobs.json, where the next serve's merge picks them up.
+    const parentPid = Number(process.env.ADA_PARENT_PID) || 0;
+    if (parentPid) {
+      const watchdog = setInterval(() => {
+        try {
+          process.kill(parentPid, 0); // throws when the parent is gone
+        } catch {
+          if (!listJobs().some((j) => j.status === "running")) process.exit(0);
+        }
+      }, 30_000);
+      watchdog.unref();
+    }
+
     // Interactive sessions — for driving ada like an IDE agent panel (live text/tool-call events,
     // and edits pause for YOUR approval UI instead of auto-running). See docs/integrations.md.
     interface AgentSession {
@@ -1105,11 +1186,13 @@ async function main(): Promise<void> {
     const makeSession = (m: string, resumeFile?: string, tokenBudget = 0): { id: string; rec: AgentSession } => {
       const session = resumeFile ? Session.open(resumeFile) : Session.create();
       const history = resumeFile ? (session.load() as unknown as Msg[]) : undefined;
+      const id = newId("sess");
       const rec: AgentSession = { agent: undefined as unknown as Agent, registry: new ApprovalRegistry(), questions: new QuestionRegistry(), emit: null, file: session.file, ctrl: null, steer: [], mode: "ask" };
       rec.agent = new Agent({
         client,
         model: m,
         session,
+        sessionId: id, // so a background_task started in this chat can record whose it is
         history,
         project: trusted,
         compactAt: settings.compactAt,
@@ -1126,7 +1209,6 @@ async function main(): Promise<void> {
           return promise;
         },
       });
-      const id = newId("sess");
       sessions.set(id, rec);
       return { id, rec };
     };
@@ -1158,6 +1240,22 @@ async function main(): Promise<void> {
       // List on-disk transcripts (survive an `ada serve` restart) so an IDE can offer "resume".
       if (req.method === "GET" && url.pathname === "/v1/sessions") {
         res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessions: list() }));
+        return;
+      }
+      // Background jobs, so the editor can show what `background_task` produced. The CLI reads the
+      // same list through /jobs; without this route the app started jobs it could never read back.
+      if (req.method === "GET" && url.pathname === "/v1/jobs") {
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jobs: listJobs() }));
+        return;
+      }
+      const cancelJobMatch = req.method === "POST" && url.pathname.match(/^\/v1\/jobs\/([^/]+)\/cancel$/);
+      if (cancelJobMatch) {
+        const job = cancelJob(decodeURIComponent(cancelJobMatch[1]!));
+        if (!job) {
+          res.writeHead(404, { "content-type": "application/json" }).end(JSON.stringify({ error: "no such job" }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ job }));
         return;
       }
       // Skills & MCP management — lets an IDE render settings pages off the same loaders the agent uses.
@@ -1284,7 +1382,10 @@ async function main(): Promise<void> {
             // the `file` values from GET /v1/sessions (a restarted `ada serve` has no memory of which
             // in-memory sessionIds existed before, so the IDE re-resolves by transcript file instead).
             if (j.resume === "latest") resume = list()[0]?.file;
-            else if (j.resume && list().some((s) => s.file === j.resume)) resume = j.resume;
+            // Anything that still names a real transcript. Requiring the file to appear in this
+            // cwd's scan meant a transcript plainly sitting on disk was refused whenever serve came
+            // back somewhere else — and refused silently, so the chat just reopened with no memory.
+            else if (j.resume) resume = resolveTranscript(j.resume) ?? undefined;
           } catch {
             /* ignore, use default model + no resume */
           }
@@ -1611,7 +1712,10 @@ async function main(): Promise<void> {
 
   // Headless print mode: run one prompt non-interactively and exit.
   if (flags.print !== undefined) {
-    const trusted = isTrusted(process.cwd());
+    // ADA_TRUST_CWD=1: same contract as `serve` — the caller vouches for this cwd. A harness that
+    // creates a working directory and then drives ada inside it can't add it to
+    // the interactive trustedDirs list, so without this its AGENTS.md was silently never loaded.
+    const trusted = process.env.ADA_TRUST_CWD === "1" || isTrusted(process.cwd());
     const settings = loadSettings(trusted);
     await applyOrgPolicy(); // org tool rules bind headless runs too (CI is the classic bypass path)
     let pm = flags.model ?? process.env.ADA_MODEL ?? settings.model ?? scoped[0] ?? "";
@@ -1636,10 +1740,25 @@ async function main(): Promise<void> {
     if (process.env.ADA_NO_SUBAGENTS !== "1") {
       registerSubagentTools({ client, model: pm, onApprove: async (): Promise<ApprovalDecision> => "yes", autoApprove: true, project: trusted, compactAt: settings.compactAt });
     }
+    // `--continue` here is what lets a caller drive ada in a loop and keep ONE
+    // conversation across many `-p` invocations — and, by dropping the flag, deliberately start a
+    // fresh one. Without this, every headless call began from zero and both halves of that mechanic
+    // were silently no-ops. Sessions live under the cwd's .ada/sessions, so each run dir is its own
+    // conversation with no extra bookkeeping.
+    let printSession = Session.create();
+    let printHistory: Msg[] | undefined;
+    if (flags.cont) {
+      const prev = Session.latest();
+      if (prev) {
+        printSession = prev;
+        printHistory = prev.load() as unknown as Msg[];
+      }
+    }
     const agent = new Agent({
       client,
       model: pm,
-      session: Session.create(),
+      session: printSession,
+      history: printHistory,
       onApprove: async (): Promise<ApprovalDecision> => "yes",
       autoApprove: true,
       reasoning: flags.reasoning ?? settings.reasoning,
@@ -1648,7 +1767,9 @@ async function main(): Promise<void> {
     });
     if (flags.strategy) agent.setStrategy(flags.strategy);
     const text = await agent.send(flags.print, { quiet: !!flags.json });
-    if (flags.json) console.log(JSON.stringify({ model: pm, text, usage: agent.usageReport() }));
+    // `context` lets a caller that drives ada in a loop see how full the window
+    // is and decide to start fresh, instead of estimating it from the usage string.
+    if (flags.json) console.log(JSON.stringify({ model: pm, text, usage: agent.usageReport(), context: agent.contextTokens() }));
     return;
   }
 
@@ -2052,7 +2173,7 @@ async function main(): Promise<void> {
       process.stdout.write("\x1b[38;5;214m◆\x1b[0m  "); // reply streams inline right after the bullet (no "ada" label)
     };
     try {
-      await agent.send(toSend, { signal: abort.signal, steer, images: imgs, onReplyStart: openReply });
+      await agent.send(toSend, { signal: abort.signal, steer, images: imgs, onReplyStart: openReply, onReasoningStart: stopSpin });
       if (!abort.signal.aborted && Date.now() - turnStart > 8000) notify("ada", "task complete");
     } catch (e) {
       track("error", { message: e instanceof Error ? e.message : String(e) });
@@ -2066,10 +2187,35 @@ async function main(): Promise<void> {
   rl.close();
 }
 
+/**
+ * End the process with `code`, preferring a NATURAL exit.
+ *
+ * Calling process.exit() while undici is still tearing down a socket aborts on Windows —
+ *   Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c, line 76
+ * — which turned every successful `ada login` (the token exchange is a fetch, and the exit follows
+ * it immediately) into exit 127. Draining the connection pool first doesn't help; letting the loop
+ * empty on its own always does.
+ *
+ * The forced exit still has to exist, because node-pty (bash) and stdin can pin the loop open
+ * forever. So: set the code, let the loop drain if it can, and force it only if something is still
+ * holding on. The timer is unref'd — it won't keep the process alive by itself, but it DOES fire
+ * when something else is keeping the loop running, which is exactly the case it's there for.
+ */
+let finishing = false;
+function finish(code: number): void {
+  // First caller wins. A command that already recorded a failure (a failed login calls finish(1)
+  // and then returns normally) must not have it erased by main()'s success handler calling
+  // finish(0) afterwards — the old code couldn't hit this because process.exit() never returned.
+  if (finishing) return;
+  finishing = true;
+  process.exitCode = code;
+  setTimeout(() => process.exit(code), 500).unref();
+}
+
 main().then(
-  () => process.exit(0), // explicit exit: node-pty (bash) and stdin can keep the loop alive otherwise
+  () => finish(0),
   (e) => {
     console.error(e instanceof Error ? e.message : e);
-    process.exit(1);
+    finish(1);
   },
 );

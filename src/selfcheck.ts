@@ -59,7 +59,7 @@ async function main(): Promise<void> {
   assert.ok(r.output.includes("hi"), r.output);
 
   // --- browser: a11y tree serializer (pure, no browser needed) ---
-  const { formatAxTree } = await import("./client/browser.ts");
+  const { formatAxTree, bridgeBlocks } = await import("./client/browser.ts");
   const ax = formatAxTree([
     { nodeId: "1", role: { value: "RootWebArea" }, name: { value: "T" }, childIds: ["2", "3", "4"] },
     { nodeId: "2", parentId: "1", role: { value: "button" }, name: { value: "Do thing" }, backendDOMNodeId: 10 },
@@ -317,6 +317,13 @@ async function main(): Promise<void> {
   // --- browser approval rendering ---
   assert.equal(describeCall("browser", { action: "click", ref: "ref_2" }).detail, "click ref_2");
   assert.ok(permPhrase("browser", true).toLowerCase().includes("enter"), "press-Enter phrase should warn about submitting");
+
+  // Nothing is blocked by default - the block list is opt-in via ADA_BRIDGE_BLOCKED. Matching must
+  // cover subdomains without catching lookalike domains, and must not throw on junk input.
+  assert.ok(!bridgeBlocks("https://www.instagram.com/"), "nothing should be blocked by default");
+  assert.ok(bridgeBlocks("https://www.instagram.com/", ["instagram.com"]), "an opted-in host must match, subdomains included");
+  assert.ok(!bridgeBlocks("https://notinstagram.com/", ["instagram.com"]), "suffix match must not catch lookalike domains");
+  assert.ok(!bridgeBlocks("not a url", ["instagram.com"]), "a malformed url must not throw");
   assert.ok(!permPhrase("browser", false).startsWith("run the"), "browser needs its own perm phrase");
 
   // --- baked offline catalog seeds pricing/limits (no network) ---
@@ -412,10 +419,18 @@ async function main(): Promise<void> {
     // But memory and skills are the user's, and meant to be committed and shared with the team.
     assert.ok(!/^memory\/?$/m.test(gi) && !/^skills\/?$/m.test(gi), "memory and skills must stay committable");
 
-    // A second call must not clobber a file the user has edited.
+    // A second call must not clobber a file the user has edited — but an install from before
+    // jobs.json existed still needs the line appended, or that project shows `?? .ada/jobs.json`
+    // forever. Append, don't rewrite.
     writeFileSync(join(ada, ".gitignore"), "# mine\n");
     ensureAdaDir(ada);
-    assert.equal(readFileSync(join(ada, ".gitignore"), "utf8"), "# mine\n", "an existing .gitignore is left alone");
+    const gi2 = readFileSync(join(ada, ".gitignore"), "utf8");
+    assert.ok(gi2.startsWith("# mine\n"), "the user's existing content is preserved, not rewritten");
+    assert.ok(/^jobs\.json$/m.test(gi2), "jobs.json is appended for installs that predate it");
+
+    // Calling again must not append a second copy of the line.
+    ensureAdaDir(ada);
+    assert.equal(readFileSync(join(ada, ".gitignore"), "utf8"), gi2, "appending jobs.json is idempotent");
     rmSync(tmp, { recursive: true, force: true });
   }
 
@@ -826,6 +841,128 @@ async function main(): Promise<void> {
   await new Promise((r) => setTimeout(r, 30));
   assert.ok(renderJobs().includes(jid) && /job-done-ok/.test(renderJobs()), "background job runs and reports its result");
 
+  // --- jobs survive a restart, and a restart does not lie about what was running ---
+  {
+    const { reviveJobs } = await import("./client/background.ts");
+
+    // A job still marked "running" belongs to a process that is gone. Loading it faithfully would
+    // show it running forever — a worse bug, and a permanent one, than the unreachable result this
+    // whole change is about.
+    const stale = reviveJobs([
+      { id: "j1", task: "was running when serve died", status: "running", started: 1 },
+      { id: "j2", task: "finished cleanly", status: "done", result: "the answer", started: 2, ended: 3 },
+    ]);
+    assert.equal(stale.jobs.length, 2, "revive keeps both jobs");
+    assert.equal(stale.jobs[0]!.status, "error", "a running job loads as interrupted, not running");
+    assert.match(stale.jobs[0]!.result ?? "", /restart/i, "and says why it is interrupted");
+    assert.equal(stale.jobs[1]!.status, "done", "a finished job loads untouched");
+    assert.equal(stale.jobs[1]!.result, "the answer", "with its result intact — the point of persisting");
+
+    // Ids are `j${++seq}` off a module counter. Without continuing the sequence, a restart hands
+    // out j1 again and silently overwrites the persisted j1 — destroying the very result we saved.
+    assert.equal(reviveJobs([{ id: "j7", task: "t", status: "done", started: 1 }]).nextSeq, 7, "seq continues from the highest id");
+    assert.equal(reviveJobs([]).nextSeq, 0, "an empty store starts the sequence at zero");
+
+    // A corrupt or hand-edited file must not take the agent down with it.
+    assert.deepEqual(reviveJobs(null), { jobs: [], nextSeq: 0 }, "null parses to an empty store");
+    assert.deepEqual(reviveJobs("nonsense"), { jobs: [], nextSeq: 0 }, "a non-array parses to an empty store");
+    assert.equal(reviveJobs([{ nope: true }, { id: "j3", task: "ok", status: "done", started: 1 }]).jobs.length, 1, "junk entries are dropped, good ones kept");
+    assert.equal(reviveJobs([{ nope: true }, { id: "j3", task: "ok", status: "done", started: 1 }]).nextSeq, 3, "and junk does not disturb the sequence");
+
+    // save() must merge with disk, not clobber it: a second `ada` in the same folder — the app's
+    // serve for the open project, say, beside a terminal `ada` — has its own Map and writes the same
+    // file. Blind overwrite means each one's save() erases whatever the other added since its own
+    // load(). A job this process never created should still be there after a save() of its own.
+    {
+      const jobsPath = join(process.cwd(), ".ada", "jobs.json");
+      const onDisk = existsSync(jobsPath) ? JSON.parse(readFileSync(jobsPath, "utf8")) : [];
+      const foreignId = "j_selfcheck_foreign";
+      // A recent `started` matters: capJobs keeps the *newest* finished jobs, and this file already
+      // has decades of prior selfcheck runs' entries in it — an old timestamp would make the foreign
+      // job look stale and get pruned for a reason that has nothing to do with the merge being tested.
+      const now = Date.now();
+      writeFileSync(
+        jobsPath,
+        JSON.stringify(
+          [...onDisk, { id: foreignId, task: "left by another ada in this folder", status: "done", result: "not ours", started: now, ended: now }],
+          null,
+          2,
+        ),
+      );
+      // Any startJob() triggers a save() as a side effect — that is the real code path, not a
+      // reach into internals.
+      startJob("triggers a save so the merge above actually runs", async () => "ok");
+      await new Promise((r) => setTimeout(r, 30));
+      const after = JSON.parse(readFileSync(jobsPath, "utf8"));
+      assert.ok(Array.isArray(after) && after.some((j: { id?: string }) => j.id === foreignId), "save() merges in a job it never created instead of overwriting the file with only its own");
+    }
+
+    // Pruning ranks by start time, which would age out a job that is still running once enough newer
+    // jobs pile up — losing the one result the whole file exists to keep. A running job must never
+    // be dropped for being old, even past the 50-job cap; only finished jobs are ever trimmed.
+    const { listJobs } = await import("./client/background.ts");
+    for (let i = 0; i < 55; i++) startJob(`long job ${i}`, () => new Promise<string>(() => {})); // never resolves
+    const stillRunning = listJobs().filter((j) => j.status === "running" && j.task.startsWith("long job"));
+    assert.equal(stillRunning.length, 55, "every running job survives a prune, even past the 50-job cap");
+  }
+
+  // --- a tool learns which session called it -------------------------------------------------
+  {
+    const { registerTool, toolByName } = await import("./client/tools.ts");
+    let seen: string | undefined = "unset";
+    registerTool({
+      name: "selfcheck_ctx_echo",
+      description: "selfcheck only",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+      needsApproval: false,
+      async run(_args, ctx) {
+        seen = ctx?.sessionId;
+        return { output: "ok" };
+      },
+    });
+    // Called the way the agent calls it, rather than through a whole turn: the contract under test
+    // is "the ctx reaches run()", and a live model round trip would prove nothing extra.
+    await toolByName.get("selfcheck_ctx_echo")!.run({}, { sessionId: "sess-abc" });
+    assert.equal(seen, "sess-abc", "a tool receives the calling session's id");
+    await toolByName.get("selfcheck_ctx_echo")!.run({});
+    assert.equal(seen, undefined, "and undefined when the caller has no session — a terminal agent");
+  }
+
+  // --- a job remembers which chat started it -------------------------------------------------
+  {
+    const { startJob, listJobs, reviveJobs } = await import("./client/background.ts");
+    const withId = startJob("attributed job", async () => "done", "sess-xyz");
+    const without = startJob("terminal job", async () => "done");
+    await new Promise((r) => setTimeout(r, 30));
+    const all = listJobs();
+    assert.equal(all.find((j) => j.id === withId)?.sessionId, "sess-xyz", "a job records the session that started it");
+    assert.equal(all.find((j) => j.id === without)?.sessionId, undefined, "a job with no session is still valid — a terminal agent has none");
+
+    // The field has to survive a restart, or attribution silently resets to unscoped.
+    const revived = reviveJobs([{ id: "j99", task: "t", status: "done", result: "r", started: 1, ended: 2, sessionId: "sess-xyz" }]);
+    assert.equal(revived.jobs[0]!.sessionId, "sess-xyz", "reviveJobs carries sessionId across a restart");
+
+    // The branch above is the easy one — status "done" never gets rewritten. The interrupted branch
+    // is the one a crash actually exercises, and it is also the one that rebuilds the job object
+    // field by field, so it is exactly where a forgotten sessionId would go unnoticed.
+    const revivedInterrupted = reviveJobs([{ id: "j98", task: "was running when serve died", status: "running", started: 1, sessionId: "sess-xyz" }]);
+    assert.equal(revivedInterrupted.jobs[0]!.status, "error", "a running job with a session still loads as interrupted");
+    assert.equal(revivedInterrupted.jobs[0]!.sessionId, "sess-xyz", "and the interrupted branch keeps its sessionId too");
+  }
+
+  // A burst of running jobs must not squeeze the finished log to nothing — that destroyed results
+  // on the next save, which is the whole thing persistence protects against.
+  {
+    const { listJobs } = await import("./client/background.ts");
+    // The premise this block depends on — the 55 "long job" running jobs started earlier — lives in
+    // an unrelated block above. Assert it explicitly, so a future edit that shrinks or moves that
+    // loop makes this test fail loudly instead of passing without ever exercising the cap.
+    const runningCount = listJobs().filter((j) => j.status === "running").length;
+    assert.ok(runningCount > 50, "setup actually has more running jobs than the cap, or the assertion below proves nothing");
+    const finishedKept = listJobs().filter((j) => j.status !== "running").length;
+    assert.ok(finishedKept > 0, "finished jobs survive even when running jobs outnumber the cap");
+  }
+
   // --- agent-server helpers: SSE framing, id uniqueness, approval correlation (no live model needed) ---
   {
     const { sseFrame, newId, ApprovalRegistry } = await import("./client/agent-server.ts");
@@ -1099,6 +1236,175 @@ async function main(): Promise<void> {
     const srv = createAdaServer();
     assert.ok(!srv.listening, "createAdaServer() builds the server without calling listen()");
     srv.close();
+  }
+
+  // --- cancelling a running job --------------------------------------------------------------
+  {
+    const { startJob, cancelJob, listJobs, reviveJobs } = await import("./client/background.ts");
+    // A job that only settles when its signal fires, so the test controls exactly when it ends.
+    const id = startJob("cancel me", (signal) => new Promise<string>((_res, rej) => {
+      signal?.addEventListener("abort", () => rej(new Error("aborted")));
+    }));
+    const j = cancelJob(id);
+    assert.equal(j?.status, "cancelled", "cancelJob settles the job as cancelled");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(listJobs().find((x) => x.id === id)?.status, "cancelled", "and the rejection does not overwrite it with error");
+
+    assert.equal(cancelJob("j-nope"), null, "cancelling an unknown job is null, not a throw");
+    const settled = startJob("already done", async () => "fine");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(cancelJob(settled)?.status, "done", "cancelling a settled job is a no-op, not an error");
+
+    // Without this, a restart relabels a deliberate stop as a success — the coercion sends anything
+    // unrecognised to "done".
+    const revived = reviveJobs([{ id: "j98", task: "t", status: "cancelled", started: 1, ended: 2 }]);
+    assert.equal(revived.jobs[0]!.status, "cancelled", "reviveJobs preserves cancelled rather than coercing it to done");
+
+    // The real sub-agent RESOLVES on abort (send() unwinds and returns whatever partial text it had)
+    // rather than rejecting — model the runner on that, not on a throw, to cover the path that
+    // actually happens in production.
+    const partialId = startJob("cancel with partial", (signal) => new Promise<string>((res) => {
+      signal?.addEventListener("abort", () => res("half an answer"));
+    }));
+    cancelJob(partialId);
+    await new Promise((r) => setTimeout(r, 30));
+    const partial = listJobs().find((x) => x.id === partialId);
+    assert.equal(partial?.status, "cancelled", "a late resolve does not move the status off cancelled");
+    assert.equal(partial?.result, "half an answer", "but its partial text is kept — the spec promises this");
+  }
+
+  // --- a nested job inherits the chat ---------------------------------------------------------
+  {
+    const { startJob, listJobs } = await import("./client/background.ts");
+    // Stands in for the nested call: a sub-agent carrying an inherited sessionId reaches exactly
+    // this path when its own background_task fires. The hop that cannot be exercised here is the
+    // live sub-agent turn; the hop that can is that an inherited id lands on the record.
+    const nested = startJob("nested job", async () => "done", "sess-parent");
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(listJobs().find((j) => j.id === nested)?.sessionId, "sess-parent", "a job started with an inherited session id records it");
+  }
+
+  // --- self-awareness tools (live.ts): registry, messaging, goal, context, notes ---------------
+  {
+    const { registerRun, endRun, liveRuns } = await import("./client/live.ts");
+    // A stub that satisfies AgentHandle — the tools only read these five methods.
+    const stubAgent = (model = "stub") => ({
+      contextTokens: () => 1234,
+      compactLimit: () => 10_000,
+      compactNow: async () => "compacted (stub)",
+      usageRaw: () => ({ model, promptTokens: 500, completionTokens: 100, cost: null }),
+      lastText: () => "stub said this",
+    });
+
+    const steerA: string[] = [];
+    const steerB: string[] = [];
+    const a = registerRun("task A: refactor the parser", steerA, stubAgent());
+    const b = registerRun("task B: write the tests", steerB, stubAgent());
+    assert.equal(liveRuns().length, 2, "both runs visible");
+
+    let r = await tool("list_agents").run({}, { runId: a });
+    assert.ok(r.output.includes("(you)") && r.output.includes("task B"), "list marks self and shows others");
+
+    r = await tool("peek_agent").run({ id: b });
+    assert.ok(r.output.includes("stub said this"), "peek shows the target's last text");
+    r = await tool("peek_agent").run({ id: "nope" });
+    assert.ok(r.isError, "peeking a dead run errors");
+
+    r = await tool("send_agent_message").run({ id: b, message: "focus on edge cases" }, { runId: a });
+    assert.ok(!r.isError, r.output);
+    assert.ok(steerB[0]!.includes("focus on edge cases") && steerB[0]!.includes(a), "message lands in the target's steer queue, attributed");
+    r = await tool("send_agent_message").run({ id: a, message: "hi me" }, { runId: a });
+    assert.ok(r.isError, "self-messaging is rejected");
+
+    // goal: set → get reports spend since set → done closes
+    const agentForGoal = stubAgent();
+    r = await tool("goal").run({ action: "set", objective: "ship the feature", token_budget: 9000 }, { agent: agentForGoal });
+    assert.ok(r.output.includes("ship the feature"), r.output);
+    r = await tool("goal").run({ action: "get" }, { agent: agentForGoal });
+    assert.ok(r.output.includes("active") && r.output.includes("9000"), "goal get reports status and budget");
+    r = await tool("goal").run({ action: "done" }, { agent: agentForGoal });
+    assert.ok(r.output.includes("closed"), r.output);
+
+    r = await tool("context_status").run({}, { agent: stubAgent() });
+    assert.ok(r.output.includes("1234") && r.output.includes("12%"), "context status reports tokens and percent");
+    r = await tool("compact_now").run({}, { agent: stubAgent() });
+    assert.equal(r.output, "compacted (stub)");
+
+    // heartbeat: create pushes into own steer on a timer; endRun clears it
+    r = await tool("heartbeat").run({ action: "create", instruction: "check the build", every_seconds: 1 }, { runId: a });
+    assert.ok(!r.isError, r.output); // min interval clamps to 15s — creation is what's under test
+    r = await tool("heartbeat").run({ action: "list" }, { runId: a });
+    assert.ok(r.output.includes("check the build"), "heartbeat listed");
+    r = await tool("heartbeat").run({ action: "cancel", id: 1 }, { runId: a });
+    assert.ok(r.output.includes("cancelled"), r.output);
+
+    endRun(a);
+    endRun(b);
+    assert.equal(liveRuns().length, 0, "endRun clears the registry");
+
+    // refine_note appends to .ada/notes.md in cwd — run it from a temp cwd so the repo stays clean
+    const notesDir = join(tmpdir(), `ada-notes-${Date.now()}`);
+    mkdirSync(notesDir, { recursive: true });
+    const oldCwd = process.cwd();
+    process.chdir(notesDir);
+    try {
+      const { readNotes } = await import("./client/live.ts");
+      r = await tool("refine_note").run({ note: "always run tests from repo root" });
+      assert.ok(!r.isError, r.output);
+      assert.ok(readNotes().includes("always run tests from repo root"), "note readable back for the system prompt");
+    } finally {
+      process.chdir(oldCwd);
+      rmSync(notesDir, { recursive: true, force: true });
+    }
+  }
+
+  // --- job notifications reach the owning agent (live.notify) ----------------------------------
+  {
+    const { registerRun, endRun, notify } = await import("./client/live.ts");
+    const stub = { contextTokens: () => 0, compactLimit: () => 1, compactNow: async () => "", usageRaw: () => ({ model: "stub", promptTokens: 0, completionTokens: 0, cost: null }), lastText: () => "" };
+
+    // Live delivery: a run in flight for the session gets the message in its steer queue.
+    const steer: string[] = [];
+    const run = registerRun("chat turn", steer, stub, "sess-live");
+    notify("sess-live", "[background job j9 done] result text");
+    assert.ok(steer.some((s) => s.includes("j9")), "notify lands in the live run's steer queue");
+    endRun(run);
+
+    // Parked delivery: no run in flight — the message waits and drains into the session's NEXT turn.
+    notify("sess-idle", "[background job j10 done] later result");
+    const steer2: string[] = [];
+    const run2 = registerRun("next turn", steer2, stub, "sess-idle");
+    assert.ok(steer2.some((s) => s.includes("j10")), "a parked notification drains into the next turn");
+    endRun(run2);
+
+    // A different session's turn must NOT receive it.
+    notify("sess-a", "[job for a]");
+    const steerB: string[] = [];
+    const runB = registerRun("b's turn", steerB, stub, "sess-b");
+    assert.equal(steerB.length, 0, "notifications never cross sessions");
+    endRun(runB);
+  }
+
+  // --- post-edit verification (verifyEdits + auto-detection) -----------------------------------
+  {
+    const { verifyEdits, detectVerifyCommand } = await import("./client/agent.ts");
+
+    // Auto-detection: npm script wins, then other ecosystems, then nothing.
+    const vDir = join(tmpdir(), `ada-verify-${Date.now()}`);
+    mkdirSync(vDir, { recursive: true });
+    writeFileSync(join(vDir, "package.json"), JSON.stringify({ scripts: { typecheck: "tsc --noEmit" } }));
+    assert.equal(detectVerifyCommand(vDir), "npm run typecheck", "package.json typecheck script is detected");
+    writeFileSync(join(vDir, "package.json"), "{}");
+    writeFileSync(join(vDir, "Cargo.toml"), "[package]");
+    assert.equal(detectVerifyCommand(vDir), "cargo check --quiet", "cargo project detected when npm has no scripts");
+    rmSync(vDir, { recursive: true, force: true });
+    assert.equal(detectVerifyCommand(join(tmpdir(), "ada-verify-none")), null, "no project markers → nothing to run");
+    const fail = await verifyEdits([], `node -e "console.error('boom');process.exit(1)"`);
+    assert.ok(fail && fail.includes("boom") && fail.includes("exited 1"), "failing verify command reports its output");
+    const ok = await verifyEdits([], `node -e "process.exit(0)"`);
+    assert.equal(ok, null, "clean verify command reports nothing");
+    const none = await verifyEdits([], undefined);
+    assert.equal(none, null, "no command and no LSP-checkable paths → silently clean");
   }
 
   console.log("selfcheck OK");

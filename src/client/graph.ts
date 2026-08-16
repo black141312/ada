@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { sqliteOptions } from "../server/sqlite-binding.ts";
 import { rankSkills } from "./skill-router.js";
 import { setFactExtractor, setRecallAugmenter } from "./memory.js";
 import { registerTool } from "./tools.js";
@@ -70,7 +71,8 @@ function db(): Database.Database {
   if (!Driver) throw new Error("knowledge graph unavailable: better-sqlite3 is not installed here");
   const path = process.env.ADA_GRAPH_DB ?? (asScript ? ":memory:" : join(process.cwd(), ".ada", "graph.db"));
   if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
-  _db = new Driver(path);
+  // Same ABI story as auth.ts: the desktop app runs this under Electron's Node, not the system one.
+  _db = new Driver(path, sqliteOptions());
   _db.pragma("journal_mode = WAL");
   _db.exec(`
     create table if not exists edges (

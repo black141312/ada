@@ -12,7 +12,7 @@
 import { randomBytes } from "node:crypto";
 import type { Pool } from "pg";
 import type Database from "better-sqlite3";
-import { authDatabase, usingPostgres } from "./auth.js";
+import { authDatabase, usingPostgres } from "./db.js";
 import { PLANS, setPlan, type PlanName } from "./plans.js";
 
 /** Long enough that a user can finish a payment flow, short enough that a leaked link goes stale. */
@@ -27,8 +27,8 @@ export interface CheckoutSession {
   expiresAt: number;
 }
 
-const pg = () => authDatabase as Pool;
-const lite = () => authDatabase as Database.Database;
+const pg = () => authDatabase() as Pool;
+const lite = () => authDatabase() as Database.Database;
 
 let ready: Promise<void> | null = null;
 function ensure(): Promise<void> {

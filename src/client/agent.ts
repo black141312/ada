@@ -1,13 +1,14 @@
 // The agentic loop. Talks ONLY to the ada backend via the OpenAI SDK; the backend
 // routes to the real provider. Streams text, runs tool calls, persists every message.
 
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type OpenAI from "openai";
 import { loadBrain } from "./brain.ts";
 import { compact, estimateTokens, isContextOverflowError } from "./compaction.ts";
 import { MarkdownStreamer } from "./render.ts";
-import { type Tool, type ToolResult, isDestructive, toolByName, tools } from "./tools.ts";
+import { type Tool, type ToolCtx, type ToolResult, isDestructive, toolByName, tools } from "./tools.ts";
 import { afterTool, beforeTool, transformInput } from "./hooks.ts";
 import { configuredServers } from "./mcp.ts";
 import { contextOf, priceOf } from "./models-dev.ts";
@@ -18,6 +19,8 @@ import { AUTO_LEARN, LEARN_EVERY, learnFromTranscript, rememberSmart } from "./m
 import { Session } from "./session.ts";
 import { fileURLToPath } from "node:url";
 import { runIsolatedWorker } from "./worker.ts";
+import { endRun, readNotes, registerRun } from "./live.ts";
+import { getDiagnostics } from "./lsp.ts";
 
 /** "tokens: 1566 in / 18 out · ~$0.0016" → numbers. A child worker reports usage as that string;
  *  parsing it back beats plumbing a second channel for three integers. */
@@ -69,8 +72,55 @@ type SendCtrl = {
   delegated?: boolean;
   images?: string[];
   onReplyStart?: () => void;
+  /** First thinking token of a turn. Separate from `onReplyStart` because the answer has not
+   *  started yet — the REPL clears its spinner here but holds the ◆ bullet back for the answer. */
+  onReasoningStart?: () => void;
   onEvent?: (e: AgentEvent) => void;
 };
+/**
+ * Streams the model's thinking to the terminal the way Claude Code shows it: a dim, indented block
+ * under a `✻ Thinking…` header, closed the moment the answer starts so the two never interleave.
+ *
+ * Until now reasoning deltas were only ever forwarded to `onEvent`, so the plain REPL — the way
+ * most of ada is actually used — dropped them on the floor: `/reasoning high` cost tokens and
+ * showed a spinner. A caller with its own UI still gets events and prints nothing here.
+ */
+function thinkingPrinter(ctrl: SendCtrl | undefined): { push: (delta: string) => void; end: () => void } {
+  let open = false;
+  let atLineStart = true;
+  return {
+    push(delta: string): void {
+      if (ctrl?.onEvent) {
+        ctrl.onEvent({ type: "reasoning", delta });
+        return;
+      }
+      if (ctrl?.quiet || !delta) return;
+      if (!open) {
+        open = true;
+        ctrl?.onReasoningStart?.(); // clear the REPL spinner; the ◆ bullet waits for the answer
+        process.stdout.write("\n\x1b[2m✻ Thinking…\x1b[0m\n\n");
+        atLineStart = true;
+      }
+      // Indent continuation lines to match, so a multi-paragraph thought stays visibly a block.
+      let out = "";
+      for (const ch of delta) {
+        if (atLineStart && ch !== "\n") {
+          out += "  ";
+          atLineStart = false;
+        }
+        out += ch;
+        if (ch === "\n") atLineStart = true;
+      }
+      process.stdout.write(`\x1b[2;3m${out}\x1b[0m`);
+    },
+    end(): void {
+      if (!open) return;
+      open = false;
+      process.stdout.write("\n\n");
+    },
+  };
+}
+
 type ToolCall = { id: string; name: string; args: string };
 type StepResult = { content: string; toolCalls: ToolCall[] };
 type ToolDef = OpenAI.Chat.Completions.ChatCompletionTool;
@@ -134,6 +184,12 @@ function extraDirsNote(): string {
   return `Also in this workspace (use absolute paths to read or edit them; call project_map with a path to see that folder's structure):\n${dirs.map((d) => `- ${d}`).join("\n")}`;
 }
 
+/** Lessons past sessions left via refine_note — the tail, so old noise ages out of the prompt. */
+function standingNotesNote(): string {
+  const notes = readNotes();
+  return notes ? `Standing notes you left yourself in past sessions (add with refine_note):\n${notes}` : "";
+}
+
 function systemPrompt(includeProject: boolean): string {
   return (
     [
@@ -145,7 +201,11 @@ function systemPrompt(includeProject: boolean): string {
       "Explore with grep/glob/ls; use codebase_search when searching by meaning, not exact text. Read a file before editing; prefer edit_file over rewriting, apply_patch for multi-file changes; lsp_diagnostics after edits; ask_user only when blocked. Documents, decks and images can be generated on request.",
       "Call list_skills then use_skill before a specialized task.",
       "Call remember_fact when the user states a durable preference, convention or constraint ('always use X', 'we deploy via Y'). Not transient state, not secrets. Relevant memories are recalled automatically.",
-      "Be concise. Don't narrate routine actions or pad with preamble. When you have enough information to act, act. Ask only when genuinely blocked or before destructive, irreversible actions.",
+      standingNotesNote(),
+      "Be concise. Don't pad with preamble. When you have enough information to act, act. Ask only when genuinely blocked or before destructive, irreversible actions.",
+      // The user watches a live step list while the agent works; several silent tool steps in a row
+      // read as a hang. One narration line per batch is the fix — cheap, and collapsed after the turn.
+      "During multi-step work, write ONE short line before each new batch of tool calls saying what you're doing and why ('Checking how sessions are stored before touching the schema.'). Never chain several tool steps in complete silence; equally, never pad narration beyond a line.",
     ]
       .filter(Boolean)
       .join("\n") + (includeProject ? projectContext() : "")
@@ -352,6 +412,61 @@ const WORKER_TOKEN_BUDGET = Number(process.env.ADA_WORKER_BUDGET) || 50_000;
 
 const PLAN_NOTE =
   "PLAN MODE: do not write, edit, or run commands. Investigate with read-only tools if needed, then present a concise numbered plan and stop. The user will approve before you execute.";
+
+// ---- post-edit verification: the harness checks a turn's edits before the turn ends ----
+
+/** Tools whose success means a file on disk changed — the trigger for verification. apply_patch is
+ *  in the set for the trigger but contributes no path (its paths live inside the patch text), so a
+ *  patch-only turn verifies via the configured command or not at all. */
+const EDIT_TOOLS = new Set(["write_file", "edit_file", "apply_patch", "notebook_edit"]);
+const VERIFY_TIMEOUT_MS = 120_000;
+
+/** The project's own cheap correctness check, discovered from what's in the folder — nobody
+ *  configures verification per client, so the harness figures it out. Deliberately conservative:
+ *  typecheck-class commands only, never tests or builds (slow, side effects), and npm scripts are
+ *  run with --no-install semantics implied (the script exists, so its tooling is local).
+ *  ponytail: four ecosystems; add more when someone actually hits one. */
+export function detectVerifyCommand(dir = process.cwd()): string | null {
+  try {
+    const pkg = JSON.parse(readFileSync(resolve(dir, "package.json"), "utf8")) as { scripts?: Record<string, string> };
+    for (const name of ["typecheck", "check", "lint"]) if (pkg.scripts?.[name]) return `npm run ${name}`;
+  } catch {
+    /* no package.json — try the other ecosystems */
+  }
+  if (existsSync(resolve(dir, "Cargo.toml"))) return "cargo check --quiet";
+  if (existsSync(resolve(dir, "go.mod"))) return "go build ./...";
+  if (existsSync(resolve(dir, "tsconfig.json")) && existsSync(resolve(dir, "node_modules", "typescript"))) return "npx --no-install tsc --noEmit";
+  return null;
+}
+
+/** What's broken after this turn's edits, or null when clean (or unverifiable).
+ *
+ *  With a configured command (ADA_VERIFY / settings.verify — "npm run typecheck"), its non-zero
+ *  exit is the report. Without one, LSP diagnostics on the edited files, errors only — feeding
+ *  style warnings back would loop the model on noise. Never throws: a broken verifier must not
+ *  break the turn it was checking. */
+export async function verifyEdits(paths: string[], cmd: string | null | undefined): Promise<string | null> {
+  try {
+    if (cmd) {
+      const r = spawnSync(cmd, { shell: true, encoding: "utf8", timeout: VERIFY_TIMEOUT_MS });
+      if (r.status === 0) return null;
+      const out = `${r.stdout ?? ""}\n${r.stderr ?? ""}`.trim();
+      // The tail, not the head: build tools print progress first and the verdict last.
+      return `\`${cmd}\` exited ${r.status ?? "(timeout)"}:\n${out.slice(-3000)}`;
+    }
+    const found: string[] = [];
+    for (const p of paths.slice(0, 5)) {
+      try {
+        found.push(...(await getDiagnostics(p)).filter((d) => /error/i.test(d)));
+      } catch {
+        /* no language server for this file — nothing to check */
+      }
+    }
+    return found.length ? found.slice(0, 40).join("\n") : null;
+  } catch {
+    return null;
+  }
+}
 
 // ---- orchestration: pluggable agent architectures over a shared Engine ----
 // The Engine holds the harness primitives (streaming, tool-call recovery, compaction, approval,
@@ -605,19 +720,25 @@ export function permPhrase(name: string, destructive: boolean): string {
   return `run the ${name} tool`;
 }
 
-async function safeRun(tool: Tool, args: Record<string, unknown>): Promise<ToolResult> {
+async function safeRun(tool: Tool, args: Record<string, unknown>, ctx?: ToolCtx): Promise<ToolResult> {
   try {
-    return await tool.run(args);
+    return await tool.run(args, ctx);
   } catch (e) {
     return { output: String(e), isError: true };
   }
 }
 
-function isTransient(e: unknown): boolean {
-  const status = (e as { status?: number }).status;
+// The SDK collapses every network-layer failure into APIConnectionError, whose whole message is
+// "Connection error." — no status, no cause, nothing the patterns below used to match. So the one
+// failure most worth retrying, a call that never reached the provider, was the one we gave up on
+// instantly. Same for "Request timed out." (APIConnectionTimeoutError): "timed out", not "timeout".
+export function isTransient(e: unknown): boolean {
+  const status = (e as { status?: number } | undefined)?.status;
   if (status && [408, 409, 429, 500, 502, 503, 504, 529].includes(status)) return true;
   const msg = (e instanceof Error ? e.message : String(e)).toLowerCase();
-  return /timeout|econn|temporarily|overloaded|rate.?limit|fetch failed|socket hang/.test(msg);
+  return /timeout|timed out|econn|enotfound|eai_again|temporarily|overloaded|rate.?limit|connection error|fetch failed|terminated|socket hang/.test(
+    msg,
+  );
 }
 
 /** Run `fn`, retrying transient failures (429/5xx/network) with exponential backoff. */
@@ -674,6 +795,9 @@ export class Agent {
   private turnsSinceLearn = 0; // turns since the last extraction pass (see maybeLearn)
   private learning = false; // one extraction pass in flight at a time
   private project: boolean; // cwd is trusted → load project skills/memory
+  private sessionId?: string;
+  private runId?: string; // live-run registry id while send() is in flight (see live.ts)
+  private editedPaths = new Set<string>(); // files this send's edit tools touched — verified before the turn ends
 
   constructor(opts: {
     client: OpenAI;
@@ -687,6 +811,9 @@ export class Agent {
     history?: Msg[];
     /** Stop after this many prompt tokens. 0/undefined = no limit (the default for a real user). */
     tokenBudget?: number;
+    /** The serve session this agent belongs to, when it has one. Handed to tools so a job can record
+     *  which chat started it; undefined for the REPL and one-shot CLI, which belong to no chat. */
+    sessionId?: string;
   }) {
     this.client = opts.client;
     this.model = opts.model;
@@ -697,6 +824,7 @@ export class Agent {
     // 0 means "derive from the model" — resolved per call in compactLimit(), so setModel() moves it.
     this.compactAt = opts.compactAt || Number(process.env.ADA_COMPACT_AT) || 0;
     this.tokenBudget = opts.tokenBudget ?? (Number(process.env.ADA_TOKEN_BUDGET) || 0);
+    this.sessionId = opts.sessionId;
     this.apiTools = buildApiTools(); // snapshot the registry (incl. extension/skill/MCP tools) at construction
     this.project = opts.project ?? true;
     this.messages = [{ role: "system", content: systemPrompt(this.project) }, ...(opts.history ?? [])];
@@ -754,6 +882,10 @@ export class Agent {
   }
 
   async send(input: string, ctrl?: SendCtrl): Promise<string> {
+    ctrl ??= {};
+    // Every run gets a mailbox, whether or not the caller passed one: send_agent_message and
+    // heartbeats push into it, and drainSteer already reads it between steps.
+    ctrl.steer ??= [];
     let replyStarted = false;
     const say = (s: string): void => {
       if (ctrl?.onEvent) {
@@ -815,9 +947,28 @@ export class Agent {
     }
 
     const engine = this.makeEngine(ctrl, say, interrupted, drainSteer);
+    this.runId = registerRun(input, ctrl.steer, this, this.sessionId);
+    this.editedPaths.clear();
     try {
       await (ORCHESTRATORS[this.strategy] ?? reAct).run(engine);
+      // The turn edited files → check them before the answer stands, and feed failures back for
+      // one fix-up pass. One pass, deliberately: the second run's own edits are not re-verified,
+      // so a model that cannot fix the breakage reports it instead of looping on the verifier.
+      if (this.editedPaths.size && !ctrl.signal?.aborted && !this.planMode) {
+        // Explicit override > per-project setting > auto-detected (trusted dirs only — a detected
+        // command is the repo's own code, same trust bar as the auto-run formatters) > LSP.
+        const trusted = isTrusted(process.cwd());
+        const cmd = process.env.ADA_VERIFY || loadSettings(trusted).verify || (trusted ? detectVerifyCommand() : null);
+        const report = await verifyEdits([...this.editedPaths].filter(Boolean), cmd);
+        if (report) {
+          say(`\n\x1b[2m[verify] this turn's edits fail verification — asking for a fix\x1b[0m\n`);
+          engine.addUser(`[verify] The edits you just made fail verification. Fix the causes now, then give your final answer:\n${report}`);
+          await (ORCHESTRATORS[this.strategy] ?? reAct).run(engine);
+        }
+      }
     } finally {
+      endRun(this.runId);
+      this.runId = undefined;
       if (skillMsg) {
         const i = this.messages.indexOf(skillMsg);
         if (i >= 0) this.messages.splice(i, 1);
@@ -923,7 +1074,10 @@ export class Agent {
     // other way: blind workers spent ~174k input tokens groping around the repo to orient. The map
     // is ~1.5k and it replaces that search. Cheap models are exactly the ones that can't infer
     // layout from nothing — and they're now cheap enough that context is the affordable half.
-    const sub = new Agent({ client: this.client, model, session: Session.create(), onApprove: this.onApprove, autoApprove: true, project: this.project, tokenBudget: WORKER_TOKEN_BUDGET });
+    // Forwarded so a background_task started by this fallback worker still attributes to the chat
+    // that kicked off the fan-out — the isolated-worker path above already carries it; this sibling
+    // was the one spot it still fell on the floor.
+    const sub = new Agent({ client: this.client, model, session: Session.create(), sessionId: this.sessionId, onApprove: this.onApprove, autoApprove: true, project: this.project, tokenBudget: WORKER_TOKEN_BUDGET });
     try {
       return await sub.send(prompt, { quiet: true, delegated: true });
     } finally {
@@ -1026,6 +1180,7 @@ export class Agent {
 
       let content = "";
       const md = new MarkdownStreamer();
+      const think = thinkingPrinter(ctrl);
       const calls: Array<{ id: string; name: string; args: string }> = [];
       // If the reply opens like a leaked tool call (raw JSON / <tool_call> / fence), hold the
       // text back instead of streaming it — we may recover it as a real call after the stream.
@@ -1056,10 +1211,11 @@ export class Agent {
           // and DeepSeek send `reasoning`, others `reasoning_content`. Never added to `content` —
           // it is not the answer, and folding it in would put the model's scratch work in the
           // transcript and in every later request.
-          const think = (delta as { reasoning?: string; reasoning_content?: string } | undefined);
-          const thinkDelta = think?.reasoning ?? think?.reasoning_content;
-          if (thinkDelta) ctrl?.onEvent?.({ type: "reasoning", delta: thinkDelta });
+          const raw = (delta as { reasoning?: string; reasoning_content?: string } | undefined);
+          const thinkDelta = raw?.reasoning ?? raw?.reasoning_content;
+          if (thinkDelta) think.push(thinkDelta);
           if (delta?.content) {
+            think.end(); // the answer starts here — close the thinking block before it
             content += delta.content;
             if (!sniffed && content.trim()) {
               sniffed = true;
@@ -1070,6 +1226,7 @@ export class Agent {
           for (const tc of delta?.tool_calls ?? []) applyToolCallDelta(calls, tc);
         }
       } catch (e) {
+        think.end();
         say(md.end());
         if (signal?.aborted) {
           interrupted();
@@ -1077,6 +1234,7 @@ export class Agent {
         }
         throw explainApiError(e);
       }
+      think.end(); // a turn that only thought, then called a tool, still has a block to close
       if (!bufferMode) say(md.end());
 
       let toolCalls = calls.filter((c): c is { id: string; name: string; args: string } => !!c);
@@ -1135,7 +1293,12 @@ export class Agent {
     const runTool = async (tool: Tool, name: string, a: Record<string, unknown>): Promise<ToolResult> => {
       const pre = await beforeTool(name, a);
       if (pre.deny) return { output: pre.deny };
-      return afterTool(name, pre.args, await safeRun(tool, pre.args));
+      const res = await afterTool(name, pre.args, await safeRun(tool, pre.args, { sessionId: this.sessionId, runId: this.runId, agent: this }));
+      if (!res.isError && EDIT_TOOLS.has(name)) {
+        if (typeof pre.args.path === "string") this.editedPaths.add(resolve(process.cwd(), pre.args.path));
+        else this.editedPaths.add(""); // apply_patch: no single path, but the turn still edited — triggers command-based verify
+      }
+      return res;
     };
 
     const results = new Array<ToolResult>(toolCalls.length);
@@ -1218,6 +1381,11 @@ export class Agent {
         pruneToolImages(this.messages);
       }
     }
+  }
+
+  /** Last assistant text — for peek_agent, so observers see substance, not just token counts. */
+  lastText(): string {
+    return this.lastAssistant;
   }
 
   async compactNow(): Promise<string> {

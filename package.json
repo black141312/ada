@@ -55,15 +55,19 @@
     "start": "tsx src/client/cli.ts",
     "server": "tsx src/server/index.ts",
     "typecheck": "tsc --noEmit",
+    "sqlite:abi": "node scripts/sqlite-abi.mjs",
+    "postinstall": "node scripts/sqlite-abi.mjs || exit 0",
     "typecheck:worker": "tsc -p src/worker/tsconfig.json --noEmit",
     "selfcheck": "tsx src/selfcheck.ts",
     "check:browser": "tsx src/browsercheck.ts",
     "bench:memory": "tsx bench/memory.ts",
     "bench:extraction": "tsx bench/extraction.ts",
     "bench:swebench": "node bench/swebench.mjs",
-    "bench:arcagi3": "node bench/arcagi3.mjs",
     "catalog:refresh": "node scripts/refresh-catalog.mjs",
-    "release": "node scripts/release.mjs"
+    "release": "node scripts/release.mjs",
+    "browser:profile": "tsx src/clone-profile.ts",
+    "browser:login": "tsx src/browser-login.ts",
+    "browser:bridge": "tsx src/browser-bridge.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.106.0",

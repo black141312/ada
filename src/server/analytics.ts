@@ -10,14 +10,14 @@
 // so they are testable without a database.
 import type { Pool } from "pg";
 import type Database from "better-sqlite3";
-import { authDatabase, usingPostgres } from "./auth.js";
+import { authDatabase, usingPostgres } from "./db.js";
 import { PLANS, type PlanName } from "./plans.js";
 import { kelviqEnabled, listKelviqSubscriptions } from "./kelviq.js";
 
 const DAY_MS = 86_400_000;
 
-const pg = () => authDatabase as Pool;
-const lite = () => authDatabase as Database.Database;
+const pg = () => authDatabase() as Pool;
+const lite = () => authDatabase() as Database.Database;
 
 /** Run one SELECT against whichever database is configured. `?` placeholders; translated for pg. */
 async function all<T>(sql: string, params: unknown[]): Promise<T[]> {
@@ -89,7 +89,9 @@ export async function computeAnalytics(windowDays = 30): Promise<Analytics> {
   ).map((r) => ({ model: r.model, requests: Number(r.c), tokens: Number(r.t) }));
 
   const planRows = await all<{ user_id: string; plan: string; status: string }>("select user_id, plan, status from user_plans", []);
-  const planOf = new Map(planRows.map((r) => [r.user_id, (r.status === "active" ? r.plan : "free") as PlanName]));
+  // A plan string outside PLANS (a Kelviq identifier, a retired tier) made PLANS[plan] undefined and
+  // took the whole dashboard down at pctOfQuota. Unknown ⇒ free, same as a lapsed one.
+  const planOf = new Map(planRows.map((r) => [r.user_id, (r.status === "active" && r.plan in PLANS ? r.plan : "free") as PlanName]));
   const planCounts = new Map<string, number>();
   for (const p of planOf.values()) planCounts.set(p, (planCounts.get(p) ?? 0) + 1);
   const plans = [...planCounts.entries()].map(([plan, users]) => ({ plan, users })).sort((a, b) => b.users - a.users);

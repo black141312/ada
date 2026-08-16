@@ -4,6 +4,7 @@
 
 import { createServer, type Server } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import type { ProviderName } from "../shared/types.ts";
 import { PORT, PROVIDERS, clientKeys, configuredProviders, isConfigured, providerKey, providerStatus } from "./config.ts";
 import { type ExchangeRequest, exchangeClients, exchangeHosts, exchangeMisconfigured, handleMcpOauthExchange } from "./mcp-oauth-exchange.ts";
@@ -19,10 +20,22 @@ import { ANALYTICS_PAGE } from "./analytics-page.ts";
 
 /** The anonymous free-tier pseudo-identity — no account, so nothing to meter or bill. */
 const isAnonymous = (who: Identity): boolean => who.user === "anon" && String(who.role) === "free";
-import { auth, betterAuthEnabled, verifyBetterAuth } from "./auth.ts";
-import { toNodeHandler } from "better-auth/node";
+// ./auth.ts is imported ON DEMAND, never at startup. It builds Better Auth eagerly, which opens a
+// database — and without DATABASE_URL that means better-sqlite3, which the DESKTOP BUNDLE
+// deliberately ships without (ada-app's extraResources filter drops it). A static import here made
+// the packaged app's local gateway die on "Cannot find module 'better-sqlite3'" the instant it
+// started, with the app silently falling back to the hosted backend. Better Auth is off unless
+// BETTER_AUTH_ENABLED is set, so on that path nothing here needs a database at all.
+const betterAuthEnabled = (): boolean => process.env.BETTER_AUTH_ENABLED === "1" || process.env.BETTER_AUTH_ENABLED === "true";
 
-const betterAuthHandler = toNodeHandler(auth);
+let authHandler: ((req: IncomingMessage, res: ServerResponse) => unknown) | null = null;
+async function betterAuthHandler(req: IncomingMessage, res: ServerResponse): Promise<unknown> {
+  if (!authHandler) {
+    const [{ auth }, { toNodeHandler }] = await Promise.all([import("./auth.ts"), import("better-auth/node")]);
+    authHandler = toNodeHandler(auth);
+  }
+  return authHandler(req, res);
+}
 
 // Device sign-in page: Continue with GitHub → (return signed in) → auto-approve the code.
 const DEVICE_PAGE = `<!doctype html><meta charset="utf-8"><title>Ada — sign in</title>
@@ -46,6 +59,8 @@ q('#gh').onclick=async()=>{ const u=await session(); if(u){await approve();retur
 import { assertOidcConfig, discover, isProvisionAllowed, mapIdentityToSeatFields, oidcConfig, oidcEnabled, verifyOidcToken } from "./oidc.ts";
 import { adapterFor } from "./providers/registry.ts";
 import { route } from "./router.ts";
+import { clientAbort, proxyUpstream, upstream, upstreamModels } from "./upstream.ts";
+import { hasSubscription } from "./providers/subscription-oauth.ts";
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -106,7 +121,7 @@ async function identify(req: IncomingMessage): Promise<Identity | "corrupt" | nu
     // account and bypass a backend locked by seats / admin key / ADA_CLIENT_KEYS / allowlist / OIDC.
     // Accounts are a valid credential only when Better Auth is the intended gate. Allowlist applies too.
     if (betterAuthEnabled()) {
-      const acct = await verifyBetterAuth(token);
+      const acct = await (await import("./auth.ts")).verifyBetterAuth(token);
       if (acct) return { user: acct, role: "dev" };
     }
   }
@@ -135,6 +150,18 @@ async function handleModels(res: ServerResponse, freeOnly = false): Promise<void
       // `free` tells clients what the free tier covers — ADA_FREE_MODELS entries have no `:free`
       // suffix, so a client guessing from the id would mark them locked.
       data.push(free ? { id, object: "model", owned_by: p, free } : { id, object: "model", owned_by: p });
+    }
+  }
+  // Everything the upstream can serve, minus anything we already serve ourselves — a locally-held
+  // subscription must win, or the same id would be listed twice and the picker would send it to
+  // whichever entry it saw first.
+  const up = upstream();
+  if (up) {
+    const mine = new Set(data.map((m) => m.id));
+    for (const m of await upstreamModels(up)) {
+      if (mine.has(m.id)) continue;
+      if (freeOnly && m.free !== true) continue;
+      data.push(m.free ? { id: m.id, object: "model", owned_by: m.owned_by ?? "upstream", free: true } : { id: m.id, object: "model", owned_by: m.owned_by ?? "upstream" });
     }
   }
   json(res, 200, { object: "list", data });
@@ -169,10 +196,29 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
     return json(res, 403, { error: { message: `model '${model}' is not allowed by org policy (allowed: ${policy.models!.join(", ")})` } });
   }
 
+  // Routed early, because whether Ada's plan applies at all depends on WHO pays for this request.
+  // When an allowlist is active, IGNORE the client's `provider` hint — else a seat holder could
+  // send an allowlisted model id with a different provider and leak the body to it before the
+  // upstream rejects the id. Route by the model id only.
+  const explicit = policy.models?.length ? undefined : typeof body.provider === "string" ? body.provider : undefined;
+  const provider = route(model, explicit);
+
+  // A request served by a subscription on THIS machine is paid for by that plan, direct to the
+  // vendor — Ada never sees a token of it. Metering it against Ada's own quota would bill the user
+  // twice over: once to Anthropic/OpenAI, and again against an allowance they aren't consuming.
+  // (Only credentials held locally count. Anything forwarded upstream is metered there as before.)
+  const paidBySubscription = (provider === "anthropic" || provider === "chatgpt") && hasSubscription(provider) && isConfigured(provider);
+
+  // Requests we're about to FORWARD aren't ours to police either. The upstream applies its own
+  // plan and quota — it's the one paying — and a local gateway's plan store is a private, usually
+  // empty file in which every user looks like a fresh free account. Enforcing it here denied
+  // perfectly valid models before they ever reached the backend that would have allowed them.
+  const willForward = !isConfigured(provider) && !!upstream();
+
   // Plan quota. Skipped for the anonymous free tier (already restricted to `:free` above, and there
   // is no account to meter against) and for enterprise seats, which are governed by org policy and
   // billed by contract rather than by plan.
-  if (!isAnonymous(who) && !enterpriseMode()) {
+  if (!isAnonymous(who) && !enterpriseMode() && !paidBySubscription && !willForward) {
     const ent = await checkEntitlement(who.user, model);
     if (!ent.ok) {
       appendAudit({ ts: Date.now(), user: who.user, event: ent.status === 402 ? "quota_exceeded" : "plan_denied_model", detail: model });
@@ -181,14 +227,24 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
     }
   }
 
-  // When an allowlist is active, IGNORE the client's `provider` hint — else a seat holder could
-  // send an allowlisted model id with a different provider and leak the body to it before the
-  // upstream rejects the id. Route by the model id only.
-  const explicit = policy.models?.length ? undefined : typeof body.provider === "string" ? body.provider : undefined;
-  const provider = route(model, explicit);
   if (!isConfigured(provider)) {
+    // Can't serve it here — but if this gateway fronts a hosted backend, that one probably can.
+    // This is what lets a local gateway use the subscription for Claude while OpenRouter, quotas
+    // and metering keep working through the hosted server exactly as before.
+    const up = upstream();
+    if (up) {
+      delete body.provider; // our routing hint, never forwarded
+      return await proxyUpstream(up, "/chat/completions", body, res, clientAbort(req, res));
+    }
     return json(res, 400, {
-      error: { message: `provider '${provider}' not configured — set ${PROVIDERS[provider].keyEnv} on the backend` },
+      error: {
+        // chatgpt has no practical API-key route — naming its env var here would send people
+        // looking for a key that doesn't exist. Point at the sign-in instead.
+        message:
+          provider === "chatgpt"
+            ? "not signed in to ChatGPT — run `ada login chatgpt` (needs a Plus/Pro plan)"
+            : `provider '${provider}' not configured — set ${PROVIDERS[provider].keyEnv} on the backend`,
+      },
     });
   }
 
@@ -200,12 +256,28 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
   // upstream reported. Wrapping res keeps this in ONE place for every adapter.
   {
     let tail = "";
+    // Timing lives here for the same reason the token count does: one place, every adapter. Split
+    // into two numbers because they fail differently — a long ttft is the model queueing or
+    // thinking before it says anything (and a throttled subscription looks exactly like this),
+    // while a long tail after first byte is just generation. One combined number hides which.
+    const started = Date.now();
+    let ttft: number | null = null;
+    // `res.write` is typed `never` here by the cast below, so the check lives in its own function
+    // where the argument can be typed honestly as unknown.
+    const firstOutput = (c: unknown): boolean =>
+      (typeof c === "string" || Buffer.isBuffer(c)) && /"(content|tool_calls|reasoning_content)":/.test(c.toString());
     const scan = (c: unknown): void => {
       if (typeof c === "string" || Buffer.isBuffer(c)) tail = (tail + c.toString()).slice(-16_384);
     };
     const write = res.write.bind(res);
     const end = res.end.bind(res);
     res.write = ((c: never, ...a: never[]) => {
+      // First chunk carrying real MODEL output, not our own opening frame. Every adapter emits a
+      // `{role:"assistant"}` chunk the moment it writes headers, so timing the first write measured
+      // us, not the model — it read as ~1ms every time and made the number worthless.
+      if (ttft === null && firstOutput(c)) {
+        ttft = Date.now() - started;
+      }
       scan(c);
       return write(c, ...a);
     }) as typeof res.write;
@@ -215,7 +287,18 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
       if (u) {
         // Same row to both sinks: the file is the self-hosted record, the table is the one that
         // survives a container restart and can therefore be billed against.
-        const row = { ts: Date.now(), user: who.user, model, provider, promptTokens: u.promptTokens, completionTokens: u.completionTokens };
+        const row = {
+          ts: Date.now(),
+          user: who.user,
+          model,
+          provider,
+          promptTokens: u.promptTokens,
+          completionTokens: u.completionTokens,
+          ...(u.cacheRead != null ? { cacheRead: u.cacheRead } : {}),
+          ...(u.cacheWrite != null ? { cacheWrite: u.cacheWrite } : {}),
+          ms: Date.now() - started,
+          ...(ttft != null ? { ttftMs: ttft } : {}),
+        };
         appendUsage(row);
         void recordUsage(row); // fire-and-forget: this is response teardown, nothing can await here
       }
@@ -571,10 +654,29 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       return res.end(DEVICE_PAGE);
     }
     // Analytics dashboard shell. PRE-AUTH on purpose: the page is an empty instrument panel that
-    // holds no data — it asks for the admin key and calls the (gated) API below with it.
+    // holds no data — it asks for a credential and calls the (gated) API below with it.
     if (req.method === "GET" && url.pathname === "/admin/analytics") {
       res.writeHead(200, { "content-type": "text/html" });
       return res.end(ANALYTICS_PAGE);
+    }
+    // Analytics via shared password. ADA_ANALYTICS_PASSWORD grants the dashboard WITHOUT an admin
+    // account — for operators who want to hand a viewer credential to someone (or themselves)
+    // before the admin list is set up. The password lives in the deployment env, never in source;
+    // unset ⇒ this path is off and only the authenticated admin route below serves the data.
+    if (req.method === "GET" && url.pathname === "/v1/admin/analytics" && process.env.ADA_ANALYTICS_PASSWORD) {
+      const h = req.headers["authorization"];
+      const token = typeof h === "string" && h.startsWith("Bearer ") ? h.slice(7) : "";
+      const want = Buffer.from(process.env.ADA_ANALYTICS_PASSWORD);
+      const got = Buffer.from(token);
+      if (got.length === want.length && timingSafeEqual(got, want)) {
+        const days = Math.min(365, Math.max(1, Number(url.searchParams.get("days")) || 30));
+        try {
+          return json(res, 200, await computeAnalytics(days));
+        } catch (e) {
+          return json(res, 500, { error: { message: e instanceof Error ? e.message : String(e) } });
+        }
+      }
+      // fall through: a non-matching token may still be a real admin identity
     }
 
     let who = await identify(req);
