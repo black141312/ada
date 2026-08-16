@@ -17,7 +17,7 @@ import { deviceGrant, deviceLogin, oauthConfig } from "../server/oauth.ts";
 import { subscriptionFor, subscriptionLogin } from "../server/providers/subscription-oauth.ts";
 import { addTrust, isTrusted, loadSettings, setActiveAgentPermissions, setGlobal, setOrgPermissions, workspaceDirs, type PermRule, type Settings } from "./settings.ts";
 import { getCommands, loadExtensions } from "./extensions.ts";
-import { registerTool, setAsker } from "./tools.ts";
+import { setAsker } from "./tools.ts";
 import { addRemoteSkill, loadSkills, registerSkillTool } from "./skills.ts";
 import { memoryCommand, registerMemoryTools } from "./memory.ts";
 import { wireGraphMemory } from "./graph.ts";
@@ -33,6 +33,7 @@ import { ensureBackend, isLocalBackend } from "./autostart.ts";
 import { popularModels } from "./models.ts";
 import { route } from "../server/router.ts"; // pure model-id → provider mapping (static table, safe client-side)
 import { cancelJob, listJobs, registerSubagentTools, renderJobs } from "./background.ts";
+import { registerBrowseTool } from "./browse.ts";
 import { renderTodos } from "./todos.ts";
 import { track } from "./telemetry.ts";
 
@@ -1144,6 +1145,7 @@ async function main(): Promise<void> {
     // Delegation, same as the REPL gets. A sub-agent auto-approves its own tools: it has no stream
     // to raise an approval on, and the parent's call was already approved through the editor's UI.
     registerSubagentTools({ client, model, onApprove: async () => "yes", autoApprove: true, project: trusted, compactAt: settings.compactAt });
+    registerBrowseTool({ client, onApprove: async () => "yes", compactAt: settings.compactAt });
 
     const port = Number(process.env.ADA_HTTP_PORT) || 8788;
 
@@ -1740,6 +1742,10 @@ async function main(): Promise<void> {
     if (process.env.ADA_NO_SUBAGENTS !== "1") {
       registerSubagentTools({ client, model: pm, onApprove: async (): Promise<ApprovalDecision> => "yes", autoApprove: true, project: trusted, compactAt: settings.compactAt });
     }
+    // Outside that guard on purpose: `browse` is the only way to reach a browser now, and a worker
+    // told to build a page must still be able to look at it. It cannot fan out — its sub-agent holds
+    // the browser tool and nothing else.
+    registerBrowseTool({ client, onApprove: async (): Promise<ApprovalDecision> => "yes", compactAt: settings.compactAt });
     // `--continue` here is what lets a caller drive ada in a loop and keep ONE
     // conversation across many `-p` invocations — and, by dropping the flag, deliberately start a
     // fresh one. Without this, every headless call began from zero and both halves of that mechanic
@@ -1875,6 +1881,7 @@ async function main(): Promise<void> {
 
   // Registered before the agent snapshots its tool list, so they appear in the registry.
   registerSubagentTools({ client, model, onApprove, autoApprove, reasoning: flags.reasoning ?? settings.reasoning, project: includeProject, compactAt: settings.compactAt });
+  registerBrowseTool({ client, onApprove, compactAt: settings.compactAt });
 
   const agent = new Agent({
     client,

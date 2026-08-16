@@ -15,7 +15,7 @@ import { getDiagnostics } from "./lsp.ts";
 import { buildPptx, type PptxSlideSpec } from "./pptx.ts";
 import { buildDocx, type DocxBlock } from "./docx.ts";
 import { browserAction, tabAction, type BrowserVerb } from "./browser.ts";
-import { availableStacks, renderUiux, uiuxSearch } from "./uiux.ts";
+import { renderUiux, uiuxSearch } from "./uiux.ts";
 
 // Every tool result is appended to the transcript and resent on each subsequent step, so an
 // oversized result is paid for again and again. 12k chars (~3k tokens) is ample for a file slice or
@@ -62,6 +62,9 @@ export interface Tool {
    *  wantsLazyTools in agent.ts). Every tool schema is resent on every request, so keeping the
    *  document/image generators out of a "hi" saves ~1k tokens a call. */
   lazy?: boolean;
+  /** Never advertised to an ordinary agent — only to one that names it via `only` (see browse.ts).
+   *  For tools whose loop is expensive enough to be worth running on a cheaper model in a sub-agent. */
+  hidden?: boolean;
   run(args: Record<string, unknown>, ctx?: ToolCtx): Promise<ToolResult>;
 }
 
@@ -75,8 +78,9 @@ export function clip(s: string, max = MAX_OUTPUT): string {
   return `${s.slice(0, head)}\n… [truncated ${s.length - max} chars] …\n${s.slice(-tail)}`;
 }
 
+// ponytail: every truncation spills — head+tail stays inline, the dropped middle stays retrievable
 function truncate(s: string): string {
-  return clip(s);
+  return spillIfHuge(s);
 }
 
 /** One choice offered by ask_user. `description` is the line under the label that says what picking
@@ -247,16 +251,21 @@ function withFileLock<T>(abs: string, fn: () => Promise<T>): Promise<T> {
 }
 
 // Huge output is spilled to .ada/tmp and replaced by a head + pointer, instead of lost to truncation.
-function spillIfHuge(text: string): string {
+export function spillIfHuge(text: string): string {
   if (text.length <= MAX_OUTPUT) return text;
   try {
     const dir = join(process.cwd(), ".ada", "tmp");
     mkdirSync(dir, { recursive: true });
     const f = join(dir, `out-${Date.now()}-${Math.floor(Math.random() * 1e6)}.txt`);
     writeFileSync(f, text, "utf8");
+    // ponytail: sweep yesterday's spills on the way past — no scheduler, no lifecycle hook
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const old of readdirSync(dir)) {
+      if (Number(old.match(/^out-(\d+)-/)?.[1] ?? Infinity) < cutoff) rmSync(join(dir, old), { force: true });
+    }
     return `${clip(text)}\n[full output: ${relative(process.cwd(), f)}]`;
   } catch {
-    return truncate(text);
+    return clip(text); // not truncate() — that routes back here
   }
 }
 
@@ -637,9 +646,11 @@ export const tools: Tool[] = [
   },
   {
     // Lets the agent check its own UI work instead of asking the user "does it look right?".
-    // Lazy — most turns never touch a browser, and the schema shouldn't ride along for them.
+    // Hidden, not lazy: driving a browser is a look→act→look loop, and every `look` puts a full
+    // screenshot into the transcript. On the user's main model that is the most expensive loop in
+    // the system, so only the `browse` sub-agent (browse.ts, cheap model) gets these verbs.
     name: "browser",
-    lazy: true,
+    hidden: true,
     description:
       "Look at and act in a real browser (the system default browser, in a persistent profile — logins survive between runs). Look: `open` navigates, `look` shows you a screenshot inline, `screenshot` saves a png to disk and shows it inline too, `pdf` saves the page as PDF, `text` returns rendered text, `console` returns logs, `read` returns the accessibility tree with ref_N tags, `eval` runs JS and returns the value (best for scraping structured data). Act: `click`, `type`, `hover`, `scroll`, `select` (dropdowns), `fill` (many inputs at once via `fields`), `upload` (`files` into a file input), `drag` (to `toX`/`toY`), `press` (named keys or any single character; optional `hold` ms). Target elements by `ref` from `read`, by CSS `selector`, or by visible text via `find` — selector/find survive re-renders, refs do not. Navigate with `back`, `forward`, `reload`, and `wait` (for `selector`, `find` text, or page load; `timeout` ms) instead of guessing at timing. Tabs: `tabs`, `tab_new`, `tab_select`, `tab_close`. To drive a visual page or a game: look, act, look again — repeat.",
     parameters: {

@@ -24,7 +24,7 @@
 // ponytail: the semantic half is a cosine over a cache of the SAME MiniLM vectors @codebase already
 // builds — no new dependency, no vector DB, no index server.
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { rerank } from "./memory-rerank.ts";

@@ -237,7 +237,7 @@ export const LAZY_GATES: { tools: string[]; intent: RegExp }[] = [
   },
   { tools: ["notebook_edit"], intent: /\b(notebooks?|jupyter|ipynb|colab|(?:code|markdown) cells?)\b/i },
   {
-    tools: ["browser"],
+    tools: ["browse"],
     intent: /\b(browser|screenshots?|devtools|localhost|dev ?server|the (?:page|site|app) (?:looks?|renders?)|console\b|in chrome|open the (?:page|site|app)|preview)\b/i,
   },
 ];
@@ -306,11 +306,15 @@ function allowedLazyTools(messages: Msg[]): Set<string> {
   return allowed;
 }
 
-function buildApiTools(): ToolDef[] {
-  return tools.map((t) => ({
-    type: "function",
-    function: { name: t.name, description: t.description, parameters: t.parameters },
-  }));
+/** `only` = this agent sees exactly these tools and nothing else (a specialist sub-agent). Otherwise
+ *  hidden tools are dropped: they exist for such a specialist, not for the conversation. */
+function buildApiTools(only?: Set<string>): ToolDef[] {
+  return tools
+    .filter((t) => (only ? only.has(t.name) : !t.hidden))
+    .map((t) => ({
+      type: "function",
+      function: { name: t.name, description: t.description, parameters: t.parameters },
+    }));
 }
 
 // Pull every top-level JSON object out of a string (brace-matched, string-aware).
@@ -698,6 +702,8 @@ export function describeCall(name: string, args: Record<string, unknown>): { lab
       return { label: "sub-agent", detail: s(a.task) };
     case "background_task":
       return { label: "background", detail: s(a.task) };
+    case "browse":
+      return { label: "browse", detail: s(a.goal) };
     case "browser": {
       const text = s(a.text);
       const preview = text ? (text.length > 80 ? `${text.slice(0, 80)}…` : text) : "";
@@ -716,16 +722,43 @@ export function permPhrase(name: string, destructive: boolean): string {
   if (name === "generate_pptx") return "write a PowerPoint (.pptx) file to disk";
   if (name === "web_fetch" || name === "web_search") return "make a network request";
   if (name === "browser") return destructive ? "⚠ press Enter in the browser — this can submit a form" : "look at and act in a real browser";
+  // One approval covers the whole errand: the worker it starts acts unattended, so say so here
+  // rather than let "look at a browser" stand in for a run of clicks nobody sees.
+  if (name === "browse") return "let a browser agent carry out this errand in a real browser, unattended";
   if (name.includes("__")) return `use the ${name.split("__")[0]} connector`;
   return `run the ${name} tool`;
 }
 
-async function safeRun(tool: Tool, args: Record<string, unknown>, ctx?: ToolCtx): Promise<ToolResult> {
+// Last-resort deadline. Every tool that shells out already carries its own (bash 120s, git 30s,
+// image 180s); this only catches the ones that hang with no timer of their own.
+const TOOL_DEADLINE_MS = Number(process.env.ADA_TOOL_TIMEOUT_MS) || 600_000;
+
+export async function safeRun(tool: Tool, args: Record<string, unknown>, ctx?: ToolCtx): Promise<ToolResult> {
   try {
-    return await tool.run(args, ctx);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<ToolResult>((res) => {
+      // not unref'd on purpose: an unref'd timer never fires when the hung tool is the only thing
+      // left pending — exactly the case this exists for. clearTimeout below keeps it from lingering.
+      timer = setTimeout(() => res({ output: `${tool.name}: no result after ${Math.round(TOOL_DEADLINE_MS / 1000)}s — gave up.`, isError: true }), TOOL_DEADLINE_MS);
+    });
+    try {
+      return await Promise.race([tool.run(args, ctx), deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
   } catch (e) {
     return { output: String(e), isError: true };
   }
+}
+
+/** Advisory nudge when the model re-runs the identical call: the result won't differ, the loop will.
+ *  Counts are per session and per exact (tool, args) pair; the reminder rides along with the output. */
+export function repeatReminder(counts: Map<string, number>, name: string, args: Record<string, unknown>): string {
+  const key = `${name}:${JSON.stringify(args)}`;
+  const n = (counts.get(key) ?? 0) + 1;
+  counts.set(key, n);
+  if (n < 3) return "";
+  return `\n\n[reminder: this is call ${n} to ${name} with identical arguments. The result is the same — take a different approach.]`;
 }
 
 // The SDK collapses every network-layer failure into APIConnectionError, whose whole message is
@@ -798,6 +831,8 @@ export class Agent {
   private sessionId?: string;
   private runId?: string; // live-run registry id while send() is in flight (see live.ts)
   private editedPaths = new Set<string>(); // files this send's edit tools touched — verified before the turn ends
+  private repeatCounts = new Map<string, number>(); // (tool, args) → times run this session, for the repeat nudge
+  private restricted = false; // constructed with `only` — a specialist; skip lazy/small-talk trimming
 
   constructor(opts: {
     client: OpenAI;
@@ -814,6 +849,9 @@ export class Agent {
     /** The serve session this agent belongs to, when it has one. Handed to tools so a job can record
      *  which chat started it; undefined for the REPL and one-shot CLI, which belong to no chat. */
     sessionId?: string;
+    /** Restrict this agent to these tools (a specialist sub-agent — see browse.ts). Lazy gating and
+     *  the small-talk trim are skipped for it: its whole existence is one kind of work. */
+    only?: string[];
   }) {
     this.client = opts.client;
     this.model = opts.model;
@@ -825,7 +863,8 @@ export class Agent {
     this.compactAt = opts.compactAt || Number(process.env.ADA_COMPACT_AT) || 0;
     this.tokenBudget = opts.tokenBudget ?? (Number(process.env.ADA_TOKEN_BUDGET) || 0);
     this.sessionId = opts.sessionId;
-    this.apiTools = buildApiTools(); // snapshot the registry (incl. extension/skill/MCP tools) at construction
+    this.restricted = !!opts.only;
+    this.apiTools = buildApiTools(opts.only ? new Set(opts.only) : undefined); // snapshot the registry (incl. extension/skill/MCP tools) at construction
     this.project = opts.project ?? true;
     this.messages = [{ role: "system", content: systemPrompt(this.project) }, ...(opts.history ?? [])];
   }
@@ -1115,7 +1154,9 @@ export class Agent {
     const note = [opts?.note ?? (this.planMode ? PLAN_NOTE : null), memory, suggest].filter(Boolean).join("\n\n") || null;
     // Send only what this turn can actually use. Answering "hi" needs no repo map and no tools, so
     // it costs the base prompt alone; the next message is assembled fresh and gets the full kit.
-    const smallTalk = isSmallTalk(this.messages);
+    // A specialist's toolset IS its brief — trimming it on a short-looking message ("click login")
+    // would leave it with no way to do the one thing it exists for.
+    const smallTalk = !this.restricted && isSmallTalk(this.messages);
     // Re-gated per turn, deliberately. Making unlocked tools sticky would keep the cached prefix
     // stable, but that only pays off when the transcript is actually cached — and it isn't on the
     // OpenAI-compatible path, which never sends cache_control. Measured: sticky cost +15% input per
@@ -1125,7 +1166,9 @@ export class Agent {
     const lazyNames = new Set(tools.filter((t) => t.lazy).map((t) => t.name));
     const apiTools = smallTalk
       ? [] // no file edits, shell or search needed to say hello back
-      : this.apiTools.filter((t) => !("function" in t) || !lazyNames.has(t.function.name) || allowed.has(t.function.name));
+      : this.restricted
+        ? this.apiTools
+        : this.apiTools.filter((t) => !("function" in t) || !lazyNames.has(t.function.name) || allowed.has(t.function.name));
 
     // Stable and transient extras are sent SEPARATELY, and that separation is what makes caching
     // possible at all. Anthropic folds every system message into one parameter which sits ahead of
@@ -1294,6 +1337,8 @@ export class Agent {
       const pre = await beforeTool(name, a);
       if (pre.deny) return { output: pre.deny };
       const res = await afterTool(name, pre.args, await safeRun(tool, pre.args, { sessionId: this.sessionId, runId: this.runId, agent: this }));
+      const nudge = repeatReminder(this.repeatCounts, name, pre.args);
+      if (nudge) res.output = `${res.output ?? ""}${nudge}`;
       if (!res.isError && EDIT_TOOLS.has(name)) {
         if (typeof pre.args.path === "string") this.editedPaths.add(resolve(process.cwd(), pre.args.path));
         else this.editedPaths.add(""); // apply_patch: no single path, but the turn still edited — triggers command-based verify

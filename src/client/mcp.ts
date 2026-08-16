@@ -345,7 +345,9 @@ export async function loadMcpServers(includeProject: boolean): Promise<string[]>
           needsApproval: true,
           async run(args) {
             try {
-              const res = await rpc.call("tools/call", { name: toolName, arguments: args });
+              // A connector that never answers must not wedge the turn. 5 min is generous: real work
+              // (a build, a slow query) fits; a dead server does not.
+              const res = await withTimeout(name, rpc.call("tools/call", { name: toolName, arguments: args }), 300_000);
               const content = (res.content as Array<Record<string, unknown>>) ?? [];
               const text = content.map((c) => (c.text != null ? String(c.text) : JSON.stringify(c))).join("\n");
               return { output: text || "(no content)", isError: !!res.isError };
@@ -397,6 +399,18 @@ export async function loadMcpServers(includeProject: boolean): Promise<string[]>
 // connectors (the stdio github/slack/sentry packages, brave-search, the file-based Google
 // packages) were removed for exactly that reason; every service that offers a hosted OAuth MCP
 // server — GitHub, Slack, Sentry, Notion, Linear, Google Calendar — is here as a sign-in instead.
+// Google's Gmail and Calendar MCP servers are in DEVELOPER PREVIEW. Enabling the APIs, holding the
+// documented scopes and signing in successfully are all necessary and none of them are sufficient:
+// the project must also be enrolled in the Google Workspace Developer Preview Program, which asks
+// for "your Google Workspace account and Google Cloud project information". A personal @gmail.com
+// account has no Workspace account to give, so it cannot enrol — and every call comes back "The
+// caller does not have permission" with nothing anywhere saying why.
+//
+// Kept in the catalog because they work properly for a Workspace project that is enrolled. The
+// description carries the requirement so nobody spends an evening on scopes that were never the
+// problem. Declared above CATALOG, not below it — the literal reads it at module load.
+const GOOGLE_PREVIEW_NOTE = " (needs Google Workspace Developer Preview enrollment)";
+
 export const CATALOG: Record<string, { description: string; server: McpServerDef }> = {
   // Local tools that need no credential of any kind — they just run.
   filesystem: { description: "Local filesystem read/write", server: { command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "."] } },
@@ -439,7 +453,7 @@ export const CATALOG: Record<string, { description: string; server: McpServerDef
   // identity — it is what the sign-in was granted against, and switching it would orphan every
   // existing sign-in. If the preview ever lands, dropping `rest` restores the MCP path.
   "google-calendar-remote": {
-    description: "Google Calendar — today's events, attendees and free/busy",
+    description: `Google Calendar — today's events, attendees and free/busy${GOOGLE_PREVIEW_NOTE}`,
     server: {
       url: "https://calendarmcp.googleapis.com/mcp/v1",
       scopes: [
@@ -455,7 +469,7 @@ export const CATALOG: Record<string, { description: string; server: McpServerDef
     },
   },
   "gmail-remote": {
-    description: "Gmail — search and read mail, and draft replies (never sends)",
+    description: `Gmail — search and read mail, and draft replies (never sends)${GOOGLE_PREVIEW_NOTE}`,
     server: {
       url: "https://gmailmcp.googleapis.com/mcp/v1",
       // The two scopes Google documents for Gmail. `gmail.modify` was the obvious choice — one
@@ -471,18 +485,6 @@ export const CATALOG: Record<string, { description: string; server: McpServerDef
     },
   },
 };
-
-// Google's Gmail and Calendar MCP servers are in DEVELOPER PREVIEW. Enabling the APIs, holding the
-// documented scopes and signing in successfully are all necessary and none of them are sufficient:
-// the project must also be enrolled in the Google Workspace Developer Preview Program, which asks
-// for "your Google Workspace account and Google Cloud project information". A personal @gmail.com
-// account has no Workspace account to give, so it cannot enrol — and every call comes back "The
-// caller does not have permission" with nothing anywhere saying why.
-//
-// Kept in the catalog because they work properly for a Workspace project that is enrolled. The
-// description carries the requirement so nobody spends an evening on scopes that were never the
-// problem.
-const GOOGLE_PREVIEW_NOTE = "Google Workspace Developer Preview enrollment required";
 
 /**
  * Connectors belong to YOU, not to a checkout.
