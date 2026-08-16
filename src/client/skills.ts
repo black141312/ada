@@ -104,9 +104,12 @@ function skillDirs(includeProject: boolean): string[] {
   return [resolve(process.cwd(), ".ada", "skills"), ...pluginDirs, global, BUNDLED];
 }
 
-/** Read one `key: value` line from a SKILL.md's `---` front-matter. */
+/** Read one `key: value` line from a SKILL.md's `---` front-matter.
+ *  CRLF-tolerant: git checks these files out with native line endings on Windows, and a `\r` after
+ *  the opening `---` made the whole block miss — so 24 skills loaded with no description and no
+ *  category, invisible to find_skill's ranking and dumped into "other". */
 function frontField(md: string, key: string): string | undefined {
-  const m = md.match(/^---\n([\s\S]*?)\n---/);
+  const m = md.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   return m?.[1]?.match(new RegExp(`^${key}:\\s*(.*)$`, "m"))?.[1]?.trim();
 }
 
