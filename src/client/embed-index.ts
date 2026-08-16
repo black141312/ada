@@ -11,7 +11,7 @@
 // next upgrade if repos outgrow it.
 
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { projectRootOf } from "./brain.ts";
 import { ensureAdaDir, workspaceDirs } from "./settings.ts";

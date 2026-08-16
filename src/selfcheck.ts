@@ -11,7 +11,7 @@ import { expandPrompt } from "./client/prompts.ts";
 import { MarkdownStreamer, highlight, renderEditDiff } from "./client/render.ts";
 import { Session, list } from "./client/session.ts";
 import { loadSkills, registerSkillTool, routeConfident } from "./client/skills.ts";
-import { Agent, describeCall, parseTextToolCalls, permPhrase, readIntegrationDocs, soleIntegration, writeProjectSkills } from "./client/agent.ts";
+import { Agent, LAZY_GATES, describeCall, parseTextToolCalls, permPhrase, readIntegrationDocs, soleIntegration, writeProjectSkills } from "./client/agent.ts";
 import { userBar } from "./client/tui.ts";
 import { configuredServers, listConnectors, loadMcpServers } from "./client/mcp.ts";
 import { confidentSkill, rankSkills } from "./client/skill-router.ts";
@@ -325,6 +325,25 @@ async function main(): Promise<void> {
   assert.ok(!bridgeBlocks("https://notinstagram.com/", ["instagram.com"]), "suffix match must not catch lookalike domains");
   assert.ok(!bridgeBlocks("not a url", ["instagram.com"]), "a malformed url must not throw");
   assert.ok(!permPhrase("browser", false).startsWith("run the"), "browser needs its own perm phrase");
+
+  // --- browse: the browser loop is delegated to a cheap sub-agent, so `browser` stays hidden ---
+  {
+    const { tools } = await import("./client/tools.ts");
+    const raw = tools.find((t) => t.name === "browser");
+    // If this ever flips back to advertised, the look→act→look loop (a screenshot per step, resent
+    // every step) lands in the user's main model again — the exact cost this arrangement removes.
+    assert.ok(raw?.hidden && !raw.lazy, "the raw browser tool must be hidden, not merely lazy");
+    // The constant, not browseModel() — the resolved value depends on this machine's settings.
+    const { BROWSE_DEFAULT_MODEL } = await import("./client/browse.ts");
+    assert.match(BROWSE_DEFAULT_MODEL, /sonnet/i, "browse should default to a Sonnet (cheap, reads screenshots)");
+    assert.equal(describeCall("browse", { goal: "open localhost:5173" }).detail, "open localhost:5173");
+    assert.ok(!permPhrase("browse", false).startsWith("run the"), "browse needs its own perm phrase");
+    // The gate advertises `browse` now; a gate still naming `browser` would advertise nothing.
+    assert.ok(
+      LAZY_GATES.some((g) => g.tools.includes("browse")) && !LAZY_GATES.some((g) => g.tools.includes("browser")),
+      "the browser gate must unlock `browse`, not the hidden `browser`",
+    );
+  }
 
   // --- baked offline catalog seeds pricing/limits (no network) ---
   {

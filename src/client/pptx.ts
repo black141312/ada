@@ -6,7 +6,7 @@
 
 import { readFileSync } from "node:fs";
 import { extname, isAbsolute, resolve } from "node:path";
-import { EMU, IMAGE_TYPES, REL_NS, RT, XML_DECL, esc, imageSize, relsXml, zip } from "./ooxml.ts";
+import { EMU, IMAGE_TYPES, XML_DECL, esc, imageSize, relsXml, zip } from "./ooxml.ts";
 
 export interface PptxBullet {
   text: string;

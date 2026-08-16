@@ -20,11 +20,12 @@ const { LAZY_GATES: GATES } = await import(
 assert.equal(GATES.length, 5, `expected 5 gate groups, got ${GATES.length}`);
 const gateFor = (name) => GATES.find((g) => g.tools.includes(name));
 
+// `browse` is registered at runtime (browse.ts, from registerSubagentTools) so it isn't in this
+// static list — its gate is checked below by name instead.
 const lazy = tools.filter((t) => t.lazy).map((t) => t.name);
 assert.deepEqual(
   lazy.sort(),
   [
-    "browser",
     "convert_image",
     "create_page",
     "generate_docx",
@@ -56,7 +57,7 @@ for (const name of lazy) {
 // The doc gate is the one that fires most; it must not drag the others in with it.
 const docIntent = gateFor("generate_pptx").intent;
 const nbIntent = gateFor("notebook_edit").intent;
-const browserIntent = gateFor("browser").intent;
+const browserIntent = gateFor("browse").intent;
 assert.equal(
   nbIntent.test("make me a deck about this project"),
   false,
