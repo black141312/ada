@@ -27,6 +27,9 @@ export function scrubbedEnv(extra?: Record<string, string | undefined>): Record<
   for (const [k, v] of Object.entries(process.env)) {
     if (v !== undefined && !isSecretEnvKey(k)) out[k] = v;
   }
-  if (extra) for (const [k, v] of Object.entries(extra)) if (v !== undefined) out[k] = v;
+  // Empty is "not filled in yet", not "set it to empty". Catalog entries ship their credentials as
+  // `{ TOKEN: "" }` placeholders, and layering those over process.env CLOBBERED a variable the user
+  // had correctly exported in their shell — the server then started with no token and blamed them.
+  if (extra) for (const [k, v] of Object.entries(extra)) if (v) out[k] = v;
   return out;
 }
