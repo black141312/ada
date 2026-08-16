@@ -36,6 +36,12 @@ const { Session } = await import(
 const OpenAI = (await import("openai")).default;
 const client = new OpenAI({ apiKey: "x", baseURL });
 
+// Registered the way the CLI registers it, so the gated `browse` schema is on the wire here too.
+const { registerBrowseTool } = await import(
+  pathToFileURL(resolve("src/client/browse.ts")).href
+);
+registerBrowseTool({ client, onApprove: async () => "yes" });
+
 async function shapeOf(message) {
   const agent = new Agent({
     client,
@@ -97,14 +103,20 @@ assert.equal(deck.hasMap, true, "a deck request should carry the repo map");
 const nb = await shapeOf("fix the broken cell in analysis.ipynb");
 assert.ok(nb.names.includes("notebook_edit"), "a notebook request must advertise notebook_edit");
 assert.ok(!nb.names.includes("generate_pptx"), "a notebook request must not advertise generate_pptx");
-assert.ok(!nb.names.includes("browser"), "a notebook request must not advertise browser");
+assert.ok(!nb.names.includes("browse"), "a notebook request must not advertise browse");
 
 const ui = await shapeOf("screenshot localhost:5173 and check the console");
-assert.ok(ui.names.includes("browser"), "a UI request must advertise browser");
+assert.ok(ui.names.includes("browse"), "a UI request must advertise browse");
 assert.ok(!ui.names.includes("notebook_edit"), "a UI request must not advertise notebook_edit");
 assert.ok(!ui.names.includes("generate_docx"), "a UI request must not advertise generate_docx");
 
-assert.ok(!deck.names.includes("browser") && !deck.names.includes("notebook_edit"), "a deck request must not advertise the browser/notebook tools");
+assert.ok(!deck.names.includes("browse") && !deck.names.includes("notebook_edit"), "a deck request must not advertise the browse/notebook tools");
+
+// The raw browser verbs belong to the `browse` sub-agent alone. If they ever leak back onto a main
+// request, the whole look→act→look loop lands in the expensive model's transcript again.
+for (const s of [code, deck, nb, ui]) {
+  assert.ok(!s.names.includes("browser"), "the raw browser tool must never be advertised to a main agent");
+}
 
 // git is core, not lazy — it rides along with any real request but never with small talk.
 assert.ok(code.names.includes("git"), "a code request should carry the git tool");

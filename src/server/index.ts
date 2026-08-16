@@ -10,7 +10,7 @@ import { PORT, PROVIDERS, clientKeys, configuredProviders, isConfigured, provide
 import { type ExchangeRequest, exchangeClients, exchangeHosts, exchangeMisconfigured, handleMcpOauthExchange } from "./mcp-oauth-exchange.ts";
 import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, createSeat, disableSeat, disableSeatByExternalId, enterpriseMode, extractLastUsage, identifySeat, listSeats, loadPolicy, modelAllowed, savePolicy, upsertSeatForSSO, usageSummary, validatePolicy } from "./enterprise.ts";
 import { adminUsers, verifyIdentity } from "./identity.ts";
-import { addAllowed, isAllowedUser, listAllowed, removeAllowed } from "./allowlist.ts";
+import { addAllowed, listAllowed, removeAllowed } from "./allowlist.ts";
 import { billableUsageSince, recordUsage } from "./usage.ts";
 import { billingWebhookImplemented, checkEntitlement, effectivePlan, isFreeModel, PLANS, planFor, periodStart, setPlan, type PlanName } from "./plans.ts";
 import { checkoutUrl, createCheckout, getCheckout, setCheckoutPlan } from "./billing.ts";

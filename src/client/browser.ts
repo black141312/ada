@@ -8,7 +8,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { Bridge, RemoteBridge, isAttachable, type BridgeLike } from "./bridge.ts";
+import { Bridge, EXT_DIR, RemoteBridge, isAttachable, type BridgeLike } from "./bridge.ts";
 
 const PORT = Number(process.env.ADA_CDP_PORT) || 9222;
 const ORIGIN = `http://127.0.0.1:${PORT}`;
@@ -190,7 +190,12 @@ async function getBridge(): Promise<BridgeLike | null> {
     const exe = browserPaths().find((p) => existsSync(p));
     if (exe) {
       const profileDir = process.env.ADA_CHROME_PROFILE || "Default";
-      spawn(exe, [`--profile-directory=${profileDir}`, "about:blank"], { detached: true, stdio: "ignore" }).unref();
+      // Side-load the bridge while we're starting it anyway. Without this the extension has to be
+      // installed by hand at chrome://extensions — the one page the debugger may never touch — and
+      // Chrome drops unpacked extensions often enough that "it worked last month" isn't worth much.
+      // Verified on Chrome 151; --load-extension alone, so their other extensions stay enabled.
+      // Only bites when Chrome is CLOSED: a running instance owns the profile and ignores our flags.
+      spawn(exe, [`--profile-directory=${profileDir}`, `--load-extension=${EXT_DIR}`, "about:blank"], { detached: true, stdio: "ignore" }).unref();
       for (let i = 0; i < (strict ? 120 : 40) && !bridge.connected; i++) await new Promise((r) => setTimeout(r, 250));
     }
   }

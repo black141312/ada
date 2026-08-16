@@ -16,8 +16,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const PORT = Number(process.env.ADA_BRIDGE_PORT) || 9223;
-/** Where the extension reads the shared secret from: written into the unpacked extension folder. */
-const EXT_DIR = join(import.meta.dirname, "../../extension");
+/** Where the extension reads the shared secret from: written into the unpacked extension folder.
+ *  Exported so a Chrome we launch ourselves can side-load it with --load-extension. */
+export const EXT_DIR = join(import.meta.dirname, "../../extension");
 
 export interface BridgeTab {
   id: number;
