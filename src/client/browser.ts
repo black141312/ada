@@ -170,7 +170,12 @@ async function getBridge(): Promise<BridgeLike | null> {
     }
     bridge = null;
     bridgeMode = false;
-    if (strict) throw new Error("ADA_BROWSER_BRIDGE=1 but port 9223 is held by something that is not an ada bridge.");
+    if (strict)
+      throw new Error(
+        "ADA_BROWSER_BRIDGE=1 but port 9223 is held by something that cannot reach the browser — " +
+          "either another program owns it, or a previous ada left a bridge whose extension is gone. " +
+          "Close that process (or the Chrome it was driving) and retry.",
+      );
     return null;
   }
   // The extension retries every 2s, so this window is generous enough to catch a live one and short
@@ -583,10 +588,80 @@ async function openSession(tab?: string): Promise<{ cdp: CdpLike; tabKey: string
   return { cdp: await Cdp.open(target.webSocketDebuggerUrl!), tabKey: target.id };
 }
 
+/** The verbs a content script can serve. Everything here avoids chrome.debugger entirely: no
+ *  "ada bridge started debugging this browser" banner, and one message instead of a protocol
+ *  handshake plus several round trips. Anything needing real input events still goes through CDP. */
+const DOM_ABLE = new Set<BrowserVerb>(["read", "text", "click", "type", "screenshot", "open"]);
+
+/** Serve an action from the page itself. Returns null when this action needs the debugger after all
+ *  (a coordinate click, for instance, has no element to talk to). */
+async function viaContentScript(b: BridgeLike, action: BrowserVerb, opts: BrowserOpts): Promise<BrowserResult | null> {
+  const usable = await b.targets();
+  const picked = opts.tab ? usable.find((t) => String(t.id) === opts.tab) : (usable.find((t) => String(t.id) === selectedTabId) ?? usable[0]);
+  if (!picked) return null;
+  const tabId = picked.id;
+
+  if (opts.url) {
+    await b.call("navigate", { tabId, url: opts.url });
+    for (let i = 0; i < 40; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      const t = (await b.tabs()).find((x) => x.id === tabId);
+      if (t && t.url && !/^about:/.test(t.url)) break;
+    }
+    await new Promise((r) => setTimeout(r, 600));
+  }
+
+  if (action === "open") {
+    const t = (await b.tabs()).find((x) => x.id === tabId);
+    return { text: `Opened ${t?.url ?? "(unknown)"} — "${t?.title ?? ""}"` };
+  }
+  if (action === "screenshot") {
+    const r = (await b.call("shot", { tabId })) as { dataUrl?: string };
+    const data = r.dataUrl?.split(",")[1];
+    if (!data) return null; // fall through to CDP rather than pretend
+    const t = (await b.tabs()).find((x) => x.id === tabId);
+    return { text: t?.url ?? "(unknown)", screenshot: Buffer.from(data, "base64") };
+  }
+  if (action === "text") {
+    const r = (await b.call("dom", { tabId, action: "text" })) as { text?: string; url?: string };
+    return { text: `${r.url ?? ""}\n\n${(r.text ?? "").trim() || "(the page rendered no text)"}` };
+  }
+  if (action === "read") {
+    const r = (await b.call("dom", { tabId, action: "snapshot" })) as { url?: string; tree?: string; count?: number };
+    return { text: `${r.url ?? ""}\n\n${r.tree || "(nothing interactive on this page)"}` };
+  }
+  if (action === "click") {
+    if (opts.x !== undefined && opts.y !== undefined) return null; // coordinates need real input
+    const r = (await b.call("dom", { tabId, action: "click", arg: { ref: opts.ref, selector: opts.selector, find: opts.find } })) as { clicked?: string; url?: string };
+    return { text: `clicked ${r.clicked ?? opts.ref ?? opts.selector ?? opts.find} on ${r.url ?? ""}` };
+  }
+  if (action === "type") {
+    const r = (await b.call("dom", { tabId, action: "type", arg: { ref: opts.ref, selector: opts.selector, find: opts.find, text: opts.text ?? "" } })) as { into?: string };
+    return { text: `typed into ${r.into ?? opts.ref ?? opts.selector ?? opts.find}` };
+  }
+  return null;
+}
+
 /** Run one browser action. `url` navigates first when given; otherwise acts on the current page. */
 export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {}): Promise<BrowserResult> {
   const { url, width = 1280, height = 800 } = opts;
   if (url && bridgeMode) assertBridgeAllowed(url);
+
+  // Prefer the page over the protocol when the bridge is live and the verb allows it.
+  if (DOM_ABLE.has(action) && process.env.ADA_BROWSER_CONTENT !== "0") {
+    const b = await getBridge();
+    if (b) {
+      try {
+        const done = await viaContentScript(b, action, opts);
+        if (done) return done;
+      } catch (e) {
+        // A page that refuses injection (the Web Store, a PDF viewer) is a reason to fall back,
+        // not to fail the whole action.
+        if (process.env.ADA_BROWSER_DEBUG) console.error(`content script: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  }
+
   const { cdp, tabKey } = await openSession(opts.tab);
   const target = { id: tabKey };
   try {

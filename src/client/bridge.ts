@@ -258,7 +258,15 @@ export class RemoteBridge implements BridgeLike {
       const j = (await r.json()) as { ok?: boolean; connected?: boolean };
       if (!j.ok) return null;
       const self = new RemoteBridge(token);
-      self.up = Boolean(j.connected);
+      // /health only says a server is there. A bridge whose extension has gone (its Chrome closed,
+      // or another ada took the extension over) answers health and then swallows every command, so
+      // prove it can actually reach the browser before handing it back as usable.
+      try {
+        await self.call("tabs", {}, 2500);
+        self.up = true;
+      } catch {
+        return null;
+      }
       return self;
     } catch {
       return null; // something else owns the port, or it died between the bind failing and this check
