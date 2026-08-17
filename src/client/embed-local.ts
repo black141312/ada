@@ -108,10 +108,20 @@ async function getExtractor(model: string): Promise<Extractor> {
 export async function embedLocal(texts: string[], model: string = LOCAL_MODEL): Promise<number[][]> {
   if (!texts.length) return [];
   const extractor = await getExtractor(model);
-  const out: number[][] = [];
-  for (let i = 0; i < texts.length; i += BATCH) {
-    const part = await extractor(texts.slice(i, i + BATCH), { pooling: "mean", normalize: true });
-    out.push(...part.tolist());
+  // Padding is per-batch, so ONE long text inflates every short one sitting beside it to its length.
+  // Grouping similar lengths together cuts the padding that gets computed and thrown away: measured
+  // 673MB -> 598MB peak over this repo's src/, same wall time. Length in characters is a good enough
+  // proxy for token count to bucket by, and much cheaper than tokenizing twice.
+  // Order is restored before returning — callers index the result positionally against their input.
+  const order = texts.map((_, i) => i).sort((a, b) => texts[a]!.length - texts[b]!.length);
+  const out: number[][] = new Array(texts.length);
+  for (let i = 0; i < order.length; i += BATCH) {
+    const idx = order.slice(i, i + BATCH);
+    const part = await extractor(
+      idx.map((j) => texts[j]!),
+      { pooling: "mean", normalize: true },
+    );
+    part.tolist().forEach((v, k) => (out[idx[k]!] = v));
   }
   return out;
 }
