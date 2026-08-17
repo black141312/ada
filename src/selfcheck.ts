@@ -809,11 +809,15 @@ async function main(): Promise<void> {
   // --- @codebase semantic search: pure parts (no network / no embedding model needed) ---
   {
     const { chunkText, cosine, walkFiles } = await import("./client/embed-index.ts");
+    // Windowing is asserted against chunkText's OWN size rather than a literal, so tuning
+    // CHUNK_LINES (for encoder truncation, say) doesn't fail a test that isn't about the number.
+    // The last line still has to be covered — that's the property worth pinning.
     const chunks = chunkText(Array.from({ length: 200 }, (_, i) => `line ${i + 1}`).join("\n"));
-    assert.equal(chunks.length, 3, "200 lines → 3 chunks of 80");
+    const size = chunks[0]!.end - chunks[0]!.start + 1;
+    assert.equal(chunks.length, Math.ceil(200 / size), `200 lines → ${Math.ceil(200 / size)} chunks of ${size}`);
     assert.equal(chunks[0]!.start, 1);
-    assert.equal(chunks[1]!.start, 81);
-    assert.equal(chunks[2]!.end, 200, "last chunk ends at the last line");
+    assert.equal(chunks[1]!.start, size + 1, "windows are contiguous");
+    assert.equal(chunks.at(-1)!.end, 200, "last chunk ends at the last line");
     assert.equal(chunkText("   \n \n").length, 0, "whitespace-only text → no chunks");
     assert.ok(chunkText(`x${"y".repeat(50_000)}`)[0]!.text.length <= 6000, "long-line chunks are char-capped");
     assert.ok(Math.abs(cosine([1, 0], [1, 0]) - 1) < 1e-9, "cosine identical = 1");

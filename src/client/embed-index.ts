@@ -24,7 +24,24 @@ const EMBED_MODEL = REMOTE ? (process.env.ADA_EMBED_MODEL ?? "text-embedding-004
 const BACKEND = process.env.ADA_BACKEND_URL ?? "http://localhost:8787/v1";
 const SKIP = new Set(["node_modules", ".git", "dist", ".ada", ".next", "build", "coverage"]);
 const TEXT_EXT = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|cs|c|h|cpp|hpp|md|txt|json|yaml|yml|toml|css|scss|html|sql|sh|svelte|vue)$/i;
-const CHUNK_LINES = 80;
+/**
+ * Sized to FIT the encoder, not to look tidy. MiniLM truncates at 512 tokens, and what it drops it
+ * drops SILENTLY — those lines are then unreachable by search no matter what you ask for. Measured
+ * over this repo's own src/:
+ *
+ *   80 lines: median 1176 tok, 89% of chunks truncated, only 42% of the code ever embedded
+ *   40 lines: median  600 tok, 73% truncated, 76% embedded
+ *   30 lines: median  463 tok, 36% truncated, 90% embedded
+ *   20 lines: median  312 tok,  6% truncated, 98% embedded
+ *
+ * 30 buys most of the coverage without doubling the chunk count: a full index of src/ goes 9.2s ->
+ * 22.3s and 498KB -> 1.2MB, while peak memory is unchanged (attention scales with seq^2, so shorter
+ * chunks offset there being more of them). Rebuilds are per-changed-file after the first, so the
+ * extra seconds are paid once. 20 costs another 2.7s for 8 more points of coverage — worth
+ * revisiting if truncation ever shows up in a retrieval benchmark, which is the measurement nobody
+ * has run for THIS encoder yet (bench/memory.ts covers the memory one).
+ */
+const CHUNK_LINES = 30;
 const MAX_FILE_BYTES = 200_000;
 
 export interface Chunk {
@@ -47,7 +64,11 @@ interface Manifest {
   dead: number; // floats orphaned by replaced/deleted files, awaiting compaction
   files: Record<string, FileEntry>;
 }
-const FORMAT = 2;
+// 3: CHUNK_LINES 80 -> 30. This MUST bump with the chunk size. Staleness is decided per file by
+// content hash, so an unchanged file would keep its old 80-line ranges while edited files got 30 —
+// one index holding two chunk sizes, with the old entries still carrying the truncated vectors this
+// change exists to eliminate. The bump costs everyone one rebuild and is the only honest option.
+const FORMAT = 3;
 
 /** Split file text into fixed-size line windows, char-capped so minified/long-line files can't
  *  blow the embedding model's context window. */
