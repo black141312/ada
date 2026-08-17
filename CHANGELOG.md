@@ -4,7 +4,17 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
-## [Unreleased]
+## [0.16.1] — 2026-08-17
+
+### Fixed
+- Local embedding now indexes in batches of 8. A large repo handed the whole corpus to onnxruntime
+  in one call, which could exhaust memory and take the backend down with it — so the feature meant
+  to make context cheaper was the one that killed the process.
+
+This fix (#94) was on `main` before 0.16.0 was published but missed the tag, so 0.16.0 on npm does
+not contain it. Nothing else differs between the two releases.
+
+## [0.16.0] — 2026-08-17
 
 ### Added — the browser tool can actually automate things
 
@@ -36,6 +46,14 @@ attach a file, or read structured data back out.
   Linux box. Automating real sites means occasionally seeing what went wrong and taking over.
 
 ### Fixed
+- Oversized tool output spills to `.ada/tmp` on every path, not just `bash` and `git`. Everything
+  else truncated silently, so the middle of a long read or search was simply lost; now the head and
+  tail stay inline and the full text is retrievable. Spills older than a day are swept.
+- A hung MCP connector can no longer wedge a turn. `tools/call` had no deadline at all — only
+  `initialize` and `tools/list` did — so a server that accepted the call and never answered stalled
+  the agent indefinitely. Now 5 minutes, with a 10-minute backstop on any tool lacking its own.
+- Repeating an identical tool call three times now appends a reminder to the result, so the loop
+  breaks itself instead of spending the turn re-reading the same file.
 - `Page.navigate` no longer hangs the tool for 30 s. Some pages — anything running aggressive bot
   detection, or opening a JS dialog — never acknowledge the command even though the navigation
   commits. It now uses a 10 s timeout and ignores a missing ack; the `readyState` poll that follows
