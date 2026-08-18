@@ -1430,6 +1430,103 @@ async function main(): Promise<void> {
     assert.equal(none, null, "no command and no LSP-checkable paths → silently clean");
   }
 
+  // --- rlm: chunking + source detection ---------------------------------------------------------
+  {
+    const { rlmChunks, rlmSources } = await import("./client/agent.ts");
+    assert.deepEqual(rlmChunks("", 100, 20), [], "empty text needs no workers");
+    assert.deepEqual(rlmChunks("abc", 100, 20), ["abc"], "text under one window is one chunk");
+
+    const seq = "abcdefghij".repeat(25); // 250 chars
+    const cs = rlmChunks(seq, 100, 20);
+    assert.equal(cs.length, 3, "250 chars at stride 80 -> 3 windows, no redundant tail window");
+    assert.ok(cs.every((c) => c.length <= 100), "no window exceeds the size");
+    // Stitching the windows back by dropping each one's overlap must reproduce the source exactly:
+    // that proves they cover every char, and that the overlap really is the size claimed.
+    assert.equal(cs[0] + cs.slice(1).map((c) => c.slice(20)).join(""), seq, "windows cover the whole text");
+
+    const rDir = join(tmpdir(), `ada-rlm-${Date.now()}`);
+    mkdirSync(rDir, { recursive: true });
+    const rFile = join(rDir, "big.txt");
+    writeFileSync(rFile, "hello");
+    writeFileSync(join(rDir, "shot.png"), "x");
+    assert.deepEqual(rlmSources(`what does ${rFile} say?`), [rFile], "a real file named in the prompt is a source");
+    assert.deepEqual(rlmSources(`see ${join(rDir, "nope.txt")}`), [], "a path that does not exist is not a source");
+    assert.deepEqual(rlmSources("compare v1.2 against node.js semantics"), [], "words with dots are not paths");
+    assert.deepEqual(rlmSources(`look at ${join(rDir, "shot.png")}`), [], "binary files are skipped");
+    rmSync(rDir, { recursive: true, force: true });
+  }
+
+  // --- rlm: note grouping + the recursive fold ---------------------------------------------------
+  {
+    const { rlmGroups, rlmFold } = await import("./client/agent.ts");
+    type Eng = Parameters<typeof rlmFold>[0];
+
+    assert.deepEqual(rlmGroups([], 100), [], "no notes, no groups");
+    assert.deepEqual(rlmGroups(["a", "b", "c"], 100), [["a", "b", "c"]], "notes that fit stay in one group");
+    assert.deepEqual(rlmGroups(["aa", "bb", "cc"], 4), [["aa", "bb"], ["cc"]], "groups are packed to the size limit");
+    assert.deepEqual(rlmGroups(["xxxxx", "y"], 3), [["xxxxx"], ["y"]], "a note larger than the limit rides alone rather than being split");
+
+    // A stub Engine: the fold is control flow over spawn(), so it can be exercised with no network.
+    let calls = 0;
+    const eng = (spawn: (p: string) => Promise<string>): Eng =>
+      ({
+        step: async () => null,
+        runTools: async () => {},
+        say: () => {},
+        interrupted: () => {},
+        addUser: () => {},
+        prompt: "q",
+        noteBudget: 40_000,
+        aborted: () => false,
+        drainSteer: () => false,
+        spawn: (p: string) => {
+          calls++;
+          return spawn(p);
+        },
+        soleIntegration: () => null,
+        readDocs: async () => "",
+        writeSkills: async () => 0,
+      }) as Eng;
+
+    const small = ["one", "two"];
+    calls = 0;
+    assert.deepEqual(await rlmFold(eng(async () => "merged"), small), small, "notes that already fit are returned untouched");
+    assert.equal(calls, 0, "a fold that isn't needed spawns nobody");
+
+    const big = Array.from({ length: 10 }, (_, i) => `note ${i} `.padEnd(20_000, "x")); // 200k, over the 40k ceiling
+    calls = 0;
+    const folded = await rlmFold(eng(async () => "merged"), big);
+    assert.equal(calls, 5, "10 notes of 20k pack into 5 merge workers at a 40k ceiling");
+    assert.equal(folded.length, 5, "the fold returns one note per merge worker");
+
+    // A merge worker that returns nothing must not be allowed to delete a group's facts.
+    calls = 0;
+    const survived = await rlmFold(eng(async () => ""), big);
+    assert.deepEqual(survived, big, "a fold whose workers came back empty keeps the unfolded notes");
+    assert.equal(calls, 5, "and it stops after the one failed pass instead of folding again");
+  }
+
+  // --- leaked tool-call markup (the special-token dialect) ---------------------------------------
+  {
+    const { stripToolMarkup, TOOL_MARKUP } = await import("./client/agent.ts");
+    const call = (t: string) => `<|tool_call_begin|>functions.${t}:0<|tool_call_argument_begin|>{"command": "dir"}<|tool_call_end|>`;
+    const leak = (t: string) => `I'll process the file directly with Windows tools.<|tool_calls_section_begin|>${call(t)}<|tool_calls_section_end|>`;
+
+    assert.ok(TOOL_MARKUP.test(leak("bash")), "markup is detected even though the reply opens with ordinary prose");
+    assert.equal(stripToolMarkup(leak("bash")), "I'll process the file directly with Windows tools.", "only the prose survives");
+    assert.equal(stripToolMarkup("no markup here"), "no markup here", "ordinary text is untouched");
+    assert.equal(stripToolMarkup("a <| b"), "a <| b", "a bare <| in prose is not markup");
+
+    const parsed = parseTextToolCalls(leak("bash"));
+    assert.ok(parsed && parsed.length === 1, "the leaked call is recovered as one call");
+    assert.equal(parsed![0]!.name, "bash", "the tool name comes out of the functions. prefix");
+    assert.equal(parsed![0]!.args, `{"command": "dir"}`, "the arguments come out verbatim");
+    // What actually happened live: the model invented `functions.shell`, which this build has no tool
+    // for. An unrunnable name must not become a call — but its markup must still never be shown.
+    assert.equal(parseTextToolCalls(leak("shell")), null, "a tool this build doesn't have is not recovered");
+    assert.ok(!stripToolMarkup(leak("shell")).includes("<|"), "and its markup is stripped from the answer anyway");
+  }
+
   console.log("selfcheck OK");
   process.exit(0); // a spawned stub MCP subprocess can hold stdin open — exit cleanly
 }
