@@ -733,6 +733,11 @@ export async function rlmFold(e: Engine, notes: string[]): Promise<string[]> {
     const merged = await mapLimit(groups, RLM_CONCURRENCY, (g, i) =>
       e.spawn(
         `Merge these ${g.length} sets of notes into one set. They were written by workers who each read a different part of the same source, all answering the same question.\n\n` +
+          // Measured: a merge worker wrote its 34k result to merged-notes-batch2of3.md and replied
+          // with a pointer. Nothing reads that file — the caller only gets the reply — so that
+          // batch's facts left the run entirely. The chunk workers were told this and stayed put;
+          // the merge worker never was.
+          `Your REPLY is the merged notes. Do not open files, run tools, or write the result anywhere — a file you write is read by nobody and its contents are lost.\n\n` +
           `QUESTION: ${e.prompt}\n\n` +
           `Keep EVERY distinct fact and the quote or path it came from, and keep the part numbers. Drop only exact duplicates. Do NOT summarize, rank, or leave anything out for being minor — a later step answers from your output and cannot go back to the source.\n\n` +
           `----- NOTES ${i + 1}/${groups.length} -----\n${g.join("\n\n")}`,
