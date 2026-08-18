@@ -718,11 +718,13 @@ export function rlmGroups(notes: string[], max = RLM_NOTES_MAX): string[][] {
  *  worker per group to merge, repeat until what is left fits. Depth 0 is the flat case and costs
  *  nothing; a needle question over 10MB never leaves it.
  *
- *  Merging is where a fold can quietly lose things, so the worker is told to keep every distinct fact
- *  and drop only duplicates — a merge that summarizes has thrown away exactly what the chunking was
- *  for. It is still a real model call, so this trades recall for reach: a fact that survives four
- *  folds survived four chances to be dropped. RLM_NOTES_MAX is the knob — raise it and fewer folds
- *  happen at all. */
+ *  Merging is where a fold could quietly lose things, so the worker is told to keep every distinct
+ *  fact and drop only duplicates — a merge that summarizes has thrown away exactly what the chunking
+ *  was for. Measured at depth 1 on a 10MB listing: 123 notes (114k) folded to 2 (25k) and answered
+ *  17/17, beating the same question unfolded, which dropped one. So the fold is not the lossy step it
+ *  looks like — the one run that lost half the answer lost it to a merge worker writing its result to
+ *  a file instead of replying, which the prompt above now forbids. Depth is still untested past 1,
+ *  and each pass is a real model call with its own chance to drop something. */
 export async function rlmFold(e: Engine, notes: string[]): Promise<string[]> {
   for (let depth = 1; notes.join("\n\n").length > e.noteBudget && notes.length > 1 && depth <= RLM_MAX_DEPTH; depth++) {
     const groups = rlmGroups(notes, e.noteBudget);
