@@ -2,8 +2,8 @@
 // routes to the real provider. Streams text, runs tool calls, persists every message.
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
 import type OpenAI from "openai";
 import { loadBrain } from "./brain.ts";
 import { compact, estimateTokens, isContextOverflowError } from "./compaction.ts";
@@ -360,9 +360,31 @@ function extractJsonObjects(s: string): Array<Record<string, unknown>> {
 // Some providers (notably Ollama over a streaming connection) fail to parse a model's tool
 // call into the structured tool_calls field and leak it as raw JSON in the text content.
 // Recover it: if the reply IS a JSON tool call for a real tool, hand it back as a call.
+/** The special-token dialect: `<|tool_calls_section_begin|><|tool_call_begin|>functions.NAME:0<|tool_call_argument_begin|>{…}<|tool_call_end|>`.
+ *  Unlike leaked JSON this can start MID-ANSWER, after paragraphs of ordinary prose, so it is
+ *  detected by marker rather than by how the reply opens. */
+export const TOOL_MARKUP = /<\|tool_calls?(?:_section)?_begin\|>/;
+const TOOL_MARKUP_CALL = /<\|tool_call_begin\|>\s*(?:functions?\.)?([\w.-]+?)(?::\d+)?\s*<\|tool_call_argument_begin\|>([\s\S]*?)<\|tool_call_end\|>/g;
+
+/** Everything from the first special token on. It is never an answer, so it never reaches the user
+ *  or the transcript — whether or not a runnable call comes out of it. */
+export function stripToolMarkup(content: string): string {
+  const i = content.search(TOOL_MARKUP);
+  return i < 0 ? content : content.slice(0, i).trimEnd();
+}
+
 export function parseTextToolCalls(content: string): Array<{ name: string; args: string }> | null {
   let s = content.trim();
   if (!s) return null;
+  if (TOOL_MARKUP.test(s)) {
+    const out: Array<{ name: string; args: string }> = [];
+    for (const m of s.matchAll(TOOL_MARKUP_CALL)) {
+      const name = m[1]!;
+      if (!toolByName.has(name)) continue;
+      out.push({ name, args: m[2]!.trim() || "{}" });
+    }
+    return out.length ? out : null;
+  }
   const fence = s.match(/^```(?:json|tool(?:_call)?)?\s*([\s\S]*?)\s*```$/i);
   if (fence) s = fence[1]!.trim();
   const blocks: string[] = [];
@@ -488,6 +510,10 @@ export interface Engine {
    *  out into a separate parameter, so a system-role append leaves the conversation ending on the
    *  assistant's own last message — which Claude rejects as an assistant prefill (400). */
   addUser(text: string): void;
+  /** The user input that started this turn. */
+  readonly prompt: string;
+  /** Chars of intermediate result this model can be handed in one turn. */
+  readonly noteBudget: number;
   aborted(): boolean;
   drainSteer(): boolean;
   /** Delegate a self-contained subtask to a fresh sub-agent on the cheap model. */
@@ -612,7 +638,191 @@ const toolsmith: Orchestrator = {
 // on a model cheap enough to absorb the extra work. Put the workers on the user's model and it cost
 // 2x react for worse output — splitting one cohesive artifact along file lines leaves nobody
 // holding the whole design. Delegation survives as spawn_agent, for genuinely separable subtasks.
-const ORCHESTRATORS: Record<string, Orchestrator> = { react: reAct, single: singleShot, plan: planExecute, toolsmith };
+/** Bounded fan-out: `limit` workers pulling from one queue. Promise.all over 175 chunks would try to
+ *  stand up 175 workers at once. */
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, i: number) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (let i = next++; i < items.length; i = next++) out[i] = await fn(items[i]!, i);
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
+/** Chars per chunk worker (~15k tokens — comfortable on the cheap subagent model), and the overlap
+ *  that stops a fact straddling a boundary from being missed by both neighbours. */
+const RLM_CHUNK = 60_000;
+const RLM_OVERLAP = 2_000;
+const RLM_CONCURRENCY = 4;
+/** Fallback ceiling for note grouping. The real one is `Engine.noteBudget`, which is derived from
+ *  the answering model's own window; this is only the default for callers that have no engine. */
+const RLM_NOTES_MAX = 40_000;
+/** Fold passes before giving up and handing the root whatever is left. A pass that cannot shrink its
+ *  input stops the fold on its own, so this only bounds pathological inputs. */
+const RLM_MAX_DEPTH = 4;
+/** Named in a prompt but not worth reading as text. */
+const RLM_BINARY = /\.(png|jpe?g|gif|webp|bmp|ico|pdf|zip|gz|exe|dll|node|wasm|mp4|mp3)$/i;
+
+/** Split into overlapping windows. Exported for the self-check. */
+export function rlmChunks(text: string, size = RLM_CHUNK, overlap = RLM_OVERLAP): string[] {
+  const stride = Math.max(1, size - overlap); // stride 0 would loop forever
+  const out: string[] = [];
+  for (let i = 0; i < text.length; i += stride) {
+    out.push(text.slice(i, i + size));
+    if (i + size >= text.length) break; // this window reached the end — another would repeat its tail
+  }
+  return out;
+}
+
+/** Readable files named anywhere in the request — including the `[full output: .ada/tmp/…]` pointer
+ *  a spilled tool result leaves behind, which is the usual way something too big to read gets here. */
+export function rlmSources(prompt: string): string[] {
+  const found = new Set<string>();
+  for (const m of prompt.match(/[^\s"'`,;()<>]+\.[A-Za-z0-9]{1,8}/g) ?? []) {
+    if (RLM_BINARY.test(m)) continue;
+    const p = resolve(process.cwd(), m);
+    try {
+      if (statSync(p).isFile()) found.add(p);
+    } catch {
+      /* not a path, just a word with a dot in it */
+    }
+  }
+  return [...found];
+}
+
+/** Pack notes into groups that each fit `max`, in order. Grouped by SIZE, not by count: four notes of
+ *  30k would blow the merge worker's own window as surely as the root's. A note bigger than `max`
+ *  rides alone — grouping cannot make it fit, and splitting a worker's answer mid-fact to force it is
+ *  how a fold loses the thing it was protecting. Exported for the self-check. */
+export function rlmGroups(notes: string[], max = RLM_NOTES_MAX): string[][] {
+  const out: string[][] = [];
+  let cur: string[] = [];
+  let size = 0;
+  for (const n of notes) {
+    if (cur.length && size + n.length > max) {
+      out.push(cur);
+      cur = [];
+      size = 0;
+    }
+    cur.push(n);
+    size += n.length;
+  }
+  if (cur.length) out.push(cur);
+  return out;
+}
+
+/** THE recursive step. Chunk workers answer in parallel, but their notes still have to meet in one
+ *  context to be answered from — and on a question most chunks can answer, that pile is as unreadable
+ *  as the source was. So the notes are folded by the same move that produced them: group, spawn a
+ *  worker per group to merge, repeat until what is left fits. Depth 0 is the flat case and costs
+ *  nothing; a needle question over 10MB never leaves it.
+ *
+ *  Merging is where a fold could quietly lose things, so the worker is told to keep every distinct
+ *  fact and drop only duplicates — a merge that summarizes has thrown away exactly what the chunking
+ *  was for. Measured at depth 1 on a 10MB listing: 123 notes (114k) folded to 2 (25k) and answered
+ *  17/17, beating the same question unfolded, which dropped one. So the fold is not the lossy step it
+ *  looks like — the one run that lost half the answer lost it to a merge worker writing its result to
+ *  a file instead of replying, which the prompt above now forbids. Depth is still untested past 1,
+ *  and each pass is a real model call with its own chance to drop something. */
+export async function rlmFold(e: Engine, notes: string[]): Promise<string[]> {
+  for (let depth = 1; notes.join("\n\n").length > e.noteBudget && notes.length > 1 && depth <= RLM_MAX_DEPTH; depth++) {
+    const groups = rlmGroups(notes, e.noteBudget);
+    // Every note already fills a group alone — another pass would spawn one worker per note and
+    // shrink nothing. Stop and let the root see too much rather than burn a round proving it.
+    if (groups.length >= notes.length) break;
+    const was = notes.join("").length;
+    const merged = await mapLimit(groups, RLM_CONCURRENCY, (g, i) =>
+      e.spawn(
+        `Merge these ${g.length} sets of notes into one set. They were written by workers who each read a different part of the same source, all answering the same question.\n\n` +
+          // Measured: a merge worker wrote its 34k result to merged-notes-batch2of3.md and replied
+          // with a pointer. Nothing reads that file — the caller only gets the reply — so that
+          // batch's facts left the run entirely. The chunk workers were told this and stayed put;
+          // the merge worker never was.
+          `Your REPLY is the merged notes. Do not open files, run tools, or write the result anywhere — a file you write is read by nobody and its contents are lost.\n\n` +
+          `QUESTION: ${e.prompt}\n\n` +
+          `Keep EVERY distinct fact and the quote or path it came from, and keep the part numbers. Drop only exact duplicates. Do NOT summarize, rank, or leave anything out for being minor — a later step answers from your output and cannot go back to the source.\n\n` +
+          `----- NOTES ${i + 1}/${groups.length} -----\n${g.join("\n\n")}`,
+      ),
+    );
+    const next = merged.map((m) => String(m ?? "").trim()).filter(Boolean);
+    // A fold that lost a whole group is worse than no fold: keep the level that still has the facts
+    // and let the root deal with the size.
+    if (next.length < groups.length) {
+      e.say(`\x1b[2m• rlm: \x1b[31mfold ${depth} lost ${groups.length - next.length} group(s) — keeping the unfolded notes\x1b[0m\n`);
+      break;
+    }
+    e.say(`\x1b[2m• rlm: fold ${depth} — ${notes.length} notes (${Math.round(was / 1000)}k) → ${next.length} notes (${Math.round(next.join("").length / 1000)}k)\x1b[0m\n`);
+    notes = next;
+  }
+  return notes;
+}
+
+const rlm: Orchestrator = {
+  name: "rlm", // read a too-big blob in parallel chunks, fold the notes, answer from what is left
+  async run(e) {
+    const files = rlmSources(e.prompt);
+    const rel = files.map((f) => relative(process.cwd(), f));
+    let text = "";
+    for (const [i, f] of files.entries()) {
+      try {
+        text += `${text ? "\n\n" : ""}----- ${rel[i]} -----\n${readFileSync(f, "utf8")}`;
+      } catch {
+        /* unreadable — the others still answer */
+      }
+    }
+    // Nothing oversized to fan out over: the plain loop answers better, and with tools.
+    if (text.length <= RLM_CHUNK) {
+      e.say(`\x1b[2m• rlm: ${files.length ? "context fits the window" : "no readable file named in the request"} — running react\x1b[0m\n`);
+      return reAct.run(e);
+    }
+
+    const chunks = rlmChunks(text);
+    e.say(`\x1b[2m• rlm: ${Math.round(text.length / 1000)}k chars over ${files.length} file(s) → ${chunks.length} workers\x1b[0m\n`);
+    const ask = (c: string, i: number): Promise<string> =>
+      e.spawn(
+        `You are reading part ${i + 1} of ${chunks.length} of a larger text (${rel.join(", ")}). Answer ONLY from the text below — do not open files or run tools.\n\n` +
+          `QUESTION: ${e.prompt}\n\n` +
+          `Report what THIS part contributes to answering it, quoting the lines it comes from. Do not guess about the other parts. If this part contributes nothing, reply with exactly: NOTHING\n\n` +
+          `----- BEGIN PART ${i + 1}/${chunks.length} -----\n${c}\n----- END PART -----`,
+      );
+    // An EMPTY worker is a failure (the token leash, a dropped stream), not an answer. Measured on a
+    // 251k-char lockfile: one of five came back empty, was dropped silently, and the synthesizer read
+    // the hole in the part numbering as "the file is missing a section". Retry once, then name it.
+    const notes = await mapLimit(chunks, RLM_CONCURRENCY, async (c, i) => {
+      if (e.aborted()) return "";
+      const first = String((await ask(c, i)) ?? "").trim();
+      return first || String((await ask(c, i)) ?? "").trim();
+    });
+    if (e.aborted()) return e.interrupted();
+
+    const kept = notes.map((n, i) => ({ i, n })).filter((x) => x.n && !/^NOTHING\b/i.test(x.n));
+    const empty = notes.map((n, i) => (n ? 0 : i + 1)).filter(Boolean);
+    const quiet = notes.map((n, i) => (n && /^NOTHING\b/i.test(n) ? i + 1 : 0)).filter(Boolean);
+    e.say(
+      `\x1b[2m• rlm: ${kept.length}/${chunks.length} parts had something${quiet.length ? `, ${quiet.length} had nothing relevant` : ""}${empty.length ? `, \x1b[31m${empty.length} unread\x1b[2m` : ""}\x1b[0m\n`,
+    );
+    const labelled = kept.map((x) => `### part ${x.i + 1}/${chunks.length}\n${x.n}`);
+    const notesLen = labelled.join("\n\n").length;
+    if (notesLen > e.noteBudget) e.say(`\x1b[2m• rlm: notes ${Math.round(notesLen / 1000)}k over this model's ${Math.round(e.noteBudget / 1000)}k budget — folding\x1b[0m\n`);
+    const folded = await rlmFold(e, labelled);
+    if (e.aborted()) return e.interrupted();
+    // Both lists are stated even when empty: an unexplained gap in the part numbers is exactly what
+    // makes a synthesizer invent a reason for it.
+    const coverage =
+      `Parts that reported nothing relevant to the question: ${quiet.join(", ") || "none"}.` +
+      ` Parts that could NOT be read (their worker failed twice — content unknown, say so if it matters): ${empty.join(", ") || "none"}.`;
+    e.addUser(
+      folded.length
+        ? `Notes from workers who each read one part of ${rel.join(", ")}${folded.length < kept.length ? ", merged in passes because there were too many to read at once" : ""}. You have NOT seen the source yourself and you have NO tools on this turn — you cannot open, read or grep the file, and trying to produces nothing. Answer the original question from these notes alone, and say plainly which parts of it they do not cover.\n\n${coverage}\n\n${folded.join("\n\n")}`
+        : `Workers read all ${chunks.length} parts of ${rel.join(", ")} and none found anything bearing on the question. ${coverage} Tell the user that, and suggest what to ask instead.`,
+    );
+    await e.step({ allowTools: false });
+    e.say("\n");
+  },
+};
+
+const ORCHESTRATORS: Record<string, Orchestrator> = { react: reAct, single: singleShot, plan: planExecute, toolsmith, rlm };
 
 /** A short, transient hint naming the most relevant skills for a request (or null if none stand out). */
 function suggestSkillNote(query: string): string | null {
@@ -985,7 +1195,7 @@ export class Agent {
       }
     }
 
-    const engine = this.makeEngine(ctrl, say, interrupted, drainSteer);
+    const engine = this.makeEngine(ctrl, say, interrupted, drainSteer, input);
     this.runId = registerRun(input, ctrl.steer, this, this.sessionId);
     this.editedPaths.clear();
     try {
@@ -1040,7 +1250,7 @@ export class Agent {
 
   // ---- Engine: the harness primitives an Orchestrator composes ----
 
-  private makeEngine(ctrl: SendCtrl | undefined, say: (s: string) => void, interrupted: () => void, drainSteer: () => boolean): Engine {
+  private makeEngine(ctrl: SendCtrl | undefined, say: (s: string) => void, interrupted: () => void, drainSteer: () => boolean, prompt: string): Engine {
     const signal = ctrl?.signal;
     return {
       step: (opts) => this.modelTurn(ctrl, say, interrupted, opts),
@@ -1052,6 +1262,12 @@ export class Agent {
         this.messages.push(m);
         this.session.append(m);
       },
+      prompt,
+      // Half the compaction threshold, in chars (the codebase's token heuristic is chars/4). Half,
+      // because the other half is the system prompt and the conversation this lands in — go over and
+      // the turn compacts, which discards exactly the notes it was handed. Derived from the model,
+      // not fixed: on a large window 118k of notes is a turn, and folding them was pure loss.
+      noteBudget: Math.round(this.compactLimit() * 4 * 0.5),
       aborted: () => !!signal?.aborted,
       drainSteer,
       spawn: (prompt) => this.spawnSub(prompt),
@@ -1085,7 +1301,11 @@ export class Agent {
    *  when the cwd isn't a git repo, so a subtask never fails purely for lack of isolation. */
   private async spawnSub(prompt: string): Promise<string> {
     const model = subagentModel(this.model);
-    if (process.env.ADA_NO_SUBAGENTS !== "1") {
+    // The isolated worker takes its prompt through argv, and Windows caps a command line at 32,767
+    // chars — measured: a 60k-char argv is ENAMETOOLONG, 30k is fine. A prompt that big cannot be
+    // isolated at all, so don't pay for a worktree to discover that. (rlm's chunk workers are what
+    // hit this; they only read text out of their own prompt, so isolation bought them nothing.)
+    if (process.env.ADA_NO_SUBAGENTS !== "1" && prompt.length < 30_000) {
       try {
         const run = await runIsolatedWorker({
           cwd: process.cwd(),
@@ -1229,6 +1449,24 @@ export class Agent {
       // text back instead of streaming it — we may recover it as a real call after the stream.
       let bufferMode = false;
       let sniffed = false;
+      // Text withheld because it might be the start of a special token. A model that opens with real
+      // prose and only then emits `<|tool_call…` defeats the start-of-reply sniff above, and the raw
+      // markup goes to the user as the answer (measured: kimi-k2 on a tools-disabled turn). Anything
+      // from a `<|` on waits: it either completes into a token that is dropped, or turns out to be
+      // ordinary text and flushes on the next delta.
+      let held = "";
+      const showable = (chunk: string): string => {
+        held += chunk;
+        const i = held.indexOf("<|");
+        if (i < 0) {
+          const out = held;
+          held = "";
+          return out;
+        }
+        const out = held.slice(0, i);
+        held = held.slice(i);
+        return out;
+      };
       try {
         for await (const chunk of stream) {
           if (chunk.usage) {
@@ -1264,7 +1502,7 @@ export class Agent {
               sniffed = true;
               bufferMode = /^(```(?:json|tool)|<tool_call>|[[{])/i.test(content.trimStart());
             }
-            if (!bufferMode) say(md.push(delta.content));
+            if (!bufferMode) say(md.push(showable(delta.content)));
           }
           for (const tc of delta?.tool_calls ?? []) applyToolCallDelta(calls, tc);
         }
@@ -1278,20 +1516,29 @@ export class Agent {
         throw explainApiError(e);
       }
       think.end(); // a turn that only thought, then called a tool, still has a block to close
+      // Held text that never became a special token is just text the model happened to write with a
+      // `<|` in it — it still belongs to the user.
+      if (!bufferMode && held && !TOOL_MARKUP.test(held)) say(md.push(held));
       if (!bufferMode) say(md.end());
 
       let toolCalls = calls.filter((c): c is { id: string; name: string; args: string } => !!c);
 
-      // Recover tool calls the provider leaked into the text (Ollama-over-stream, weak models).
-      if (!toolCalls.length && bufferMode) {
+      // Recover tool calls the provider leaked into the text (Ollama-over-stream, weak models, and
+      // the special-token dialect, which streams past the sniff and so is caught by marker instead).
+      if (!toolCalls.length && (bufferMode || TOOL_MARKUP.test(content))) {
         const parsed = parseTextToolCalls(content);
         if (parsed) {
           toolCalls = parsed.map((p, i) => ({ id: `text_${this.completionTokens}_${i}`, name: p.name, args: p.args }));
           content = "";
         } else {
-          say(md.push(content) + md.end()); // looked like a call but isn't runnable — show it
+          content = stripToolMarkup(content);
+          if (bufferMode) say(md.push(content) + md.end()); // looked like a call but isn't runnable — show it
         }
       }
+      // A recovered call leaves its markup behind in the text; an unrunnable one (tools disabled this
+      // turn, or a name we don't have) leaves all of it. Neither is an answer, and neither belongs in
+      // the transcript, where it would be replayed to the model as something it apparently once said.
+      content = stripToolMarkup(content);
 
       const assistantMsg: Msg = toolCalls.length
         ? {
