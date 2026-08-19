@@ -500,8 +500,25 @@ function printTree(currentFile: string): void {
   for (const m of metas.filter((x) => !x.parent || !metas.some((y) => y.file === x.parent))) rec(m, 0);
 }
 
+/**
+ * The one place the timezone header is attached, so every backend call carries it without each call
+ * site remembering to. It is the machine's IANA zone (e.g. "Asia/Kolkata") and nothing more: the
+ * hosted analytics uses it to show WHEN and roughly WHERE Ada is used, which a server-side IP lookup
+ * would otherwise have to guess at while also handling an address it has no reason to hold.
+ * ADA_NO_TZ=1 omits it — the row is then counted everywhere except the timing and location panels.
+ */
+function tzHeader(): Record<string, string> {
+  if (process.env.ADA_NO_TZ === "1") return {};
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return tz ? { "x-ada-tz": tz } : {};
+  } catch {
+    return {}; // no ICU in this build — not worth failing a request over
+  }
+}
+
 function makeClient(): OpenAI {
-  return new OpenAI({ baseURL: BACKEND, apiKey: clientKey(), maxRetries: 0 });
+  return new OpenAI({ baseURL: BACKEND, apiKey: clientKey(), maxRetries: 0, defaultHeaders: tzHeader() });
 }
 
 interface AuthMethods {
