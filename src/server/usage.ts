@@ -20,6 +20,18 @@ export interface UsageEvent {
   provider: string;
   promptTokens: number;
   completionTokens: number;
+  /** Wall time of the whole response, and time to first token. Both were already measured at the
+   *  call site and handed to the JSONL writer; only this table dropped them, which meant latency
+   *  could not be analysed on a hosted box at all (that file is ephemeral on Cloud Run). */
+  ms?: number;
+  ttftMs?: number;
+  /** IANA zone the CLIENT reported (x-ada-tz), e.g. "Asia/Kolkata". Coarse by construction and
+   *  chosen deliberately over an IP lookup: it answers both questions we actually have — roughly
+   *  where usage comes from, and what the local hour was — without storing an address. */
+  tz?: string;
+  /** Two-letter country, only when a proxy in front of us already resolved one. We never look it
+   *  up ourselves and never store the IP it came from. */
+  country?: string;
 }
 
 const pg = () => authDatabase() as Pool;
@@ -38,7 +50,11 @@ function ensure(): Promise<void> {
            model text not null,
            provider text not null,
            prompt_tokens integer not null default 0,
-           completion_tokens integer not null default 0
+           completion_tokens integer not null default 0,
+           ms integer,
+           ttft_ms integer,
+           tz text,
+           country text
          )`
       : `create table if not exists usage_events (
            id integer primary key autoincrement,
@@ -47,15 +63,34 @@ function ensure(): Promise<void> {
            model text not null,
            provider text not null,
            prompt_tokens integer not null default 0,
-           completion_tokens integer not null default 0
+           completion_tokens integer not null default 0,
+           ms integer,
+           ttft_ms integer,
+           tz text,
+           country text
          )`;
     const idx = "create index if not exists usage_events_user_ts on usage_events (user_id, ts)";
+    // Columns added after the table shipped. `create table if not exists` is a no-op against an
+    // existing table, so without this every deployment that predates them keeps the old shape and
+    // every insert fails on the unknown column — the metering write is best-effort, so that failure
+    // would be silent and permanent. All four are nullable: rows written before this stay valid,
+    // and analytics treats null as "not captured" rather than zero.
+    const added: Array<[string, string]> = [
+      ["ms", "integer"],
+      ["ttft_ms", "integer"],
+      ["tz", "text"],
+      ["country", "text"],
+    ];
     if (usingPostgres) {
       await pg().query(ddl);
       await pg().query(idx);
+      for (const [col, type] of added) await pg().query(`alter table usage_events add column if not exists ${col} ${type}`);
     } else {
       lite().exec(ddl);
       lite().exec(idx);
+      // sqlite has no ADD COLUMN IF NOT EXISTS — ask the table what it already has.
+      const have = new Set((lite().prepare("pragma table_info(usage_events)").all() as Array<{ name: string }>).map((r) => r.name));
+      for (const [col, type] of added) if (!have.has(col)) lite().exec(`alter table usage_events add column ${col} ${type}`);
     }
   })();
   return ready;
@@ -69,13 +104,15 @@ export async function recordUsage(e: UsageEvent): Promise<void> {
     await ensure();
     if (usingPostgres) {
       await pg().query(
-        "insert into usage_events (ts, user_id, model, provider, prompt_tokens, completion_tokens) values ($1, $2, $3, $4, $5, $6)",
-        [e.ts, e.user, e.model, e.provider, e.promptTokens, e.completionTokens],
+        "insert into usage_events (ts, user_id, model, provider, prompt_tokens, completion_tokens, ms, ttft_ms, tz, country) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        [e.ts, e.user, e.model, e.provider, e.promptTokens, e.completionTokens, e.ms ?? null, e.ttftMs ?? null, e.tz ?? null, e.country ?? null],
       );
     } else {
       lite()
-        .prepare("insert into usage_events (ts, user_id, model, provider, prompt_tokens, completion_tokens) values (?, ?, ?, ?, ?, ?)")
-        .run(e.ts, e.user, e.model, e.provider, e.promptTokens, e.completionTokens);
+        .prepare(
+          "insert into usage_events (ts, user_id, model, provider, prompt_tokens, completion_tokens, ms, ttft_ms, tz, country) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .run(e.ts, e.user, e.model, e.provider, e.promptTokens, e.completionTokens, e.ms ?? null, e.ttftMs ?? null, e.tz ?? null, e.country ?? null);
     }
   } catch (err) {
     console.error("[ada] usage write failed:", err instanceof Error ? err.message : err);

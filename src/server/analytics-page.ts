@@ -44,6 +44,11 @@ export const ANALYTICS_PAGE = `<!doctype html>
   .bars .track { display:block; height:14px; border-radius:4px; background:var(--panel2); overflow:hidden; }
   .bars .fill { display:block; height:100%; border-radius:4px 0 0 4px; background:var(--s1); min-width:2px; }
   .bars .val { text-align:right; color:var(--ink2); font-family:var(--mono); font-size:11px; }
+  .hours { display:grid; grid-template-columns:repeat(24,1fr); gap:3px; align-items:end; height:110px; }
+  .hcol { display:flex; flex-direction:column; justify-content:flex-end; height:100%; }
+  .hbar { background:var(--s1); border-radius:3px 3px 0 0; min-height:2px; }
+  .hlab { text-align:center; font-family:var(--mono); font-size:9.5px; color:var(--ink2); padding-top:4px; height:14px; }
+  .note { color:var(--ink2); font-size:11.5px; margin:10px 0 0; }
   table { width:100%; border-collapse:collapse; font-size:12.5px; }
   th { text-align:left; font:500 10.5px var(--mono); letter-spacing:.08em; text-transform:uppercase; color:var(--dim); padding:6px 8px; border-bottom:1px solid var(--line); }
   td { padding:7px 8px; border-bottom:1px solid var(--line); color:var(--ink2); font-variant-numeric:tabular-nums; }
@@ -122,6 +127,21 @@ function bars(rows, nameKey, valKey, color) {
     '<span class="val">'+fmt(r[valKey])+'</span></div>').join('') + '</div>';
 }
 
+// Hour-of-day as a compact column chart. Requests are bucketed in each user's OWN local time, so
+// this reads as "when do people work", not "when is our server busy" — the two differ by however
+// spread out the user base is.
+function hourChart(hourly) {
+  const max = Math.max(1, ...hourly.map((h) => h.requests));
+  return '<div class="hours">' + hourly.map((h) =>
+    '<div class="hcol" title="' + h.hour + ':00 local &middot; ' + h.requests + ' requests">' +
+      '<div class="hbar" style="height:' + Math.round((h.requests / max) * 100) + '%"></div>' +
+      '<div class="hlab">' + (h.hour % 6 === 0 ? h.hour : '') + '</div></div>').join('') + '</div>';
+}
+
+const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function ms(v) { return v === null || v === undefined ? '—' : v >= 1000 ? (v / 1000).toFixed(1) + 's' : v + 'ms'; }
+
 function render(a) {
   $('range').style.display = '';
   const conv = a.funnel.conversionPct === null ? '—' : a.funnel.conversionPct + '%';
@@ -155,6 +175,24 @@ function render(a) {
       '<div class="card"><h2>Where to improve</h2>' + (a.insights.length ?
         '<ul class="insights">' + a.insights.map((i) => '<li class="'+i.level+'">'+esc(i.text)+'</li>').join('') + '</ul>'
         : '<p class="empty">Nothing flagged — collect more data.</p>') + '</div>' +
+    '</div>' +
+    '<div class="card"><h2>When it is used &middot; local time</h2>' + hourChart(a.timing.hourly) +
+      '<p class="note">' + (a.timing.unknownTzPct > 0
+        ? a.timing.unknownTzPct + '% of requests reported no timezone and are not shown here.'
+        : 'Every request reported a timezone.') + '</p></div>' +
+    '<div class="grid2">' +
+      '<div class="card"><h2>By weekday</h2>' + bars(a.timing.weekday.map((d) => ({ name: DOW[d.day], v: d.requests })), 'name', 'v') + '</div>' +
+      '<div class="card"><h2>Response latency</h2><table>' +
+        '<tr><th>metric</th><th style="text-align:right">p50</th><th style="text-align:right">p95</th></tr>' +
+        '<tr><td>time to first token</td><td class="num">'+ms(a.timing.latency.ttftP50)+'</td><td class="num">'+ms(a.timing.latency.ttftP95)+'</td></tr>' +
+        '<tr><td>full response</td><td class="num">'+ms(a.timing.latency.p50)+'</td><td class="num">'+ms(a.timing.latency.p95)+'</td></tr>' +
+        '</table><p class="note">' + fmt(a.timing.latency.measured) + ' measured responses.</p></div>' +
+    '</div>' +
+    '<div class="grid2">' +
+      '<div class="card"><h2>Timezones</h2>' + bars(a.locations.timezones.map((t) => ({ name: t.tz, v: t.requests })), 'name', 'v') + '</div>' +
+      '<div class="card"><h2>Countries</h2>' + (a.locations.countries.length
+        ? bars(a.locations.countries.map((c) => ({ name: c.country, v: c.requests })), 'name', 'v')
+        : '<p class="empty">No country data — the proxy in front of this server does not add a country header.</p>') + '</div>' +
     '</div>';
   wireLineHover(a.daily);
 }

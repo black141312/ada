@@ -36,6 +36,26 @@ export interface DailyPoint {
   activeUsers: number;
 }
 
+/** When Ada is used, in each user's OWN local time, and how fast it answered. */
+export interface Timing {
+  /** 24 buckets, always all present so the chart has a fixed x-axis. */
+  hourly: { hour: number; requests: number }[];
+  /** 7 buckets, 0 = Sunday. */
+  weekday: { day: number; requests: number }[];
+  /** Exact percentiles over the rows that carry a measurement. `measured` says how many that was —
+   *  without it a p95 computed from three requests reads like a fact. */
+  latency: { p50: number | null; p95: number | null; ttftP50: number | null; ttftP95: number | null; measured: number };
+  /** Share of requests whose client sent no timezone; hourly/weekday cannot see these. */
+  unknownTzPct: number;
+}
+
+/** Roughly where usage comes from. Timezone is client-reported; country only exists when a proxy
+ *  in front of the server resolved one. Neither is derived from an address we store. */
+export interface Locations {
+  timezones: { tz: string; requests: number; tokens: number; users: number }[];
+  countries: { country: string; requests: number; users: number }[];
+}
+
 export interface Insight {
   level: "good" | "info" | "warn";
   text: string;
@@ -50,8 +70,54 @@ export interface Analytics {
   topUsers: { user: string; requests: number; tokens: number; plan: PlanName; pctOfQuota: number }[];
   plans: { plan: string; users: number }[];
   funnel: { minted: number; paid: number; expired: number; pending: number; conversionPct: number | null };
+  timing: Timing;
+  locations: Locations;
   revenue: { activeSubs: number; mrr: number; currency: string } | null;
   insights: Insight[];
+}
+
+/**
+ * Minutes to add to UTC to get local time in `tz`, using the CURRENT offset.
+ *
+ * A window can straddle a DST change, so a bucket from before one lands an hour off. That is
+ * accepted: this feeds an hour-of-day histogram meant to answer "mornings or evenings", and paying
+ * for per-instant offset resolution would not change that answer. Unknown zones — a client sending
+ * something Intl does not recognise — contribute 0 rather than throwing the dashboard.
+ */
+const tzOffsetCache = new Map<string, number>();
+export function offsetMinutes(tz: string): number {
+  const hit = tzOffsetCache.get(tz);
+  if (hit !== undefined) return hit;
+  let mins = 0;
+  try {
+    // Format one instant in both UTC and the target zone and diff them. `en-CA` gives an
+    // ISO-ordered date, so Date.parse reads both back unambiguously.
+    const at = new Date();
+    const fmt = (zone: string) => new Intl.DateTimeFormat("en-CA", { timeZone: zone, hour12: false, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).format(at);
+    const asUtc = Date.parse(fmt("UTC").replace(", ", "T") + "Z");
+    const asLocal = Date.parse(fmt(tz).replace(", ", "T") + "Z");
+    if (Number.isFinite(asUtc) && Number.isFinite(asLocal)) mins = Math.round((asLocal - asUtc) / 60_000);
+  } catch {
+    mins = 0; // unrecognised zone — treat as UTC rather than dropping the requests
+  }
+  tzOffsetCache.set(tz, mins);
+  return mins;
+}
+
+/**
+ * Exact percentile of one column, by ordering and offsetting.
+ *
+ * Neither `percentile_cont` (Postgres) nor a window function is available on both engines, and an
+ * average would be the wrong statistic anyway — latency is long-tailed, so the mean sits under most
+ * of the pain. Two cheap queries beat a number nobody should act on. Returns null when nothing has
+ * been measured yet, which the dashboard renders as "—" rather than 0ms.
+ */
+async function percentile(column: "ms" | "ttft_ms", q: number, since: number): Promise<number | null> {
+  const n = Number(((await all<{ c: number }>(`select count(*) as c from usage_events where ts >= ? and ${column} is not null`, [since]))[0] ?? { c: 0 }).c);
+  if (n === 0) return null;
+  const offset = Math.min(n - 1, Math.floor(n * q));
+  const row = (await all<{ v: number }>(`select ${column} as v from usage_events where ts >= ? and ${column} is not null order by ${column} limit 1 offset ${offset}`, [since]))[0];
+  return row ? Number(row.v) : null;
 }
 
 export async function computeAnalytics(windowDays = 30): Promise<Analytics> {
@@ -142,6 +208,63 @@ export async function computeAnalytics(windowDays = 30): Promise<Analytics> {
     }
   }
 
+
+  // --- timing & location ----------------------------------------------------
+  // Local-time bucketing without a portable IANA function: sqlite has none, and doing it in
+  // Postgres only would make the dashboard disagree with itself between deployments. Instead group
+  // by (tz, absolute UTC bucket) and shift each bucket by that zone's offset here, where Intl exists.
+  //
+  // The bucket is a QUARTER hour, not an hour. Offsets are not all whole hours — India is +5:30,
+  // Nepal +5:45 — so flooring to hours first and shifting after put 09:00 IST (03:30 UTC) into the
+  // 08:00 bucket. Every real IANA offset is a multiple of 15 minutes, so at this granularity the
+  // shift is exact for every zone. Cost is 4x the rows: bounded by distinct (zone, quarter-hour)
+  // pairs that actually saw traffic, which for an admin dashboard is comfortably small.
+  const tzHourRows = await all<{ tz: string | null; h: number; c: number; t: number }>(
+    "select tz, ts / 900000 as h, count(*) as c, sum(prompt_tokens + completion_tokens) as t from usage_events where ts >= ? group by tz, h",
+    [since],
+  );
+  const hourly = Array.from({ length: 24 }, (_, hour) => ({ hour, requests: 0 }));
+  const weekday = Array.from({ length: 7 }, (_, day) => ({ day, requests: 0 }));
+  let placed = 0;
+  for (const r of tzHourRows) {
+    if (!r.tz) continue; // no timezone reported — counted in totals, invisible to these two charts
+    const localMs = Number(r.h) * 900_000 + offsetMinutes(r.tz) * 60_000;
+    const d = new Date(localMs);
+    hourly[d.getUTCHours()]!.requests += Number(r.c); // getUTC* on an already-shifted instant = local
+    weekday[d.getUTCDay()]!.requests += Number(r.c);
+    placed += Number(r.c);
+  }
+  const totalReq = Number(totalsRow.c);
+  const unknownTzPct = totalReq > 0 ? Math.round(((totalReq - placed) / totalReq) * 100) : 0;
+
+  const timing: Timing = {
+    hourly,
+    weekday,
+    latency: {
+      p50: await percentile("ms", 0.5, since),
+      p95: await percentile("ms", 0.95, since),
+      ttftP50: await percentile("ttft_ms", 0.5, since),
+      ttftP95: await percentile("ttft_ms", 0.95, since),
+      measured: Number(((await all<{ c: number }>("select count(*) as c from usage_events where ts >= ? and ms is not null", [since]))[0] ?? { c: 0 }).c),
+    },
+    unknownTzPct,
+  };
+
+  const locations: Locations = {
+    timezones: (
+      await all<{ tz: string; c: number; t: number; u: number }>(
+        "select tz, count(*) as c, sum(prompt_tokens + completion_tokens) as t, count(distinct user_id) as u from usage_events where ts >= ? and tz is not null group by tz order by c desc limit 12",
+        [since],
+      )
+    ).map((r) => ({ tz: r.tz, requests: Number(r.c), tokens: Number(r.t), users: Number(r.u) })),
+    countries: (
+      await all<{ country: string; c: number; u: number }>(
+        "select country, count(*) as c, count(distinct user_id) as u from usage_events where ts >= ? and country is not null group by country order by c desc limit 12",
+        [since],
+      )
+    ).map((r) => ({ country: r.country, requests: Number(r.c), users: Number(r.u) })),
+  };
+
   const totals = { requests: Number(totalsRow.c), tokens: Number(totalsRow.t), activeUsers: Number(totalsRow.u) };
   return {
     windowDays,
@@ -151,6 +274,8 @@ export async function computeAnalytics(windowDays = 30): Promise<Analytics> {
     models,
     topUsers,
     plans,
+    timing,
+    locations,
     funnel,
     revenue,
     insights: computeInsights({ totals, models, topUsers, funnel, revenue }),

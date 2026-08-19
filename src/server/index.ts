@@ -16,6 +16,33 @@ import { billingWebhookImplemented, checkEntitlement, effectivePlan, isFreeModel
 import { checkoutUrl, createCheckout, getCheckout, setCheckoutPlan } from "./billing.ts";
 import { createKelviqCheckout, getKelviqCatalog, handleKelviqWebhook, kelviqEnabled, verifyKelviqSignature, type KelviqEvent } from "./kelviq.ts";
 import { computeAnalytics } from "./analytics.ts";
+
+/**
+ * Where a request came from, for analytics — deliberately coarse.
+ *
+ * The timezone is what the CLIENT says it is (x-ada-tz), not something we infer. It answers the two
+ * questions the dashboard actually asks — roughly which part of the world, and what the local hour
+ * was — and it costs no geo-IP lookup and no address on disk. A client that sends nothing is simply
+ * uncounted, which is the correct default for something the user did not opt into.
+ *
+ * The country is only read, never resolved: if a proxy in front of us already put one on the
+ * request we keep the two letters. Direct-to-Cloud-Run traffic has no such header and stays null.
+ * We never store the IP that produced it.
+ */
+function originOf(req: IncomingMessage): { tz?: string; country?: string } {
+  const h = (name: string): string | undefined => {
+    const v = req.headers[name];
+    return (Array.isArray(v) ? v[0] : v)?.trim() || undefined;
+  };
+  // Validated, not trusted: these are attacker-controlled strings that become GROUP BY keys and
+  // then dashboard text. An IANA zone is letters, digits, _ + - and /; anything else is dropped
+  // rather than stored, and the length cap stops a long string bloating every row.
+  const raw = h("x-ada-tz");
+  const tz = raw && raw.length <= 64 && /^[A-Za-z0-9_+/-]+$/.test(raw) ? raw : undefined;
+  const cc = h("cf-ipcountry") ?? h("x-vercel-ip-country") ?? h("x-appengine-country") ?? h("x-client-geo-country");
+  const country = cc && /^[A-Za-z]{2}$/.test(cc) ? cc.toUpperCase() : undefined;
+  return { ...(tz ? { tz } : {}), ...(country ? { country } : {}) };
+}
 import { ANALYTICS_PAGE } from "./analytics-page.ts";
 
 /** The anonymous free-tier pseudo-identity — no account, so nothing to meter or bill. */
@@ -298,6 +325,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
           ...(u.cacheWrite != null ? { cacheWrite: u.cacheWrite } : {}),
           ms: Date.now() - started,
           ...(ttft != null ? { ttftMs: ttft } : {}),
+          ...originOf(req),
         };
         appendUsage(row);
         void recordUsage(row); // fire-and-forget: this is response teardown, nothing can await here
@@ -365,7 +393,7 @@ async function handleEmbeddings(req: IncomingMessage, res: ServerResponse, who: 
   const text = await upstream.text();
   const u = extractLastUsage(text); // embedding responses report prompt_tokens
   if (u) {
-    const row = { ts: Date.now(), user: who.user, model, provider, promptTokens: u.promptTokens, completionTokens: 0 };
+    const row = { ts: Date.now(), user: who.user, model, provider, promptTokens: u.promptTokens, completionTokens: 0, ...originOf(req) };
     appendUsage(row);
     void recordUsage(row);
   }
@@ -428,7 +456,7 @@ async function handleImages(req: IncomingMessage, res: ServerResponse, who: Iden
   });
   const text = await upstream.text();
   if (upstream.ok) {
-    const row = { ts: Date.now(), user: who.user, model, provider: "openai" as const, promptTokens: 0, completionTokens: 0 };
+    const row = { ts: Date.now(), user: who.user, model, provider: "openai" as const, promptTokens: 0, completionTokens: 0, ...originOf(req) };
     appendUsage(row);
     void recordUsage(row);
   }
