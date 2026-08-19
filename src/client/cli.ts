@@ -8,7 +8,7 @@ import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { stdin, stdout } from "node:process";
 import OpenAI from "openai";
-import { Agent, type AgentEvent, type ApprovalDecision, type OnApprove } from "./agent.ts";
+import { Agent, STRATEGIES, type AgentEvent, type ApprovalDecision, type OnApprove, isStrategy } from "./agent.ts";
 import { ApprovalRegistry, QuestionRegistry, newId, sseFrame } from "./agent-server.ts";
 import { expandPrompt, loadPrompts } from "./prompts.ts";
 import { Session, list, removeStore, resolveTranscript, stores, type SessionMeta } from "./session.ts";
@@ -1373,10 +1373,12 @@ async function main(): Promise<void> {
           let m = model;
           let resume: string | undefined;
           let effort: "low" | "medium" | "high" | undefined;
+          let strategy: string | undefined;
           let budget = 0; // 0 = uncapped, which is right for a turn somebody is sitting in front of
           try {
-            const j = JSON.parse(body || "{}") as { model?: string; resume?: string; reasoning?: string; tokenBudget?: number };
+            const j = JSON.parse(body || "{}") as { model?: string; resume?: string; reasoning?: string; tokenBudget?: number; strategy?: string };
             m = j.model || model;
+            if (j.strategy !== undefined) strategy = j.strategy;
             if (j.reasoning !== undefined && isEffort(j.reasoning)) effort = effortOf(j.reasoning);
             // A ceiling for turns nobody is watching. Interactive chat leaves this unset — you can
             // see a run wandering and stop it — but a scheduled task has no such brake, and an
@@ -1403,11 +1405,16 @@ async function main(): Promise<void> {
               return;
             }
           }
+          if (strategy !== undefined && !isStrategy(strategy)) {
+            res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: `strategy must be one of: ${STRATEGIES.join(", ")}` }));
+            return;
+          }
           const { id, rec } = makeSession(m, resume, budget);
+          if (strategy !== undefined) rec.agent.setStrategy(strategy);
           // Falls back to the serve-wide setting when the caller says nothing, so an IDE that never
           // sends the field behaves exactly as it did before this existed.
           if (effort !== undefined) rec.agent.setReasoning(effort);
-          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: id, model: m, file: rec.file, resumed: !!resume, reasoning: rec.agent.reasoning ?? "off" }));
+          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ sessionId: id, model: m, file: rec.file, resumed: !!resume, reasoning: rec.agent.reasoning ?? "off", strategy: rec.agent.getStrategy() }));
         });
         return;
       }
@@ -1530,11 +1537,13 @@ async function main(): Promise<void> {
           let mode: string | undefined;
           let model: string | undefined;
           let reasoning: string | undefined;
+          let strategy: string | undefined;
           try {
-            const parsed = JSON.parse(body || "{}") as { mode?: string; model?: string; reasoning?: string };
+            const parsed = JSON.parse(body || "{}") as { mode?: string; model?: string; reasoning?: string; strategy?: string };
             mode = parsed.mode;
             model = parsed.model;
             reasoning = parsed.reasoning;
+            strategy = parsed.strategy;
           } catch {
             /* all stay undefined */
           }
@@ -1542,12 +1551,16 @@ async function main(): Promise<void> {
             res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: 'mode must be "ask" | "plan" | "auto"' }));
             return;
           }
+          if (strategy !== undefined && !isStrategy(strategy)) {
+            res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: `strategy must be one of: ${STRATEGIES.join(", ")}` }));
+            return;
+          }
           if (reasoning !== undefined && !isEffort(reasoning)) {
             res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: 'reasoning must be "low" | "medium" | "high" | "off"' }));
             return;
           }
-          if (mode === undefined && model === undefined && reasoning === undefined) {
-            res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: "nothing to update — send mode, model and/or reasoning" }));
+          if (mode === undefined && model === undefined && reasoning === undefined && strategy === undefined) {
+            res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: "nothing to update — send mode, model, reasoning and/or strategy" }));
             return;
           }
           if (mode !== undefined) {
@@ -1559,7 +1572,9 @@ async function main(): Promise<void> {
           if (model !== undefined && model.trim()) rec.agent.setModel(model.trim());
           // Same for effort: it is a per-request field, so the next turn simply carries the new one.
           if (reasoning !== undefined) rec.agent.setReasoning(effortOf(reasoning));
-          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, mode: rec.mode, model: rec.agent.model, reasoning: rec.agent.reasoning ?? "off" }));
+          // Orchestration is chosen per turn, so switching mid-session applies from the next prompt.
+          if (strategy !== undefined) rec.agent.setStrategy(strategy);
+          res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, mode: rec.mode, model: rec.agent.model, reasoning: rec.agent.reasoning ?? "off", strategy: rec.agent.getStrategy() }));
         });
         return;
       }
