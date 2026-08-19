@@ -26,6 +26,9 @@ export type SessionEvent =
   /** The model thinking out loud, when reasoning is on — shown while the turn runs, not part of
    *  the answer. Only arrives from models that stream it. */
   | { type: "reasoning"; delta: string }
+  /** A status line about the run itself (fan-out counts, routing, folding) — not part of the
+   *  answer. Render it where "thinking…" goes, never in the message body. */
+  | { type: "progress"; text: string; level?: "warn" }
   | { type: "tool_call"; callId: string; name: string; detail: string }
   | { type: "tool_result"; callId: string; name: string; output: string; isError: boolean }
   | { type: "approval_request"; id: string; name: string; summary: string }
@@ -52,6 +55,13 @@ export interface AdaSession {
   setMode(mode: "ask" | "plan" | "auto"): Promise<void>;
   /** How hard the model thinks before answering, on models that support it. "off" clears it. */
   setReasoning(effort: "low" | "medium" | "high" | "off"): Promise<void>;
+  /** Which orchestration architecture runs the next turn. `auto` routes per request; `react` is the
+   *  plain tool loop; `rlm` reads a source too big for the window by fanning out over it.
+   *
+   *  Distinct from setMode, despite both having an "auto": mode is about PERMISSION (may it edit
+   *  without asking), strategy is about SHAPE (how the turn is run). An unknown name is a 400, not a
+   *  silent fallback. Applies from the next prompt — it never rewrites a turn already running. */
+  setStrategy(strategy: string): Promise<void>;
   /** Free the session's resources server-side. (Does not delete the on-disk transcript.) */
   close(): Promise<void>;
 }
@@ -72,7 +82,7 @@ export interface AdaClient {
    * Pass `resume: "latest"` or a `file` from `listSessions()` to reattach an existing conversation
    * (e.g. after `ada serve` restarted and the old in-memory sessionId is gone).
    */
-  session(opts?: { model?: string; resume?: string; reasoning?: "low" | "medium" | "high" | "off" }): Promise<AdaSession>;
+  session(opts?: { model?: string; resume?: string; reasoning?: "low" | "medium" | "high" | "off"; strategy?: string }): Promise<AdaSession>;
   /** On-disk session transcripts, newest first — for building a "resume which conversation?" picker. */
   listSessions(): Promise<SessionMeta[]>;
   /** Server health + the default model. */
@@ -114,7 +124,7 @@ export function createClient(baseUrl = "http://localhost:8788"): AdaClient {
       const res = await fetch(`${url}/v1/sessions`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: opts?.model, resume: opts?.resume, reasoning: opts?.reasoning }),
+        body: JSON.stringify({ model: opts?.model, resume: opts?.resume, reasoning: opts?.reasoning, strategy: opts?.strategy }),
       });
       if (!res.ok) throw new Error(`ada ${res.status}: ${await res.text().catch(() => res.statusText)}`);
       const { sessionId, file, resumed } = (await res.json()) as { sessionId: string; file: string; resumed: boolean };
@@ -165,6 +175,16 @@ export function createClient(baseUrl = "http://localhost:8788"): AdaClient {
             body: JSON.stringify({ reasoning: effort }),
           });
           if (!r.ok) throw new Error(`ada ${r.status}: could not set reasoning`);
+        },
+        async setStrategy(strategy) {
+          const r = await fetch(`${url}/v1/sessions/${sessionId}`, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ strategy }),
+          });
+          // The body names the valid strategies — surface it rather than a bare status, since the
+          // whole point of the 400 is that the caller sent a name that does not exist.
+          if (!r.ok) throw new Error(`ada ${r.status}: ${await r.text().catch(() => "could not set strategy")}`);
         },
         async close() {
           await fetch(`${url}/v1/sessions/${sessionId}`, { method: "DELETE" });

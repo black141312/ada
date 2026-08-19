@@ -1476,6 +1476,7 @@ async function main(): Promise<void> {
         interrupted: () => {},
         addUser: () => {},
         prompt: "q",
+        note: () => {},
         noteBudget: 40_000,
         aborted: () => false,
         drainSteer: () => false,

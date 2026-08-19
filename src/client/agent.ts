@@ -55,6 +55,11 @@ export function pruneToolImages(messages: Msg[], keep = 2): void {
  *  When `onEvent` is set on SendCtrl, `send()` emits these instead of writing to stdout. */
 export type AgentEvent =
   | { type: "text"; delta: string }
+  /** A status line from the orchestration itself — "175 workers", "folding", "reading docs".
+   *  Deliberately NOT text: it is about the run, not part of the answer, and a UI that appends it to
+   *  the message bubble is showing the user machinery inside the reply. Terminals print it dim; a
+   *  GUI belongs to put it wherever it shows "thinking…". */
+  | { type: "progress"; text: string; level?: "warn" }
   /** The model thinking out loud, when reasoning is on. Separate from `text` because it is not part
    *  of the answer — a caller shows it while the turn runs and drops it once the answer lands. */
   | { type: "reasoning"; delta: string }
@@ -516,6 +521,9 @@ export interface Engine {
   readonly noteBudget: number;
   aborted(): boolean;
   drainSteer(): boolean;
+  /** Say what the RUN is doing (not what the answer is). Plain text, no escapes, no newline —
+   *  each surface formats it: dim in a terminal, a status line in a GUI. */
+  note(text: string, level?: "warn"): void;
   /** Delegate a self-contained subtask to a fresh sub-agent on the cheap model. */
   spawn(prompt: string): Promise<string>;
   soleIntegration(): string | null;
@@ -599,10 +607,10 @@ const toolsmith: Orchestrator = {
   async run(e) {
     const integ = e.soleIntegration();
     if (!integ) {
-      e.say("\x1b[33mtoolsmith needs exactly one integration configured (ada mcp add <name>).\x1b[0m\n");
+      e.note("toolsmith needs exactly one integration configured (ada mcp add <name>).", "warn");
       return;
     }
-    e.say(`\x1b[2m• reading ${integ} docs…\x1b[0m\n`);
+    e.note(`reading ${integ} docs…`);
     const docs = await e.readDocs(integ);
     const plan = await e.step({
       allowTools: false,
@@ -614,10 +622,10 @@ const toolsmith: Orchestrator = {
       .filter((a) => a.length > 1)
       .slice(0, 8);
     if (!areas.length) {
-      e.say("\x1b[33mtoolsmith: could not derive capability areas from the docs.\x1b[0m\n");
+      e.note("toolsmith: could not derive capability areas from the docs.", "warn");
       return;
     }
-    e.say(`\x1b[2m• ${integ}: ${areas.join(", ")}\x1b[0m\n`);
+    e.note(`${integ}: ${areas.join(", ")}`);
     const drafts = await Promise.all(
       areas.map(async (area) => ({
         name: `${integ}-${area}`,
@@ -749,10 +757,10 @@ export async function rlmFold(e: Engine, notes: string[]): Promise<string[]> {
     // A fold that lost a whole group is worse than no fold: keep the level that still has the facts
     // and let the root deal with the size.
     if (next.length < groups.length) {
-      e.say(`\x1b[2m• rlm: \x1b[31mfold ${depth} lost ${groups.length - next.length} group(s) — keeping the unfolded notes\x1b[0m\n`);
+      e.note(`rlm: fold ${depth} lost ${groups.length - next.length} group(s) — keeping the unfolded notes`, "warn");
       break;
     }
-    e.say(`\x1b[2m• rlm: fold ${depth} — ${notes.length} notes (${Math.round(was / 1000)}k) → ${next.length} notes (${Math.round(next.join("").length / 1000)}k)\x1b[0m\n`);
+    e.note(`rlm: fold ${depth} — ${notes.length} notes (${Math.round(was / 1000)}k) → ${next.length} notes (${Math.round(next.join("").length / 1000)}k)`);
     notes = next;
   }
   return notes;
@@ -773,12 +781,12 @@ const rlm: Orchestrator = {
     }
     // Nothing oversized to fan out over: the plain loop answers better, and with tools.
     if (text.length <= RLM_CHUNK) {
-      e.say(`\x1b[2m• rlm: ${files.length ? "context fits the window" : "no readable file named in the request"} — running react\x1b[0m\n`);
+      e.note(`rlm: ${files.length ? "context fits the window" : "no readable file named in the request"} — running react`);
       return reAct.run(e);
     }
 
     const chunks = rlmChunks(text);
-    e.say(`\x1b[2m• rlm: ${Math.round(text.length / 1000)}k chars over ${files.length} file(s) → ${chunks.length} workers\x1b[0m\n`);
+    e.note(`rlm: ${Math.round(text.length / 1000)}k chars over ${files.length} file(s) → ${chunks.length} workers`);
     const ask = (c: string, i: number): Promise<string> =>
       e.spawn(
         `You are reading part ${i + 1} of ${chunks.length} of a larger text (${rel.join(", ")}). Answer ONLY from the text below — do not open files or run tools.\n\n` +
@@ -799,12 +807,13 @@ const rlm: Orchestrator = {
     const kept = notes.map((n, i) => ({ i, n })).filter((x) => x.n && !/^NOTHING\b/i.test(x.n));
     const empty = notes.map((n, i) => (n ? 0 : i + 1)).filter(Boolean);
     const quiet = notes.map((n, i) => (n && /^NOTHING\b/i.test(n) ? i + 1 : 0)).filter(Boolean);
-    e.say(
-      `\x1b[2m• rlm: ${kept.length}/${chunks.length} parts had something${quiet.length ? `, ${quiet.length} had nothing relevant` : ""}${empty.length ? `, \x1b[31m${empty.length} unread\x1b[2m` : ""}\x1b[0m\n`,
+    e.note(
+      `rlm: ${kept.length}/${chunks.length} parts had something${quiet.length ? `, ${quiet.length} had nothing relevant` : ""}${empty.length ? `, ${empty.length} unread` : ""}`,
+      empty.length ? "warn" : undefined,
     );
     const labelled = kept.map((x) => `### part ${x.i + 1}/${chunks.length}\n${x.n}`);
     const notesLen = labelled.join("\n\n").length;
-    if (notesLen > e.noteBudget) e.say(`\x1b[2m• rlm: notes ${Math.round(notesLen / 1000)}k over this model's ${Math.round(e.noteBudget / 1000)}k budget — folding\x1b[0m\n`);
+    if (notesLen > e.noteBudget) e.note(`rlm: notes ${Math.round(notesLen / 1000)}k over this model's ${Math.round(e.noteBudget / 1000)}k budget — folding`);
     const folded = await rlmFold(e, labelled);
     if (e.aborted()) return e.interrupted();
     // Both lists are stated even when empty: an unexplained gap in the part numbers is exactly what
@@ -867,12 +876,20 @@ const auto: Orchestrator = {
       );
       pick = /\bplan\b/i.test(String(answer ?? "")) ? "plan" : "react";
     }
-    e.say(`\x1b[2m• auto → ${pick}\x1b[0m\n`);
+    e.note(`auto → ${pick}`);
     await (ORCHESTRATORS[pick] ?? reAct).run(e);
   },
 };
 
 const ORCHESTRATORS: Record<string, Orchestrator> = { react: reAct, single: singleShot, plan: planExecute, toolsmith, rlm, auto };
+
+/** The strategy names `setStrategy` accepts. Exported so an API can 400 on a typo: setStrategy of an
+ *  unknown name falls back to react, which reads as "the setting did nothing" — the worst outcome for
+ *  a toggle somebody just flipped. */
+export const STRATEGIES = Object.keys(ORCHESTRATORS);
+export function isStrategy(s: unknown): s is string {
+  return typeof s === "string" && Object.prototype.hasOwnProperty.call(ORCHESTRATORS, s);
+}
 
 /** A short, transient hint naming the most relevant skills for a request (or null if none stand out). */
 function suggestSkillNote(query: string): string | null {
@@ -1313,6 +1330,12 @@ export class Agent {
         this.session.append(m);
       },
       prompt,
+      // Not routed through `say`: say() turns into a text event when a caller is listening, which is
+      // exactly the conflation this exists to undo.
+      note: (text, level) => {
+        if (ctrl?.onEvent) ctrl.onEvent({ type: "progress", text, ...(level ? { level } : {}) });
+        else if (!ctrl?.quiet) process.stdout.write(`\x1b[${level === "warn" ? "33" : "2"}m${text}\x1b[0m\n`);
+      },
       // Half the compaction threshold, in chars (the codebase's token heuristic is chars/4). Half,
       // because the other half is the system prompt and the conversation this lands in — go over and
       // the turn compacts, which discards exactly the notes it was handed. Derived from the model,
