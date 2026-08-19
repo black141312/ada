@@ -17,6 +17,7 @@ export interface Settings {
   backendKey?: string; // bearer/seat key for that backend
   model?: string;
   subagentModel?: string; // model for spawn_agent / background_task; unset = same as the main model
+  strategy?: string; // orchestration architecture every session starts in (auto | react | single | plan | toolsmith | rlm); --strategy still wins for one run
   browseModel?: string; // model that drives the browser for the `browse` tool; unset = Sonnet 4.6 (see browse.ts)
   reasoning?: "low" | "medium" | "high";
   autoApprove?: boolean;
@@ -57,10 +58,23 @@ function writeGlobal(s: Settings): void {
   }
 }
 
-/** Global settings, with project settings merged in (project overrides) when trusted. */
+// Client defaults pushed by the backend (/v1/policy). Unlike permissions — where the org may only
+// tighten — these MOVE the setting: a field the org sets wins over the same field in the local file,
+// which is the point of configuring a fleet centrally. A field the org leaves unset stays local, and
+// --model / --strategy / ADA_* still win for one run.
+let orgDefaults: Pick<Settings, "model" | "subagentModel" | "strategy"> = {};
+export function setOrgDefaults(d: Pick<Settings, "model" | "subagentModel" | "strategy">): void {
+  orgDefaults = {};
+  if (d.model) orgDefaults.model = d.model;
+  if (d.subagentModel) orgDefaults.subagentModel = d.subagentModel;
+  if (d.strategy) orgDefaults.strategy = d.strategy;
+}
+
+/** Global settings, with project settings merged in (project overrides) when trusted, and the org's
+ *  own client defaults on top of both. */
 export function loadSettings(includeProject: boolean): Settings {
   const g = readJson(GLOBAL);
-  return includeProject ? { ...g, ...readJson(PROJECT) } : g;
+  return { ...(includeProject ? { ...g, ...readJson(PROJECT) } : g), ...orgDefaults };
 }
 
 export function isTrusted(dir: string): boolean {

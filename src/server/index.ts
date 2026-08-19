@@ -8,7 +8,7 @@ import { timingSafeEqual } from "node:crypto";
 import type { ProviderName } from "../shared/types.ts";
 import { PORT, PROVIDERS, clientKeys, configuredProviders, isConfigured, providerKey, providerStatus } from "./config.ts";
 import { type ExchangeRequest, exchangeClients, exchangeHosts, exchangeMisconfigured, handleMcpOauthExchange } from "./mcp-oauth-exchange.ts";
-import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, createSeat, disableSeat, disableSeatByExternalId, enterpriseMode, extractLastUsage, identifySeat, listSeats, loadPolicy, modelAllowed, savePolicy, upsertSeatForSSO, usageSummary, validatePolicy } from "./enterprise.ts";
+import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, createSeat, disableSeat, disableSeatByExternalId, enterpriseMode, envDefaults, extractLastUsage, identifySeat, listSeats, loadPolicy, modelAllowed, savePolicy, upsertSeatForSSO, usageSummary, validatePolicy } from "./enterprise.ts";
 import { adminUsers, verifyIdentity } from "./identity.ts";
 import { addAllowed, listAllowed, removeAllowed } from "./allowlist.ts";
 import { billableUsageSince, recordUsage } from "./usage.ts";
@@ -834,7 +834,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
           throw e;
         }
         appendAudit({ ts: Date.now(), user: who.user, event: "policy_fetched", detail: "" }); // spot seats that never fetch
-        return json(res, 200, policy);
+        // Env defaults UNDER the stored policy: an admin PUT is an explicit act and outranks them.
+        return json(res, 200, { ...envDefaults(), ...(policy as Record<string, unknown>) });
       }
       if (req.method === "PUT") {
         if (who.role !== "admin") return json(res, 403, { error: { message: "admin only" } });

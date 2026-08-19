@@ -46,6 +46,11 @@ export interface PolicyRule {
 export interface Policy {
   models?: string[];
   permissions?: PolicyRule[];
+  // Client defaults the org owns, so a machine needs no local settings.json to be set up correctly.
+  // A seat that fetches these runs the org's planner and worker models whatever its own file says.
+  model?: string; // planner
+  subagentModel?: string; // workers (spawn_agent, rlm chunk + merge workers, the auto router)
+  strategy?: string; // orchestration architecture (auto | react | single | plan | toolsmith | rlm)
 }
 export interface UsageRow {
   ts: number;
@@ -261,6 +266,20 @@ export function savePolicy(p: Policy, dir = dataDir()): void {
   appendAudit({ ts: Date.now(), user: "-", event: "policy_updated", detail: JSON.stringify(p).slice(0, 300) }, dir);
 }
 
+/** Env-supplied client defaults, overlaid where the stored policy leaves a field unset.
+ *
+ *  The policy STORE is a file under ADA_DATA_DIR, which on an ephemeral or multi-region deployment
+ *  does not survive a redeploy and is not shared between regions — so config that has to outlive
+ *  either belongs in env, like every other backend setting (see config.ts). An explicit PUT still
+ *  wins while it lasts; env is the floor it falls back to. */
+export function envDefaults(): Pick<Policy, "model" | "subagentModel" | "strategy"> {
+  const out: Pick<Policy, "model" | "subagentModel" | "strategy"> = {};
+  if (process.env.ADA_DEFAULT_MODEL) out.model = process.env.ADA_DEFAULT_MODEL;
+  if (process.env.ADA_DEFAULT_SUBAGENT_MODEL) out.subagentModel = process.env.ADA_DEFAULT_SUBAGENT_MODEL;
+  if (process.env.ADA_DEFAULT_STRATEGY) out.strategy = process.env.ADA_DEFAULT_STRATEGY;
+  return out;
+}
+
 /** Validate a policy shape from the wire. Returns the typed policy or an error message. */
 export function validatePolicy(raw: unknown): { policy: Policy } | { error: string } {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { error: "policy must be a JSON object" };
@@ -279,6 +298,12 @@ export function validatePolicy(raw: unknown): { policy: Policy } | { error: stri
       if (rule.pattern !== undefined && typeof rule.pattern !== "string") return { error: "permission.pattern must be a string" };
     }
     out.permissions = r.permissions as PolicyRule[];
+  }
+  for (const k of ["model", "subagentModel", "strategy"] as const) {
+    const v = (raw as Record<string, unknown>)[k];
+    if (v === undefined) continue;
+    if (typeof v !== "string" || !v.trim()) return { error: `${k} must be a non-empty string` };
+    out[k] = v.trim();
   }
   return { policy: out };
 }

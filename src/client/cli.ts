@@ -15,7 +15,7 @@ import { Session, list, removeStore, resolveTranscript, stores, type SessionMeta
 import { deleteCredential, getCredential, listCredentials, setCredential } from "../server/credentials.ts";
 import { deviceGrant, deviceLogin, oauthConfig } from "../server/oauth.ts";
 import { subscriptionFor, subscriptionLogin } from "../server/providers/subscription-oauth.ts";
-import { addTrust, isTrusted, loadSettings, setActiveAgentPermissions, setGlobal, setOrgPermissions, workspaceDirs, type PermRule, type Settings } from "./settings.ts";
+import { addTrust, isTrusted, loadSettings, setActiveAgentPermissions, setGlobal, setOrgDefaults, setOrgPermissions, workspaceDirs, type PermRule, type Settings } from "./settings.ts";
 import { getCommands, loadExtensions } from "./extensions.ts";
 import { setAsker } from "./tools.ts";
 import { addRemoteSkill, loadSkills, registerSkillTool } from "./skills.ts";
@@ -625,8 +625,9 @@ async function applyOrgPolicy(): Promise<void> {
   try {
     const r = await fetch(`${BACKEND}/policy`, { headers: { authorization: `Bearer ${clientKey()}` }, signal: AbortSignal.timeout(3000) });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const policy = (await r.json()) as { permissions?: PermRule[] };
+    const policy = (await r.json()) as { permissions?: PermRule[]; model?: string; subagentModel?: string; strategy?: string };
     setOrgPermissions(policy.permissions ?? null);
+    setOrgDefaults(policy);
     try {
       mkdirSync(join(homedir(), ".ada"), { recursive: true });
       writeFileSync(cacheFile, JSON.stringify(policy));
@@ -638,8 +639,9 @@ async function applyOrgPolicy(): Promise<void> {
     if (!enterprise) return; // non-enterprise backend — local rules only, silently
     // Enterprise backend unreachable — fall back to the last policy we saw, and say so loudly.
     try {
-      const cached = JSON.parse(readFileSync(cacheFile, "utf8")) as { permissions?: PermRule[] };
+      const cached = JSON.parse(readFileSync(cacheFile, "utf8")) as { permissions?: PermRule[]; model?: string; subagentModel?: string; strategy?: string };
       setOrgPermissions(cached.permissions ?? null);
+      setOrgDefaults(cached);
       console.error(`\x1b[33m[warn] could not fetch org policy (${e instanceof Error ? e.message : e}) — using cached rules.\x1b[0m`);
     } catch {
       console.error(`\x1b[33m[warn] could not fetch org policy (${e instanceof Error ? e.message : e}) and no cache — org tool rules NOT applied this session.\x1b[0m`);
@@ -1718,8 +1720,8 @@ async function main(): Promise<void> {
     // creates a working directory and then drives ada inside it can't add it to
     // the interactive trustedDirs list, so without this its AGENTS.md was silently never loaded.
     const trusted = process.env.ADA_TRUST_CWD === "1" || isTrusted(process.cwd());
-    const settings = loadSettings(trusted);
     await applyOrgPolicy(); // org tool rules bind headless runs too (CI is the classic bypass path)
+    const settings = loadSettings(trusted); // after the fetch, so the org's model/strategy are in it
     let pm = flags.model ?? process.env.ADA_MODEL ?? settings.model ?? scoped[0] ?? "";
     if (!pm) {
       try {
@@ -1771,7 +1773,8 @@ async function main(): Promise<void> {
       project: trusted,
       compactAt: settings.compactAt,
     });
-    if (flags.strategy) agent.setStrategy(flags.strategy);
+    const strategy = flags.strategy ?? process.env.ADA_STRATEGY ?? settings.strategy;
+    if (strategy) agent.setStrategy(strategy);
     const text = await agent.send(flags.print, { quiet: !!flags.json });
     // `context` lets a caller that drives ada in a loop see how full the window
     // is and decide to start fresh, instead of estimating it from the usage string.
@@ -1894,7 +1897,8 @@ async function main(): Promise<void> {
     compactAt: settings.compactAt,
     history,
   });
-  if (flags.strategy) agent.setStrategy(flags.strategy);
+  const startStrategy = flags.strategy ?? process.env.ADA_STRATEGY ?? settings.strategy;
+  if (startStrategy) agent.setStrategy(startStrategy);
   if (flags.agent && !switchAgent(agent, flags.agent, settings)) console.error(`unknown agent: ${flags.agent} (configure in .ada/settings.json)`);
 
   setMode = (m: PermMode): void => {
@@ -2077,7 +2081,7 @@ async function main(): Promise<void> {
         agent.setStrategy(v);
         console.log(`strategy → ${v}`);
       } else {
-        console.log(`strategy: ${agent.getStrategy()} (react | single | plan | toolsmith | rlm)`);
+        console.log(`strategy: ${agent.getStrategy()} (auto | react | single | plan | toolsmith | rlm)`);
       }
       continue;
     }

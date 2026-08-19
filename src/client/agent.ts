@@ -822,7 +822,57 @@ const rlm: Orchestrator = {
   },
 };
 
-const ORCHESTRATORS: Record<string, Orchestrator> = { react: reAct, single: singleShot, plan: planExecute, toolsmith, rlm };
+/** Openings that mean "answer me", not "go do a project". A question never wants a plan phase, and
+ *  routing one costs a model call to learn what the first word already said. */
+const AUTO_QUESTION = /^(what|why|how|where|who|which|when|is|are|was|does|do|did|can|could|should|explain|show|list|find|tell|describe|summari[sz]e)\b/i;
+/** Below this a request is a remark, not a project. Chosen to sit under a one-line instruction. */
+const AUTO_SHORT = 120;
+
+/** The free half of the routing decision: a strategy name, or null for "the signals don't say".
+ *  Pure, so the self-check can pin it. Exported for that. */
+export function autoRoute(prompt: string): "rlm" | "react" | null {
+  // A source too big to read decides on its own. Safe even if it turns out to fit — rlm's own first
+  // step hands back to react in that case.
+  for (const f of rlmSources(prompt)) {
+    try {
+      if (statSync(f).size > RLM_CHUNK) return "rlm";
+    } catch {
+      /* vanished between the two calls */
+    }
+  }
+  if (prompt.trim().length < AUTO_SHORT) return "react";
+  if (AUTO_QUESTION.test(prompt.trim())) return "react";
+  return null;
+}
+
+/** Pick the architecture per request instead of pinning one.
+ *
+ *  Cheap signals first and a model call only when they don't decide, because the alternative — a
+ *  classifier on every turn — taxes every "what does this do?" to serve the rare request where the
+ *  answer is interesting. When it does ask, it asks the SUB-AGENT model: routing is a one-word
+ *  judgement, the cheapest thing in the system to get a second opinion from.
+ *
+ *  Unrecognised answers fall to react. A router that fails should cost you the plan phase, never the
+ *  turn. */
+const auto: Orchestrator = {
+  name: "auto", // route per request: react | plan | rlm
+  async run(e) {
+    let pick: string | null = autoRoute(e.prompt);
+    if (!pick) {
+      const answer = await e.spawn(
+        `Classify this request for an autonomous coding agent. Reply with ONE word, nothing else.\n\n` +
+          `plan — the request is a change across several files or steps, where deciding the approach before touching anything is worth a turn.\n` +
+          `react — everything else: a question, one edit, a bug to look at, a command to run, exploration.\n\n` +
+          `When unsure, answer react.\n\nREQUEST: ${e.prompt}`,
+      );
+      pick = /\bplan\b/i.test(String(answer ?? "")) ? "plan" : "react";
+    }
+    e.say(`\x1b[2m• auto → ${pick}\x1b[0m\n`);
+    await (ORCHESTRATORS[pick] ?? reAct).run(e);
+  },
+};
+
+const ORCHESTRATORS: Record<string, Orchestrator> = { react: reAct, single: singleShot, plan: planExecute, toolsmith, rlm, auto };
 
 /** A short, transient hint naming the most relevant skills for a request (or null if none stand out). */
 function suggestSkillNote(query: string): string | null {
