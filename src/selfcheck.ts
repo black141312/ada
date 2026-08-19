@@ -1550,6 +1550,45 @@ async function main(): Promise<void> {
     rmSync(aDir, { recursive: true, force: true });
   }
 
+  // --- org-pushed client defaults (model / worker model / strategy) ------------------------------
+  {
+    const { envDefaults, validatePolicy } = await import("./server/enterprise.ts");
+    const { setOrgDefaults, loadSettings } = await import("./client/settings.ts");
+
+    // Server: env supplies the defaults, so they survive a redeploy of an ephemeral instance.
+    const saved = { m: process.env.ADA_DEFAULT_MODEL, s: process.env.ADA_DEFAULT_STRATEGY };
+    delete process.env.ADA_DEFAULT_MODEL;
+    delete process.env.ADA_DEFAULT_STRATEGY;
+    assert.deepEqual(envDefaults(), {}, "no env, no defaults — the backend stays out of the way");
+    process.env.ADA_DEFAULT_MODEL = "org/planner";
+    process.env.ADA_DEFAULT_STRATEGY = "auto";
+    assert.deepEqual(envDefaults(), { model: "org/planner", strategy: "auto" }, "env defaults are picked up");
+    if (saved.m === undefined) delete process.env.ADA_DEFAULT_MODEL;
+    else process.env.ADA_DEFAULT_MODEL = saved.m;
+    if (saved.s === undefined) delete process.env.ADA_DEFAULT_STRATEGY;
+    else process.env.ADA_DEFAULT_STRATEGY = saved.s;
+
+    // Server: an admin PUT may carry them, but not as junk.
+    const ok = validatePolicy({ model: "  org/planner  ", subagentModel: "org/worker", strategy: "rlm" });
+    assert.ok("policy" in ok && ok.policy.model === "org/planner", "a pushed model is accepted and trimmed");
+    assert.ok("error" in validatePolicy({ model: 7 }), "a non-string model is rejected");
+    assert.ok("error" in validatePolicy({ strategy: "  " }), "an empty strategy is rejected");
+
+    // Client: an org-set field MOVES the setting — it wins over the local file. An unset field
+    // leaves the local value alone.
+    const before = loadSettings(false);
+    setOrgDefaults({ model: "org/planner", subagentModel: "org/worker", strategy: "auto" });
+    const during = loadSettings(false);
+    assert.equal(during.model, "org/planner", "the org's planner model wins over the local file");
+    assert.equal(during.subagentModel, "org/worker", "the org's worker model wins too");
+    assert.equal(during.strategy, "auto", "and the strategy");
+    setOrgDefaults({ strategy: "rlm" });
+    assert.equal(loadSettings(false).strategy, "rlm", "a later push replaces the earlier one");
+    assert.equal(loadSettings(false).model, before.model, "a field the org does NOT set stays local");
+    setOrgDefaults({}); // don't leak org state into the checks below
+    assert.deepEqual(loadSettings(false), before, "clearing the org defaults restores the local settings exactly");
+  }
+
   console.log("selfcheck OK");
   process.exit(0); // a spawned stub MCP subprocess can hold stdin open — exit cleanly
 }
