@@ -1527,6 +1527,29 @@ async function main(): Promise<void> {
     assert.ok(!stripToolMarkup(leak("shell")).includes("<|"), "and its markup is stripped from the answer anyway");
   }
 
+  // --- auto routing: the free half of the decision ----------------------------------------------
+  {
+    const { autoRoute } = await import("./client/agent.ts");
+
+    assert.equal(autoRoute("fix the typo in the header"), "react", "a short instruction needs no router call");
+    assert.equal(autoRoute("what does the compaction threshold do, and where is it set in this repo?"), "react", "a question is never a plan, however long");
+    assert.equal(
+      autoRoute("Migrate every provider adapter onto the new streaming interface, update their tests, and delete the old shim once nothing imports it."),
+      null,
+      "a long non-question is handed to the router rather than guessed at",
+    );
+
+    const aDir = join(tmpdir(), `ada-auto-${Date.now()}`);
+    mkdirSync(aDir, { recursive: true });
+    const big = join(aDir, "big.log");
+    const small = join(aDir, "small.log");
+    writeFileSync(big, "x".repeat(70_000)); // over one chunk
+    writeFileSync(small, "x".repeat(100));
+    assert.equal(autoRoute(`what is in ${big}?`), "rlm", "an oversized source outranks the question opening");
+    assert.equal(autoRoute(`what is in ${small}?`), "react", "a small file does not trigger the fan-out");
+    rmSync(aDir, { recursive: true, force: true });
+  }
+
   console.log("selfcheck OK");
   process.exit(0); // a spawned stub MCP subprocess can hold stdin open — exit cleanly
 }

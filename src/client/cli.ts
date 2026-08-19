@@ -1771,7 +1771,8 @@ async function main(): Promise<void> {
       project: trusted,
       compactAt: settings.compactAt,
     });
-    if (flags.strategy) agent.setStrategy(flags.strategy);
+    const strategy = flags.strategy ?? process.env.ADA_STRATEGY ?? settings.strategy;
+    if (strategy) agent.setStrategy(strategy);
     const text = await agent.send(flags.print, { quiet: !!flags.json });
     // `context` lets a caller that drives ada in a loop see how full the window
     // is and decide to start fresh, instead of estimating it from the usage string.
@@ -1894,7 +1895,8 @@ async function main(): Promise<void> {
     compactAt: settings.compactAt,
     history,
   });
-  if (flags.strategy) agent.setStrategy(flags.strategy);
+  const startStrategy = flags.strategy ?? process.env.ADA_STRATEGY ?? settings.strategy;
+  if (startStrategy) agent.setStrategy(startStrategy);
   if (flags.agent && !switchAgent(agent, flags.agent, settings)) console.error(`unknown agent: ${flags.agent} (configure in .ada/settings.json)`);
 
   setMode = (m: PermMode): void => {
@@ -2077,7 +2079,7 @@ async function main(): Promise<void> {
         agent.setStrategy(v);
         console.log(`strategy → ${v}`);
       } else {
-        console.log(`strategy: ${agent.getStrategy()} (react | single | plan | toolsmith | rlm)`);
+        console.log(`strategy: ${agent.getStrategy()} (auto | react | single | plan | toolsmith | rlm)`);
       }
       continue;
     }

@@ -17,6 +17,7 @@ export interface Settings {
   backendKey?: string; // bearer/seat key for that backend
   model?: string;
   subagentModel?: string; // model for spawn_agent / background_task; unset = same as the main model
+  strategy?: string; // orchestration architecture every session starts in (auto | react | single | plan | toolsmith | rlm); --strategy still wins for one run
   browseModel?: string; // model that drives the browser for the `browse` tool; unset = Sonnet 4.6 (see browse.ts)
   reasoning?: "low" | "medium" | "high";
   autoApprove?: boolean;
