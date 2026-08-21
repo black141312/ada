@@ -6,36 +6,96 @@ All notable changes to ada are documented here. The format is based on
 
 ## [0.16.2] — 2026-08-21
 
+### Added — `rlm`, and a strategy chosen per request
+
+- **`--strategy rlm` answers from a source too big to read.** A question about something that does not fit
+  the window had one answer until now: `compact`, which summarizes the transcript *before* the question is
+  asked, so whatever the summary dropped is gone. `rlm` never summarizes. It chunks the source, gives one
+  worker per chunk the question already in hand, and answers from their notes — the root model never sees a
+  byte of the source. Chunks overlap by 2k so a fact on a boundary is not missed by both neighbours, and
+  `rlmFold` recurses only once the notes outgrow the answering model, because a fold that fires when it need
+  not costs recall for nothing (8/17 folded vs 16/17 unfolded on the same question). Measured on real files:
+  4/4 finding .pem paths in a 10MB listing, 67/68 pre-1.0 packages in a 251k lockfile, 16/17 directories in
+  that same listing, and no fabricated results in any run.
+- **`strategy` is a settings key, and the new `auto` routes per request.** It was flag-only, so every session
+  started in `react` unless you remembered `--strategy`; it now resolves flag > `ADA_STRATEGY` >
+  `settings.json` like every other default. `auto` asks the cheap signals first and a model only when they do
+  not decide, because a classifier on every turn taxes every "what does this do?" to serve the rare request
+  where the answer is interesting: a named source bigger than one chunk goes to `rlm`, anything under 120
+  characters or opening like a question goes to `react`, and the rest costs one word from the worker model.
+  An unrecognised answer falls back to `react` — a failed router should cost you the plan phase, never the
+  turn. `single` and `toolsmith` are never routed to.
+
+### Added — a GUI can drive orchestration and watch it run
+
+- `strategy` joins model/mode/reasoning on `POST /v1/sessions` and `PATCH /v1/sessions/:id`, and rides the
+  same per-turn sync, so flipping it mid-conversation applies from the next prompt. An unknown name is a 400
+  that names the valid ones rather than a silent fallback to `react`, which reads as "the setting did
+  nothing" — the worst outcome for a control somebody just flipped. `session({strategy})` and
+  `AdaSession.setStrategy()` mirror it in the SDK.
+- **A `progress` event, and `Engine.note()` to emit it.** Every orchestrator status line went through
+  `say()`, which becomes a `text` event when a caller is listening — so "175 workers" arrived as part of the
+  assistant message, ANSI escapes and all. `note()` takes plain text and each surface formats it: dim
+  (yellow for warn) in a terminal, a status line in a GUI.
+
+### Added — analytics can say when usage happens, and how fast it answered
+
+- **Latency is kept.** `ms` and `ttftMs` were measured at the call site, handed to the JSONL writer, then
+  dropped at the table — so on a hosted box, where that file is ephemeral, latency could not be analysed at
+  all. They are columns now, and the dashboard shows p50/p95 for both, computed by ordering rather than
+  averaging: latency is long-tailed and a mean sits under most of the pain.
+- **Rough location, without holding an address.** Clients send their IANA zone (`x-ada-tz`); country is kept
+  only when a proxy in front of us already resolved one, and is never looked up. `ADA_NO_TZ=1` opts out.
+  Hour-of-day is bucketed in each user's own local time, so the chart reads as "when do people work" rather
+  than "when is the server busy" — bucketed by quarter hour, because India is +5:30 and Nepal +5:45, and
+  flooring to hours before shifting put 09:00 IST in the 08:00 column.
+
+### Changed — local embedding chunks at 30 lines
+
+MiniLM truncates at 512 tokens. An 80-line code chunk tokenizes to a median 1176, so the tail was cut and
+those lines became unreachable by search — no query could reach them, and nothing anywhere said so. Measured
+over this repo's `src/`: at 80 lines, 89% of chunks were truncated and 42% of the content was ever embedded;
+at 30 lines, 36% and 90%. The cost is one slower first index (9.2s → 22.3s over `src/`, 498KB → 1.2MB on
+disk); peak memory is unchanged, since attention scales with seq² and the shorter sequences offset there
+being more of them.
+
+`FORMAT` bumps to 3 because it has to: staleness is per-file by content hash, so without it an unchanged file
+would keep its 80-line ranges while edited files got 30 — one index holding two chunk sizes, the old half
+still carrying the truncated vectors this removes. **Everyone re-indexes once.**
+
+Each embed batch is also length-sorted. Padding is per-batch, so one long text inflated every short one next
+to it; grouping by length cut peak memory from 673MB to 598MB over the same work, at the same wall time.
+
 ### Fixed — the browser tool acts on the page again
 
-Three separate faults, each of which let an action report success while the page never saw it.
+Three faults, each of which let an action report success while the page never saw it.
 
-- **The bridge stopped answering after its first command.** The extension starts a `connect()` loop from
-  four places (`onInstalled`, `onStartup`, the 30s alarm, and worker wake) and every failed attempt
-  scheduled another, so the loops multiplied instead of replacing each other — each holding its own
-  stream socket open. Six of them reach Chrome's per-host connection limit, at which point the
-  extension's `POST /result` can no longer get a connection: commands ran in the browser and their
-  answers were lost on the way back. It surfaced as every op timing out a few seconds after the first
-  one worked. The bridge now closes a superseded stream, and the extension refuses to start a second
-  connect loop.
-- **Clicks were dropped on a freshly launched browser.** On Windows a window that opens behind the
-  user's other windows is reported fully occluded, and Chrome then marks the renderer hidden and
-  throttles it — synthetic `Input.*` events are discarded on a hidden widget while the dispatch still
-  reports success, so a click "succeeded" and the page never saw a mousedown.
-  `--disable-features=CalculateNativeWinOcclusion` keeps the renderer live. It only looked flaky
-  because a window that later became visible stayed working for the rest of its life.
+- **The bridge stopped answering after its first command.** The extension starts a `connect()` loop from four
+  places (`onInstalled`, `onStartup`, the 30s alarm, and worker wake) and every failed attempt scheduled
+  another, so the loops multiplied instead of replacing each other — each holding its own stream socket open.
+  Six of them reach Chrome's per-host connection limit, at which point the extension's `POST /result` can no
+  longer get a connection: commands ran in the browser and their answers were lost on the way back. It
+  surfaced as every op timing out a few seconds after the first one worked. The bridge now closes a
+  superseded stream, and the extension refuses to start a second connect loop.
+- **Clicks were dropped on a freshly launched browser.** On Windows a window that opens behind the user's
+  other windows is reported fully occluded, and Chrome then marks the renderer hidden and throttles it —
+  synthetic `Input.*` events are discarded on a hidden widget while the dispatch still reports success, so a
+  click "succeeded" and the page never saw a mousedown. `--disable-features=CalculateNativeWinOcclusion`
+  keeps the renderer live. It only looked flaky because a window that later became visible stayed working for
+  the rest of its life.
 - **`read` answered differently depending on the transport.** Over the debug port it returned the full
-  accessibility tree; over the bridge, only the interactive elements — so `click` then `read` to
-  confirm a result showed nothing had changed, which is indistinguishable from the click having failed.
-  The bridge now reports the page text too, names elements by ARIA role (`textbox`, `link`,
-  `combobox`) instead of tag name, and renders a control's current value the way the accessibility
-  tree does. `npm run check:browser` now passes over the bridge as well as the debug port.
+  accessibility tree; over the bridge, only the interactive elements — so `click` then `read` to confirm a
+  result showed nothing had changed, which is indistinguishable from the click having failed. The bridge now
+  reports the page text too, names elements by ARIA role (`textbox`, `link`, `combobox`) instead of tag name,
+  and renders a control's current value the way the accessibility tree does. `npm run check:browser` now
+  passes over the bridge as well as the debug port.
 
-### Added
-- A `reload` op on the bridge. Editing `extension/background.js` otherwise means a human clicking
-  reload on `chrome://extensions` — the one page `chrome.debugger` may never attach to — because
-  Chrome keeps serving the registered worker script, not the one on disk. **Upgrading to this release
-  does not reload the extension for you: reload it once by hand, after which ada can do it.**
+### Added — `reload` on the browser bridge
+
+Editing `extension/background.js` otherwise means a human clicking reload on `chrome://extensions` — the one
+page `chrome.debugger` may never attach to — because Chrome keeps serving the registered worker script, not
+the one on disk. **Upgrading to this release does not reload the extension for you: reload it once by hand,
+after which ada can do it.**
 
 ## [0.16.1] — 2026-08-17
 
