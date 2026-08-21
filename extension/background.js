@@ -57,6 +57,34 @@ function adaDom(action, arg) {
     const s = getComputedStyle(el);
     return s.visibility !== "hidden" && s.display !== "none" && s.opacity !== "0";
   };
+  // The CDP path names elements by ARIA role, because that is what the accessibility tree reports:
+  // an <input> is a "textbox", an <a href> a "link", a <select> a "combobox". Reporting tag names
+  // here made the same element read differently depending on which transport was live, so anything
+  // matching on "textbox" simply found nothing. Map the implicit roles to match.
+  const implicitRole = (el) => {
+    const tag = el.tagName.toLowerCase();
+    if (tag === "a") return el.hasAttribute("href") ? "link" : "generic";
+    if (tag === "select") return el.multiple || el.size > 1 ? "listbox" : "combobox";
+    if (tag === "textarea" || el.isContentEditable) return "textbox";
+    if (tag === "summary") return "button";
+    if (tag !== "input") return tag;
+    const t = (el.getAttribute("type") || "text").toLowerCase();
+    return (
+      { checkbox: "checkbox", radio: "radio", range: "slider", number: "spinbutton", search: "searchbox", button: "button", submit: "button", reset: "button", image: "button" }[t] ||
+      "textbox"
+    );
+  };
+  // CDP reports a control's current value separately from its name, and renders it as = "value".
+  // innerText never carries what was typed into an input, so without this, type-then-read showed no
+  // change at all through the bridge while the same sequence read back fine over the debug port.
+  const fieldValue = (el) => {
+    const tag = el.tagName.toLowerCase();
+    if (tag === "select") return (el.selectedOptions[0] || {}).textContent?.trim() || "";
+    if (tag !== "input" && tag !== "textarea") return "";
+    const t = (el.getAttribute("type") || "text").toLowerCase();
+    if (t === "checkbox" || t === "radio") return el.checked ? "true" : "false";
+    return el.value || "";
+  };
   const label = (el) =>
     (el.getAttribute("aria-label") || el.getAttribute("placeholder") || el.value || el.innerText || el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80);
 
@@ -66,10 +94,11 @@ function adaDom(action, arg) {
     const els = [...document.querySelectorAll(INTERACTIVE)].filter(visible);
     window.__adaRefs = els;
     const lines = els.map((el, i) => {
-      const role = el.getAttribute("role") || el.tagName.toLowerCase();
+      const role = el.getAttribute("role") || implicitRole(el);
       const name = label(el);
       const r = el.getBoundingClientRect();
-      return `${role}${name ? ` "${name}"` : ""} [ref_${i + 1}] @${Math.round(r.x)},${Math.round(r.y)}`;
+      const val = fieldValue(el);
+      return `${role}${name ? ` "${name}"` : ""}${val && val !== name ? ` = ${JSON.stringify(val)}` : ""} [ref_${i + 1}] @${Math.round(r.x)},${Math.round(r.y)}`;
     });
     return { url: location.href, title: document.title, count: els.length, tree: lines.join("\n") };
   }
@@ -169,6 +198,14 @@ async function run(cmd) {
     await attach(cmd.tabId);
     return await chrome.debugger.sendCommand({ tabId: cmd.tabId }, cmd.method, cmd.params || {});
   }
+  if (cmd.op === "reload") {
+    // Editing this file otherwise means a human clicking reload on chrome://extensions - the one page
+    // chrome.debugger may never attach to, so nothing here can automate it. Letting the worker idle
+    // out does not help either: Chrome keeps serving the registered script, not the one on disk.
+    // Answer before reloading; restarting the worker tears this connection down mid-flight.
+    setTimeout(() => chrome.runtime.reload(), 100);
+    return { ok: true };
+  }
   if (cmd.op === "detach") {
     if (attached.has(cmd.tabId)) await chrome.debugger.detach({ tabId: cmd.tabId });
     attached.delete(cmd.tabId);
@@ -195,9 +232,19 @@ async function handle(cmd, t) {
  *  going out, a command had nowhere to land, and if Chrome tore this worker down in that window it
  *  waited for the 30s alarm - which looked like the bridge silently ignoring commands. A stream has
  *  no gap, and ada's heartbeat every 15s counts as activity, so the worker is not torn down at all. */
+let connecting = false;
 async function connect() {
+  // pump() is called from onInstalled, onStartup, the 30s alarm and top-level worker wake, and each
+  // failed attempt schedules another - so without this guard the loops multiply instead of replacing
+  // each other, and every one holds its own stream socket open. Six is Chrome's per-host limit, at
+  // which point the POST below cannot get a connection and every answer is lost on the way back.
+  if (connecting) return;
+  connecting = true;
   const t = await token();
-  if (!t) return;
+  if (!t) {
+    connecting = false;
+    return;
+  }
   try {
     const res = await fetch(`${BRIDGE}/stream?token=${encodeURIComponent(t)}`);
     if (!res.ok || !res.body) throw new Error(`stream ${res.status}`);
@@ -221,6 +268,7 @@ async function connect() {
   } catch {
     /* ada restarted or is not running */
   }
+  connecting = false;
   setTimeout(connect, 2000); // reconnect promptly; the alarm is only a backstop
 }
 const pump = connect;

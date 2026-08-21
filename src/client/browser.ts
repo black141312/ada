@@ -112,7 +112,12 @@ async function ensureBrowser(): Promise<void> {
   if (!exe) throw new Error(`no Chromium-based browser found. Install Chrome/Edge, or set ADA_BROWSER to its path (or start any Chrome with --remote-debugging-port=${PORT}).`);
   const profile = process.env.ADA_BROWSER_PROFILE || join(homedir(), ".ada", "browser-profile");
   mkdirSync(profile, { recursive: true });
-  const flags = [`--remote-debugging-port=${PORT}`, `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "about:blank"];
+  // --disable-features=CalculateNativeWinOcclusion: on Windows, a window that opens behind the
+  // user's other windows is reported fully occluded, and Chrome then marks the renderer hidden and
+  // throttles it. Synthetic Input.* events are silently dropped on a hidden widget while the dispatch
+  // still reports success, so a click "succeeded" and the page never saw a mousedown. It only looked
+  // flaky because a window that later became visible stayed working for the rest of its life.
+  const flags = [`--remote-debugging-port=${PORT}`, `--user-data-dir=${profile}`, "--no-first-run", "--no-default-browser-check", "--disable-features=CalculateNativeWinOcclusion", "about:blank"];
   if (headless()) flags.splice(2, 0, "--headless=new", "--disable-gpu");
   const child = spawn(exe, flags, {
     detached: true,
@@ -633,8 +638,19 @@ async function viaContentScript(b: BridgeLike, action: BrowserVerb, opts: Browse
     return { text: `${r.url ?? ""}\n\n${(r.text ?? "").trim() || "(the page rendered no text)"}` };
   }
   if (action === "read") {
-    const r = (await b.call("dom", { tabId, action: "snapshot" })) as { url?: string; tree?: string; count?: number };
-    return { text: `${r.url ?? ""}\n\n${r.tree || "(nothing interactive on this page)"}` };
+    // The CDP path answers `read` with the full accessibility tree, which carries the page's static
+    // text as well as its controls. A snapshot lists only interactive elements, so `click` then
+    // `read` to confirm the result showed nothing had changed — the same verb answering differently
+    // depending on which transport happened to be live, which is indistinguishable from the click
+    // having failed. Ask for the text too; both round trips are local and cost single-digit ms.
+    const [snap, body] = (await Promise.all([
+      b.call("dom", { tabId, action: "snapshot" }),
+      b.call("dom", { tabId, action: "text" }),
+    ])) as [{ url?: string; tree?: string; count?: number }, { text?: string }];
+    const text = (body.text ?? "").replace(/\n{3,}/g, "\n\n").trim();
+    return {
+      text: `${snap.url ?? ""}\n\n${snap.tree || "(nothing interactive on this page)"}${text ? `\n\n--- page text ---\n${text}` : ""}`,
+    };
   }
   if (action === "click") {
     if (opts.x !== undefined && opts.y !== undefined) return null; // coordinates need real input
