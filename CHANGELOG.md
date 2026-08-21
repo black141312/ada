@@ -4,6 +4,39 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [0.16.2] — 2026-08-21
+
+### Fixed — the browser tool acts on the page again
+
+Three separate faults, each of which let an action report success while the page never saw it.
+
+- **The bridge stopped answering after its first command.** The extension starts a `connect()` loop from
+  four places (`onInstalled`, `onStartup`, the 30s alarm, and worker wake) and every failed attempt
+  scheduled another, so the loops multiplied instead of replacing each other — each holding its own
+  stream socket open. Six of them reach Chrome's per-host connection limit, at which point the
+  extension's `POST /result` can no longer get a connection: commands ran in the browser and their
+  answers were lost on the way back. It surfaced as every op timing out a few seconds after the first
+  one worked. The bridge now closes a superseded stream, and the extension refuses to start a second
+  connect loop.
+- **Clicks were dropped on a freshly launched browser.** On Windows a window that opens behind the
+  user's other windows is reported fully occluded, and Chrome then marks the renderer hidden and
+  throttles it — synthetic `Input.*` events are discarded on a hidden widget while the dispatch still
+  reports success, so a click "succeeded" and the page never saw a mousedown.
+  `--disable-features=CalculateNativeWinOcclusion` keeps the renderer live. It only looked flaky
+  because a window that later became visible stayed working for the rest of its life.
+- **`read` answered differently depending on the transport.** Over the debug port it returned the full
+  accessibility tree; over the bridge, only the interactive elements — so `click` then `read` to
+  confirm a result showed nothing had changed, which is indistinguishable from the click having failed.
+  The bridge now reports the page text too, names elements by ARIA role (`textbox`, `link`,
+  `combobox`) instead of tag name, and renders a control's current value the way the accessibility
+  tree does. `npm run check:browser` now passes over the bridge as well as the debug port.
+
+### Added
+- A `reload` op on the bridge. Editing `extension/background.js` otherwise means a human clicking
+  reload on `chrome://extensions` — the one page `chrome.debugger` may never attach to — because
+  Chrome keeps serving the registered worker script, not the one on disk. **Upgrading to this release
+  does not reload the extension for you: reload it once by hand, after which ada can do it.**
+
 ## [0.16.1] — 2026-08-17
 
 ### Fixed

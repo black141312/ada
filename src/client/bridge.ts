@@ -138,6 +138,13 @@ export class Bridge implements BridgeLike {
     if (url.pathname === "/stream") {
       if (url.searchParams.get("token") !== this.token) return send(403, { error: "bad token" });
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+      // Only ever hold ONE stream open. The extension can start several connect() loops (the 30s
+      // alarm and the 2s retry both call it, and neither cancels the other), and a superseded stream
+      // is never read from again - but it still occupies a socket. Six of them reach Chrome's
+      // per-host connection limit, and then the extension's POST /result has no connection left to
+      // send on: commands run in the browser and their answers never come back, which surfaces as
+      // every op timing out a few seconds after the first one worked.
+      this.stream?.end();
       this.stream = res;
       this.seenExtension = true;
       for (const cmd of this.queue.splice(0)) this.push(cmd); // anything queued before it connected
