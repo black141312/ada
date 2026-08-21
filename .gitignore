@@ -9,7 +9,7 @@ node_modules/
 .dev.vars
 .wrangler/
 
-ada-auth.db
+ada-auth.db*
 runs/
 
 # subagent-driven-development scratch
