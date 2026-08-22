@@ -346,6 +346,21 @@ async function main(): Promise<void> {
     // check the source that a future edit cannot quietly re-gate it.
     const browseSrc = readFileSync(new URL("./client/browse.ts", import.meta.url), "utf8");
     assert.ok(!/lazy:s*true/.test(browseSrc), "`browse` must be advertised every turn, not lazy");
+
+    // Profile resolution must survive a machine with no Chrome at all - CI is one, and so is any
+    // box where the user has never opened it. Throwing here would take the browser tool down with
+    // it; the full multi-profile behaviour is covered by test/chrome-profiles.mjs.
+    const { listChromeProfiles, resolveChromeProfile } = await import("./client/chrome-profiles.ts");
+    const noChrome = join(tmpdir(), `ada-nochrome-${process.pid}`);
+    const prevUserData = process.env.ADA_CHROME_USER_DATA;
+    const prevProfile = process.env.ADA_CHROME_PROFILE;
+    process.env.ADA_CHROME_USER_DATA = noChrome;
+    delete process.env.ADA_CHROME_PROFILE;
+    assert.deepEqual(listChromeProfiles("/nope"), [], "no chrome user data must read as no profiles, not throw");
+    assert.equal((await resolveChromeProfile("/nope")).dir, "Default", "with nothing to go on, fall back to Default");
+    if (prevUserData === undefined) delete process.env.ADA_CHROME_USER_DATA;
+    else process.env.ADA_CHROME_USER_DATA = prevUserData;
+    if (prevProfile !== undefined) process.env.ADA_CHROME_PROFILE = prevProfile;
     assert.ok(
       !LAZY_GATES.some((g) => g.tools.includes("browse") || g.tools.includes("browser")),
       "no lazy gate should name browse/browser - browse is advertised unconditionally now",

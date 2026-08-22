@@ -19,6 +19,7 @@ export interface Settings {
   subagentModel?: string; // model for spawn_agent / background_task; unset = same as the main model
   strategy?: string; // orchestration architecture every session starts in (auto | react | single | plan | toolsmith | rlm); --strategy still wins for one run
   browseModel?: string; // model that drives the browser for the `browse` tool; unset = Sonnet 4.6 (see browse.ts)
+  chromeProfile?: string; // which real Chrome profile the bridge drives ("Default", "Profile 6"); env ADA_CHROME_PROFILE overrides. Only honoured while that profile still carries the extension.
   reasoning?: "low" | "medium" | "high";
   autoApprove?: boolean;
   compactAt?: number;
