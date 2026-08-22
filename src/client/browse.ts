@@ -75,9 +75,8 @@ export async function runBrowse(
 export function registerBrowseTool(opts: { client: OpenAI; onApprove: OnApprove; compactAt?: number }): void {
   registerTool({
     name: "browse",
-    lazy: true,
     description:
-      "Do something in a real browser (the system default browser, in a persistent profile — logins survive between runs) and get back a written report. Give one errand in plain English, with everything needed to carry it out: the URL to start at, what to click or fill in, and exactly what to bring back. A cheaper vision model runs the browser loop and replies in text, so ask for what you need in one call — 'open http://localhost:5173, click Settings, and tell me if the save button is cut off' — rather than stepping through the page yourself. Use it to check your own UI work, to read a page's console, or to carry out a task on a site.",
+      "Do something in a real browser and report back. It drives the user's own browser when the bridge extension is connected, otherwise a persistent profile of ada's — either way it carries real logins, so it can reach pages behind a sign-in (mail, an account page, a dashboard, an internal tool), not only public URLs. Give one errand in plain English with everything needed to carry it out: where to start, what to click or fill in, and exactly what to bring back. A cheaper vision model runs the browser loop and replies in text, so ask for the whole errand in one call — open gmail and give me the sender and subject of the newest five — rather than stepping through the page yourself. Just as good for your own UI work: open http://localhost:5173, click Settings, and say whether the save button is cut off.",
     parameters: {
       type: "object",
       properties: {

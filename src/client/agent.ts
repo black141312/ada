@@ -241,10 +241,6 @@ export const LAZY_GATES: { tools: string[]; intent: RegExp }[] = [
       /\b(ui|ux|design|redesign|styling|style|look and feel|visual|layout|palette|colou?rs?|typography|fonts?|accessibility|a11y|wcag|animation|motion|component|dashboard|landing page|make it (?:look )?(?:better|beautiful|nicer))\b/i,
   },
   { tools: ["notebook_edit"], intent: /\b(notebooks?|jupyter|ipynb|colab|(?:code|markdown) cells?)\b/i },
-  {
-    tools: ["browse"],
-    intent: /\b(browser|screenshots?|devtools|localhost|dev ?server|the (?:page|site|app) (?:looks?|renders?)|console\b|in chrome|open the (?:page|site|app)|preview)\b/i,
-  },
 ];
 // Gating is driven by the tool's own `lazy` flag; LAZY_GATES only says what unlocks each one. A
 // lazy tool missing from the gates would go permanently invisible — test/lazy-tools.mjs asserts the

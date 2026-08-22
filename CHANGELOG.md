@@ -4,6 +4,26 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [Unreleased]
+
+### Fixed — ada stops claiming it has no browser
+
+`browse` was lazy: advertised to the model only when the turn matched a regex of dev words —
+`localhost`, `devtools`, `screenshot`, `console`, `preview`, `in chrome`. So "can you get me the top
+email from gmail" advertised nothing, and the model answered that it had no access to email at all.
+That answer was accurate: the tool genuinely was not in its list. Nine of ten ordinary browser
+requests missed the gate, including `open gmail`, `go to leetcode and read the problem`, and the typo
+`use broswer` — the fix a user reaches for when the first answer is wrong.
+
+The gate saved ~244 tokens a turn and cost a wasted round trip whenever it missed, so it was losing on
+its own terms. `browse` is now advertised unconditionally. The expensive tool is the raw `browser`
+schema — 25 verbs and a screenshot per step — and that stays `hidden`, reachable only by the cheap
+`browse` sub-agent, which is the arrangement worth keeping.
+
+The description was the other half: it read as a tool for checking your own UI work and reading a
+page's console, and never said the browser carries real logins. It now leads with that, so reaching a
+page behind a sign-in is an obvious use rather than one you have to think of.
+
 ## [0.16.2] — 2026-08-21
 
 ### Added — `rlm`, and a strategy chosen per request
