@@ -12,6 +12,7 @@
 import type { Pool } from "pg";
 import type Database from "better-sqlite3";
 import { authDatabase, usingPostgres } from "./db.js";
+import { priceOf } from "../client/models-dev.js";
 
 export interface UsageEvent {
   ts: number;
@@ -136,23 +137,37 @@ export async function usageSince(user: string, sinceMs: number): Promise<UsageTo
   return { promptTokens: Number(row?.p ?? 0), completionTokens: Number(row?.c ?? 0), requests: Number(row?.n ?? 0) };
 }
 
-/** Like usageSince, but only tokens that cost money upstream. Free-tier models (`:free` suffix,
- *  plus anything in ADA_FREE_MODELS) are excluded — a quota exists to cap upstream spend, and free
- *  models have none, so chatting on them must not eat the paid allowance. */
-export async function billableUsageSince(user: string, sinceMs: number): Promise<UsageTotal> {
-  await ensure();
-  const extraFree = (process.env.ADA_FREE_MODELS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
-  let sql =
-    "select coalesce(sum(prompt_tokens),0) as p, coalesce(sum(completion_tokens),0) as c, count(*) as n from usage_events where user_id = $1 and ts >= $2 and lower(model) not like '%:free'";
-  const params: unknown[] = [user, sinceMs];
-  for (const m of extraFree) {
-    params.push(m);
-    sql += ` and lower(model) <> $${params.length}`;
+/** $ per 1M [input, output] tokens. `:free` costs nothing. Anything models.dev doesn't price gets a
+ *  deliberately PESSIMISTIC guess: a cap that under-counts an unknown model is a cap that doesn't
+ *  cap, and an unpriced id is exactly where a surprise bill comes from. */
+const UNKNOWN_PRICE: [number, number] = [3, 15];
+export function priceUsd(model: string): [number, number] {
+  if (/:free$/i.test(model)) return [0, 0];
+  return priceOf(model) ?? UNKNOWN_PRICE;
+}
+
+export interface Spend extends UsageTotal {
+  usd: number;
+}
+
+/** What one account has COST us since a timestamp — the number the spend cap is checked against.
+ *
+ *  Derived at read time from stored tokens × today's price, not stored per row: prices move, and a
+ *  frozen cost column would have to be recomputed the first time a provider repriced anyway. Free
+ *  models fall out for free — they price at 0, so they add 0 without a special case. */
+export async function costSince(user: string, sinceMs: number): Promise<Spend> {
+  const rows = await usageByModel(user, sinceMs);
+  let usd = 0;
+  const total: Spend = { usd: 0, promptTokens: 0, completionTokens: 0, requests: 0 };
+  for (const r of rows) {
+    const [inPrice, outPrice] = priceUsd(r.model);
+    usd += (r.promptTokens * inPrice + r.completionTokens * outPrice) / 1_000_000;
+    total.promptTokens += r.promptTokens;
+    total.completionTokens += r.completionTokens;
+    total.requests += r.requests;
   }
-  const row = usingPostgres
-    ? ((await pg().query(sql, params)).rows[0] as { p: string; c: string; n: string })
-    : (lite().prepare(sql.replace(/\$\d+/g, "?")).get(...params) as { p: number; c: number; n: number });
-  return { promptTokens: Number(row?.p ?? 0), completionTokens: Number(row?.c ?? 0), requests: Number(row?.n ?? 0) };
+  total.usd = usd;
+  return total;
 }
 
 /** Per-model breakdown for an account over a window — for a usage page, and for costing a period

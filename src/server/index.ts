@@ -11,8 +11,9 @@ import { type ExchangeRequest, exchangeClients, exchangeHosts, exchangeMisconfig
 import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, createSeat, disableSeat, disableSeatByExternalId, enterpriseMode, envDefaults, extractLastUsage, identifySeat, listSeats, loadPolicy, modelAllowed, savePolicy, upsertSeatForSSO, usageSummary, validatePolicy } from "./enterprise.ts";
 import { adminUsers, verifyIdentity } from "./identity.ts";
 import { addAllowed, listAllowed, removeAllowed } from "./allowlist.ts";
-import { billableUsageSince, recordUsage } from "./usage.ts";
-import { billingWebhookImplemented, checkEntitlement, effectivePlan, isFreeModel, PLANS, planFor, periodStart, setPlan, type PlanName } from "./plans.ts";
+import { costSince, recordUsage } from "./usage.ts";
+import { prefetch as prefetchModelCatalog } from "../client/models-dev.ts";
+import { billingWebhookImplemented, checkEntitlement, effectivePlan, isFreeModel, PLANS, planFor, periodStart, setPlan, WINDOW_MS, windowStart, type PlanName } from "./plans.ts";
 import { checkoutUrl, createCheckout, getCheckout, setCheckoutPlan } from "./billing.ts";
 import { createKelviqCheckout, getKelviqCatalog, handleKelviqWebhook, kelviqEnabled, verifyKelviqSignature, type KelviqEvent } from "./kelviq.ts";
 import { computeAnalytics } from "./analytics.ts";
@@ -250,7 +251,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
     if (!ent.ok) {
       appendAudit({ ts: Date.now(), user: who.user, event: ent.status === 402 ? "quota_exceeded" : "plan_denied_model", detail: model });
       // The body carries plan/used/limit so a client can render "you're out" without a second call.
-      return json(res, ent.status!, { error: { message: ent.message, type: ent.status === 402 ? "insufficient_quota" : "plan_restricted" }, plan: ent.plan, used: ent.used, limit: ent.limit });
+      return json(res, ent.status!, { error: { message: ent.message, type: ent.status === 402 ? "insufficient_quota" : "plan_restricted" }, plan: ent.plan, usedUsd: ent.usedUsd, capUsd: ent.capUsd, resetsAt: ent.resetsAt });
     }
   }
 
@@ -570,7 +571,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
           kelviqPlan: null,
           label: PLANS[p].label,
           models: PLANS[p].models,
-          monthlyTokens: PLANS[p].monthlyTokens,
+          capUsd: PLANS[p].capUsd, // null = uncapped (enterprise, billed by contract)
+          windowHours: WINDOW_MS / 3_600_000,
           prices: null,
         }));
         return json(res, 200, { source: "static", currency: "USD", symbol: "$", plans });
@@ -582,7 +584,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
           kelviqPlan: k.identifier,
           label: k.name,
           models: PLANS[k.plan].models,
-          monthlyTokens: PLANS[k.plan].monthlyTokens,
+          capUsd: PLANS[k.plan].capUsd,
+          windowHours: WINDOW_MS / 3_600_000,
           prices: k.prices,
         }));
         return json(res, 200, { source: "kelviq", currency: c.currency, symbol: c.symbol, plans });
@@ -639,7 +642,8 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
         plan: s.plan,
         label: def.label,
         models: def.models,
-        monthlyTokens: def.monthlyTokens,
+        capUsd: def.capUsd,
+        windowHours: WINDOW_MS / 3_600_000,
         status: s.status,
         expiresAt: s.expiresAt,
       });
@@ -742,29 +746,40 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     // What am I on, and how much is left? Self-serve: a client shouldn't have to hit a 402 to learn
     // it's near the limit. Anonymous callers get the free plan's shape with no usage attached.
     if (req.method === "GET" && url.pathname === "/v1/plan") {
-      if (isAnonymous(who)) return json(res, 200, { plan: "free", status: "active", used: 0, limit: PLANS.free.monthlyTokens, models: PLANS.free.models });
+      const since = windowStart();
+      const resetsAt = since + WINDOW_MS;
+      const windowHours = WINDOW_MS / 3_600_000;
+      if (isAnonymous(who)) {
+        return json(res, 200, { plan: "free", status: "active", models: PLANS.free.models, used: 0, usedUsd: 0, capUsd: PLANS.free.capUsd, windowHours, resetsAt });
+      }
       const up = await planFor(who.user);
-      const since = periodStart(up);
-      // Billable only: free-tier model tokens cost nothing upstream and don't count against quota.
-      const used = await billableUsageSince(who.user, since).then((u) => u.promptTokens + u.completionTokens).catch(() => 0);
+      // Costed from stored tokens at today's prices. Free-tier models price at 0, so they fall out
+      // of the spend total on their own — no special case, no second definition of "billable".
+      const spend = await costSince(who.user, since).catch(() => ({ usd: 0, promptTokens: 0, completionTokens: 0, requests: 0 }));
+      // `used` stays TOKENS, deliberately: the composer's live turn meter reads it to show how many
+      // tokens a turn has burned while it runs. `usedUsd` is what the plan meter shows.
+      const used = spend.promptTokens + spend.completionTokens;
       // God mode mirrors checkEntitlement: env-listed admins are unmetered, and the UI should say so
       // rather than show "free — upgrade" to an account the gate will never stop.
       if (adminUsers()?.includes(who.user)) {
-        return json(res, 200, { plan: "team", subscribed: up.plan, status: "active", models: "all", used, limit: Number.MAX_SAFE_INTEGER, remaining: Number.MAX_SAFE_INTEGER, periodStart: since, paidThrough: null, god: true });
+        return json(res, 200, { plan: "team", subscribed: up.plan, status: "active", models: "all", used, usedUsd: spend.usd, capUsd: null, windowHours, resetsAt, periodStart: periodStart(up), paidThrough: null, god: true });
       }
       // effectivePlan, not a second copy of the rule: this endpoint had its own
       // `status === "active" ? plan : "free"` and would have kept reporting a lapsed plan as live.
       const def = effectivePlan(up);
-      const limit = up.maxTokens ?? def.monthlyTokens; // per-user override beats the plan's cap
+      const capUsd = up.maxUsd ?? def.capUsd; // per-user override beats the plan's cap; null = uncapped
       return json(res, 200, {
         plan: def.name, // what they actually GET — a lapsed pro is a free account
         subscribed: up.plan, // what they signed up for, so the UI can say "expired" rather than lie
         status: up.status,
         models: def.models,
         used,
-        limit,
-        remaining: Math.max(0, limit - used),
-        periodStart: since,
+        usedUsd: spend.usd,
+        capUsd,
+        remainingUsd: capUsd == null ? null : Math.max(0, capUsd - spend.usd),
+        windowHours,
+        resetsAt,
+        periodStart: periodStart(up), // the SUBSCRIPTION period, for "renews on" — not the spend window
         paidThrough: up.paidThrough,
       });
     }
@@ -803,7 +818,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     if (req.method === "POST" && url.pathname === "/v1/plans") {
       const admin = who.role === "admin" || (adminUsers()?.includes(who.user) ?? false);
       if (!admin) return json(res, 403, { error: { message: "admin only" } });
-      let b: { user?: string; plan?: string; status?: string; maxTokens?: number | null };
+      let b: { user?: string; plan?: string; status?: string; maxUsd?: number | null };
       try {
         b = JSON.parse(await readBody(req));
       } catch {
@@ -815,17 +830,18 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
       if (!["active", "past_due", "canceled", "banned"].includes(status)) {
         return json(res, 400, { error: { message: `unknown status '${status}' (active, past_due, canceled, banned)` } });
       }
-      // maxTokens: absent = leave any override alone, null = clear it, a positive number = set it.
-      let maxTokens: number | null | undefined;
-      if ("maxTokens" in b) {
-        maxTokens = b.maxTokens === null ? null : Number(b.maxTokens);
-        if (maxTokens !== null && (!Number.isFinite(maxTokens) || maxTokens <= 0)) {
-          return json(res, 400, { error: { message: "maxTokens must be a positive number, or null to clear" } });
+      // maxUsd: absent = leave any override alone, null = clear it, a positive number = set it.
+      // Per-window spend cap in dollars, same unit as the plan's own cap.
+      let maxUsd: number | null | undefined;
+      if ("maxUsd" in b) {
+        maxUsd = b.maxUsd === null ? null : Number(b.maxUsd);
+        if (maxUsd !== null && (!Number.isFinite(maxUsd) || maxUsd <= 0)) {
+          return json(res, 400, { error: { message: "maxUsd must be a positive number of dollars, or null to clear" } });
         }
       }
-      await setPlan(b.user, b.plan as PlanName, status, true, null, maxTokens);
-      appendAudit({ ts: Date.now(), user: who.user, event: "plan_set", detail: `${b.user} -> ${b.plan}/${status}${maxTokens !== undefined ? ` max=${maxTokens}` : ""}` });
-      return json(res, 200, { ok: true, user: b.user, plan: b.plan, status, ...(maxTokens !== undefined ? { maxTokens } : {}) });
+      await setPlan(b.user, b.plan as PlanName, status, true, null, maxUsd);
+      appendAudit({ ts: Date.now(), user: who.user, event: "plan_set", detail: `${b.user} -> ${b.plan}/${status}${maxUsd !== undefined ? ` max=$${maxUsd}` : ""}` });
+      return json(res, 200, { ok: true, user: b.user, plan: b.plan, status, ...(maxUsd !== undefined ? { maxUsd } : {}) });
     }
     if (req.method === "GET" && url.pathname === "/v1/models") {
       return await handleModels(res, isAnon);
@@ -976,6 +992,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
  *  config (throws on misconfig — never construct a server that would provision seats unsafely). */
 export function createAdaServer(): Server {
   assertOidcConfig();
+  // Model prices decide which models the free tier covers (plans.ts) and what a request cost
+  // (usage.ts). The baked catalog.json already seeds both synchronously, so this only refreshes;
+  // not awaited, because a slow models.dev must never delay the port opening.
+  void prefetchModelCatalog();
   return createServer(handleRequest);
 }
 

@@ -394,8 +394,9 @@ async function main(): Promise<void> {
     assert.equal(effectivePlan(p({ paidThrough: now - 1 }), now).name, "free", "one ms past the paid period is free");
     assert.equal(effectivePlan(p({ paidThrough: now }), now).name, "free", "the boundary itself is over");
 
-    // A lapsed plan drops to free QUOTAS too, not just the label — otherwise it keeps the paid cap.
-    assert.equal(effectivePlan(p({ paidThrough: now - 1 }), now).monthlyTokens, PLANS.free.monthlyTokens, "lapsed gets the free quota");
+    // A lapsed plan drops to the free SPEND CAP too, not just the label — otherwise it keeps the
+    // paid one and a dead card buys $2 of upstream every 4 hours indefinitely.
+    assert.equal(effectivePlan(p({ paidThrough: now - 1 }), now).capUsd, PLANS.free.capUsd, "lapsed gets the free cap");
     // Status still wins independently: a cancelled plan is free even if paid through next year.
     assert.equal(effectivePlan(p({ status: "canceled", paidThrough: now + 1e10 }), now).name, "free", "status still applies");
   }

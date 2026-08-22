@@ -14,7 +14,7 @@ process.env.ADA_DATA_DIR = dir;
 process.chdir(dir);
 
 const base = resolve(import.meta.dirname, "..");
-const { PLANS, planFor, setPlan, effectivePlan, periodStart, checkEntitlement } = await import(
+const { PLANS, planFor, setPlan, effectivePlan, periodStart, windowStart, WINDOW_MS, isFreeModel, checkEntitlement } = await import(
   pathToFileURL(join(base, "src/server/plans.ts")).href
 );
 const { recordUsage } = await import(pathToFileURL(join(base, "src/server/usage.ts")).href);
@@ -33,6 +33,15 @@ assert.equal(denied.status, 403, "a plan restriction is 403, not 402 — it isn'
 const allowed = await checkEntitlement("newcomer", "meta-llama/llama-3.3-70b-instruct:free");
 assert.equal(allowed.ok, true, "free must be able to run :free models");
 
+// --- the free tier is defined by PRICE, not by the :free suffix ---------------
+// The point of the change: :free upstream quota runs dry, so the tier is cheap models we pay for.
+assert.equal(isFreeModel("gemini-2.5-flash-lite"), true, "a cheap model is on the free tier");
+assert.equal(isFreeModel("claude-opus-4-8"), false, "an expensive model is not");
+assert.equal(isFreeModel("some/model-nobody-has-priced"), false, "an unpriced model must fail CLOSED");
+process.env.ADA_FREE_MAX_PRICE = "0.01";
+assert.equal(isFreeModel("gemini-2.5-flash-lite"), false, "the threshold is tunable without a deploy");
+delete process.env.ADA_FREE_MAX_PRICE;
+
 // --- ADA_FREE_MODELS adds specific models to the free tier -------------------
 process.env.ADA_FREE_MODELS = "deepseek/deepseek-v4-flash-0731";
 assert.equal((await checkEntitlement("newcomer", "deepseek/deepseek-v4-flash-0731")).ok, true, "a listed model must be free-tier usable");
@@ -44,16 +53,23 @@ delete process.env.ADA_FREE_MODELS;
 await setPlan("payer", "pro");
 const pro = await checkEntitlement("payer", "anthropic/claude-opus-5");
 assert.equal(pro.ok, true, "pro must reach paid models");
-assert.equal(pro.limit, PLANS.pro.monthlyTokens);
+assert.equal(pro.capUsd, PLANS.pro.capUsd);
 
-// --- quota ------------------------------------------------------------------
-// Spend the whole allowance, then the next request must be refused.
+// --- spend cap --------------------------------------------------------------
+// Spend the whole allowance, then the next request must be refused. Opus prices in the $5/$25
+// per 1M range, so 1M output tokens is far past the $2 cap however the catalogue moves.
 const now = Date.now();
-await recordUsage({ ts: now, user: "payer", model: "anthropic/claude-opus-5", provider: "anthropic", promptTokens: PLANS.pro.monthlyTokens, completionTokens: 0 });
+await recordUsage({ ts: now, user: "payer", model: "anthropic/claude-opus-5", provider: "anthropic", promptTokens: 0, completionTokens: 1_000_000 });
 const spent = await checkEntitlement("payer", "anthropic/claude-opus-5");
 assert.equal(spent.ok, false, "a used-up plan must stop");
-assert.equal(spent.status, 402, "out of quota is 402 — payment, not permission");
-assert.ok(spent.message.includes("quota reached"), "the message must say why");
+assert.equal(spent.status, 402, "out of budget is 402 — payment, not permission");
+assert.ok(spent.message.includes("cap reached"), "the message must say why");
+assert.ok(spent.usedUsd > PLANS.pro.capUsd, "spend is reported in dollars");
+
+// A window ago does not count: the cap is per 4 hours, not forever.
+await setPlan("yesterday", "pro");
+await recordUsage({ ts: windowStart() - 1, user: "yesterday", model: "anthropic/claude-opus-5", provider: "anthropic", promptTokens: 0, completionTokens: 1_000_000 });
+assert.equal((await checkEntitlement("yesterday", "anthropic/claude-opus-5")).ok, true, "spend outside the window must not count");
 
 // Quota is per account: one user's spend must never consume another's.
 await setPlan("other", "pro");
@@ -75,23 +91,19 @@ const raw = process.env.DATABASE_URL
   : (await import("node:module")).createRequire(import.meta.url)("better-sqlite3");
 if (raw) {
   const { authDatabase } = await import(pathToFileURL(join(base, "src/server/auth.ts")).href);
-  authDatabase.prepare("update user_plans set plan = 'enterprise_unlimited' where user_id = ?").run("weird");
+  authDatabase().prepare("update user_plans set plan = 'enterprise_unlimited' where user_id = ?").run("weird");
   const { invalidatePlanCache } = await import(pathToFileURL(join(base, "src/server/plans.ts")).href);
   invalidatePlanCache("weird");
   assert.equal((await planFor("weird")).plan, "free", "an unrecognised plan name must degrade to free, not unlock");
 }
 
-// --- free-model tokens don't count against quota ------------------------------
-// Quota caps upstream spend; :free models have none, so they must not eat the allowance.
+// --- free-model tokens cost nothing -------------------------------------------
+// The cap is on SPEND, so :free models fall out on their own — they price at zero.
 await setPlan("freeloader", "pro");
-await recordUsage({ ts: Date.now(), user: "freeloader", model: "meta-llama/llama-3.3-70b-instruct:free", provider: "openrouter", promptTokens: PLANS.pro.monthlyTokens * 3, completionTokens: 0 });
+await recordUsage({ ts: Date.now(), user: "freeloader", model: "meta-llama/llama-3.3-70b-instruct:free", provider: "openrouter", promptTokens: 50_000_000, completionTokens: 0 });
 const freeSpend = await checkEntitlement("freeloader", "anthropic/claude-opus-5");
-assert.equal(freeSpend.ok, true, "free-model tokens must not consume the paid quota");
-assert.equal(freeSpend.used, 0, "used must count billable tokens only");
-process.env.ADA_FREE_MODELS = "deepseek/deepseek-v4-flash-0731";
-await recordUsage({ ts: Date.now(), user: "freeloader", model: "deepseek/deepseek-v4-flash-0731", provider: "openrouter", promptTokens: 999, completionTokens: 0 });
-assert.equal((await checkEntitlement("freeloader", "anthropic/claude-opus-5")).used, 0, "ADA_FREE_MODELS entries must not count either");
-delete process.env.ADA_FREE_MODELS;
+assert.equal(freeSpend.ok, true, "free-model tokens must not consume the paid budget");
+assert.equal(freeSpend.usedUsd, 0, "a :free model costs $0 however many tokens it burns");
 
 // --- ban ---------------------------------------------------------------------
 // Banned means nothing runs, not even free models, and it's 403 — money can't fix it.
@@ -100,30 +112,43 @@ const banned = await checkEntitlement("outlaw", "some/model:free");
 assert.equal(banned.ok, false, "a banned account must not run anything");
 assert.equal(banned.status, 403, "banned is 403, not a quota problem");
 
-// --- per-user token override -------------------------------------------------
+// --- per-user spend override -------------------------------------------------
 // An admin can raise one account's cap past its plan without inventing a plan for it.
-await setPlan("vip", "pro", "active", true, null, PLANS.pro.monthlyTokens * 10);
-await recordUsage({ ts: Date.now(), user: "vip", model: "anthropic/claude-opus-5", provider: "anthropic", promptTokens: PLANS.pro.monthlyTokens + 1, completionTokens: 0 });
+await setPlan("vip", "pro", "active", true, null, 500);
+await recordUsage({ ts: Date.now(), user: "vip", model: "anthropic/claude-opus-5", provider: "anthropic", promptTokens: 0, completionTokens: 1_000_000 });
 const vip = await checkEntitlement("vip", "anthropic/claude-opus-5");
 assert.equal(vip.ok, true, "an override must beat the plan's cap");
-assert.equal(vip.limit, PLANS.pro.monthlyTokens * 10, "the reported limit is the override");
-// A later setPlan that says nothing about maxTokens must not wipe the override (webhooks call this).
+assert.equal(vip.capUsd, 500, "the reported cap is the override");
+// A later setPlan that says nothing about maxUsd must not wipe the override (webhooks call this).
 await setPlan("vip", "pro", "active");
-assert.equal((await checkEntitlement("vip", "anthropic/claude-opus-5")).limit, PLANS.pro.monthlyTokens * 10, "an unrelated setPlan must not wipe the override");
+assert.equal((await checkEntitlement("vip", "anthropic/claude-opus-5")).capUsd, 500, "an unrelated setPlan must not wipe the override");
 // Explicit null clears it.
 await setPlan("vip", "pro", "active", true, null, null);
-assert.equal((await checkEntitlement("vip", "anthropic/claude-opus-5")).limit, PLANS.pro.monthlyTokens, "null must clear the override");
+assert.equal((await checkEntitlement("vip", "anthropic/claude-opus-5")).capUsd, PLANS.pro.capUsd, "null must clear the override");
 
 // --- god mode ----------------------------------------------------------------
 // Env-listed admins are never metered or model-gated, even with no plan row and spend past any cap.
 process.env.ADA_ADMIN_USERS = "boss";
-await recordUsage({ ts: Date.now(), user: "boss", model: "anthropic/claude-opus-5", provider: "anthropic", promptTokens: PLANS.team.monthlyTokens * 2, completionTokens: 0 });
+await recordUsage({ ts: Date.now(), user: "boss", model: "anthropic/claude-opus-5", provider: "anthropic", promptTokens: 0, completionTokens: 5_000_000 });
 const god = await checkEntitlement("boss", "anthropic/claude-opus-5");
 assert.equal(god.ok, true, "an env-listed admin must never be blocked");
-assert.equal(god.limit, Number.MAX_SAFE_INTEGER, "god mode reports an effectively-unlimited cap");
-assert.ok(god.used > 0, "god mode still reports spend — unlimited must stay visible");
+assert.equal(god.capUsd, null, "god mode is uncapped, not capped-very-high");
+assert.ok(god.usedUsd > 0, "god mode still reports spend — unlimited must stay visible");
 assert.equal((await checkEntitlement("payer", "anthropic/claude-opus-5")).ok, false, "god mode must not leak to non-admins");
 delete process.env.ADA_ADMIN_USERS;
+
+// --- enterprise is uncapped ---------------------------------------------------
+// Billed by contract, so metering it is reporting rather than gating.
+await setPlan("bigco", "team");
+await recordUsage({ ts: Date.now(), user: "bigco", model: "anthropic/claude-opus-5", provider: "anthropic", promptTokens: 0, completionTokens: 20_000_000 });
+const ent = await checkEntitlement("bigco", "anthropic/claude-opus-5");
+assert.equal(ent.ok, true, "an enterprise account must never hit a cap");
+assert.equal(ent.capUsd, null, "team reports no cap at all");
+
+// --- the spend window --------------------------------------------------------
+assert.equal(WINDOW_MS, 4 * 60 * 60 * 1000, "the window is 4 hours");
+assert.equal(windowStart(Date.UTC(2026, 7, 2, 13, 59)), Date.UTC(2026, 7, 2, 12), "windows align to fixed 4h buckets");
+assert.ok(windowStart() <= Date.now(), "a window can never start in the future");
 
 // --- billing period ---------------------------------------------------------
 // No anchor → calendar month, so a free account's window is predictable.

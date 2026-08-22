@@ -53,6 +53,29 @@ assert.equal(opus.requests, 2, "per-model grouping must aggregate matching rows"
 assert.equal(opus.promptTokens, 1500);
 assert.equal(byModel.find((r) => r.model === "gpt-5.5").requests, 1);
 
+// --- cost: the number the spend cap is actually checked against ---------------
+// Tokens are stored; dollars are derived at read time. Get this wrong and the cap either never
+// fires or fires on the wrong people.
+const { costSince, priceUsd } = await import(pathToFileURL(resolve(import.meta.dirname, "../src/server/usage.ts")).href);
+
+// A :free model costs nothing however many tokens it burns — that is what makes the free tier free.
+assert.deepEqual(priceUsd("meta-llama/llama-3.3-70b-instruct:free"), [0, 0], ":free prices at zero");
+// An id nobody has priced must be treated as EXPENSIVE. The other way round, one unrecognised model
+// id silently uncaps an account.
+const unknown = priceUsd("some-vendor/model-nobody-has-heard-of");
+assert.ok(unknown[0] > 1 && unknown[1] > 1, "an unpriced model must cost a lot, not nothing");
+
+await recordUsage({ ts: now, user: "costed", model: "claude-opus-4-8", provider: "anthropic", promptTokens: 1_000_000, completionTokens: 1_000_000 });
+await recordUsage({ ts: now, user: "costed", model: "meta-llama/llama-3.3-70b-instruct:free", provider: "openrouter", promptTokens: 9_000_000, completionTokens: 9_000_000 });
+const cost = await costSince("costed", now - 1000);
+const [pin, pout] = priceUsd("claude-opus-4-8");
+assert.ok(Math.abs(cost.usd - (pin + pout)) < 1e-9, "1M in + 1M out costs exactly the per-1M prices");
+assert.equal(cost.promptTokens, 10_000_000, "tokens still total across every model, priced or not");
+
+// Spend is per account and per window — the two ways a cap leaks.
+assert.equal((await costSince("nobody-else", now - 1000)).usd, 0, "spend must not leak across accounts");
+assert.equal((await costSince("costed", now + 1000)).usd, 0, "spend outside the window must not count");
+
 // --- metering must never break a request ------------------------------------
 // The call sites sit in response teardown, where a rejection has nobody to catch it.
 await assert.doesNotReject(
