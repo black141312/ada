@@ -17,11 +17,12 @@ const src = readFileSync("src/client/agent.ts", "utf8");
 const { LAZY_GATES: GATES } = await import(
   pathToFileURL(resolve("src/client/agent.ts")).href
 );
-assert.equal(GATES.length, 5, `expected 5 gate groups, got ${GATES.length}`);
+assert.equal(GATES.length, 4, `expected 4 gate groups, got ${GATES.length}`);
 const gateFor = (name) => GATES.find((g) => g.tools.includes(name));
 
-// `browse` is registered at runtime (browse.ts, from registerSubagentTools) so it isn't in this
-// static list — its gate is checked below by name instead.
+// `browse` is deliberately NOT lazy: it was gated behind a regex of dev words (localhost,
+// devtools, screenshot...), so "read my gmail" never advertised it and the model answered
+// that it had no browser at all. It costs ~244 tokens a turn and is now always offered.
 const lazy = tools.filter((t) => t.lazy).map((t) => t.name);
 assert.deepEqual(
   lazy.sort(),
@@ -57,16 +58,11 @@ for (const name of lazy) {
 // The doc gate is the one that fires most; it must not drag the others in with it.
 const docIntent = gateFor("generate_pptx").intent;
 const nbIntent = gateFor("notebook_edit").intent;
-const browserIntent = gateFor("browse").intent;
+assert.ok(!gateFor("browse"), "browse is advertised on every turn now - it must not be gated");
 assert.equal(
   nbIntent.test("make me a deck about this project"),
   false,
   "a deck request must not enable the notebook tool",
-);
-assert.equal(
-  browserIntent.test("make me a deck about this project"),
-  false,
-  "a deck request must not enable the browser tool",
 );
 assert.equal(
   docIntent.test("fix the failing cell in analysis.ipynb"),
@@ -82,20 +78,12 @@ for (const s of [
   assert.equal(nbIntent.test(s), true, `should enable notebook_edit: "${s}"`);
 }
 for (const s of [
-  "screenshot the settings page",
-  "check the console for errors",
-  "open http://localhost:5173 and look",
-  "does the page render?",
-]) {
-  assert.equal(browserIntent.test(s), true, `should enable browser: "${s}"`);
-}
-for (const s of [
   "fix the failing test",
   "refactor the auth module",
   "rename this variable",
 ]) {
   assert.equal(
-    nbIntent.test(s) || browserIntent.test(s),
+    nbIntent.test(s),
     false,
     `plain coding must enable neither: "${s}"`,
   );

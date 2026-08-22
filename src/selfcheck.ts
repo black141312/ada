@@ -338,10 +338,17 @@ async function main(): Promise<void> {
     assert.match(BROWSE_DEFAULT_MODEL, /sonnet/i, "browse should default to a Sonnet (cheap, reads screenshots)");
     assert.equal(describeCall("browse", { goal: "open localhost:5173" }).detail, "open localhost:5173");
     assert.ok(!permPhrase("browse", false).startsWith("run the"), "browse needs its own perm phrase");
-    // The gate advertises `browse` now; a gate still naming `browser` would advertise nothing.
+    // `browse` is no longer gated at all. The regex was dev-flavoured (localhost, devtools,
+    // screenshot), so "read my gmail" advertised nothing and the model answered that it had no
+    // browser - accurately, since it had none. At ~244 tokens a turn it is cheap enough to always
+    // offer, unlike the raw `browser` above whose schema is the thing worth hiding.
+    // browse is registered at runtime (registerBrowseTool), so it is not in the static list above -
+    // check the source that a future edit cannot quietly re-gate it.
+    const browseSrc = readFileSync(new URL("./client/browse.ts", import.meta.url), "utf8");
+    assert.ok(!/lazy:s*true/.test(browseSrc), "`browse` must be advertised every turn, not lazy");
     assert.ok(
-      LAZY_GATES.some((g) => g.tools.includes("browse")) && !LAZY_GATES.some((g) => g.tools.includes("browser")),
-      "the browser gate must unlock `browse`, not the hidden `browser`",
+      !LAZY_GATES.some((g) => g.tools.includes("browse") || g.tools.includes("browser")),
+      "no lazy gate should name browse/browser - browse is advertised unconditionally now",
     );
   }
 
