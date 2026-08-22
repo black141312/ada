@@ -9,6 +9,8 @@ import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { Bridge, EXT_DIR, RemoteBridge, isAttachable, type BridgeLike } from "./bridge.ts";
+import { resolveChromeProfile } from "./chrome-profiles.ts";
+import { loadSettings } from "./settings.ts";
 
 const PORT = Number(process.env.ADA_CDP_PORT) || 9222;
 const ORIGIN = `http://127.0.0.1:${PORT}`;
@@ -149,6 +151,16 @@ let bridgeChecked = false;
  *  then silently switch to the user's real browser halfway through. */
 let bridgeMode: boolean | null = null;
 
+/** The saved profile choice, if any. Read lazily: settings can change between runs, and a browser
+ *  action is rare enough that re-reading a small JSON file costs nothing. */
+function settingsProfile(): string | undefined {
+  try {
+    return loadSettings(true).chromeProfile;
+  } catch {
+    return undefined;
+  }
+}
+
 /** The bridge drives the user's REAL browser (their logins, their tabs) via a loaded extension;
  *  the debug port drives ada's own profile. Prefer the bridge when the extension is actually
  *  connected, because that is the browser the user means. ADA_BROWSER_BRIDGE=0 opts out. */
@@ -194,7 +206,11 @@ async function getBridge(): Promise<BridgeLike | null> {
   if (!bridge.connected && process.env.ADA_BROWSER_BRIDGE !== "0") {
     const exe = browserPaths().find((p) => existsSync(p));
     if (exe) {
-      const profileDir = process.env.ADA_CHROME_PROFILE || "Default";
+      // Which profile? The extension is per-profile, so launching Default when the extension lives in
+      // another one drives a browser ada cannot reach. Ask where it actually is.
+      const chosen = await resolveChromeProfile(EXT_DIR, settingsProfile());
+      const profileDir = chosen.dir;
+      if (process.env.ADA_BROWSER_DEBUG) console.error(`[bridge] profile=${profileDir} (${chosen.why})`);
       // Side-load the bridge while we're starting it anyway. Without this the extension has to be
       // installed by hand at chrome://extensions — the one page the debugger may never touch — and
       // Chrome drops unpacked extensions often enough that "it worked last month" isn't worth much.

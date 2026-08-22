@@ -6,6 +6,28 @@ All notable changes to ada are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — ada opens the Chrome profile that actually has the extension
+
+The bridge extension is per-profile: it is loaded into one profile, and only that profile's tabs are
+reachable through it. Ada launched `Default` regardless, and `ADA_CHROME_PROFILE` was the only way to
+say otherwise — an env var named after Chrome's internal directory (`"Profile 6"`), documented
+nowhere. Worse, it barely worked: `--load-extension` is ignored when Chrome is already running, which
+for most people it always is, so pointing ada at a profile without the extension just fell through to
+its own scratch profile with none of your logins. Silently.
+
+Ada now reads which profiles carry the extension and launches one of those:
+
+- exactly one has it — use it, no question asked;
+- several have it — ask, listing them by the name you know (`adacodelabs.com — admin@…`), not
+  `Profile 6`, and remember the answer in `chromeProfile`;
+- nothing to ask on (print mode, `serve`, cron) — take the profile Chrome itself used last rather
+  than block on a prompt nobody can answer;
+- none have it — open the profile you actually work in and side-load there, as before.
+
+A saved choice is honoured only while that profile still carries the extension. Otherwise ada would
+keep launching a browser it cannot drive and fall back silently every time — the original bug wearing
+a settings key.
+
 ### Fixed — ada stops claiming it has no browser
 
 `browse` was lazy: advertised to the model only when the turn matched a regex of dev words —

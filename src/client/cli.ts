@@ -16,6 +16,7 @@ import { deleteCredential, getCredential, listCredentials, setCredential } from 
 import { deviceGrant, deviceLogin, oauthConfig } from "../server/oauth.ts";
 import { subscriptionFor, subscriptionLogin } from "../server/providers/subscription-oauth.ts";
 import { addTrust, isTrusted, loadSettings, setActiveAgentPermissions, setGlobal, setOrgDefaults, setOrgPermissions, workspaceDirs, type PermRule, type Settings } from "./settings.ts";
+import { setChromeProfileChooser } from "./chrome-profiles.ts";
 import { getCommands, loadExtensions } from "./extensions.ts";
 import { setAsker } from "./tools.ts";
 import { addRemoteSkill, loadSkills, registerSkillTool } from "./skills.ts";
@@ -1917,6 +1918,17 @@ async function main(): Promise<void> {
   // Registered before the agent snapshots its tool list, so they appear in the registry.
   registerSubagentTools({ client, model, onApprove, autoApprove, reasoning: flags.reasoning ?? settings.reasoning, project: includeProject, compactAt: settings.compactAt });
   registerBrowseTool({ client, onApprove, compactAt: settings.compactAt });
+
+  // Only the interactive REPL can ask. Print mode, serve and cron leave this unset, and
+  // resolveChromeProfile falls back to the last-used profile instead of blocking on a prompt.
+  setChromeProfileChooser(async (choices) => {
+    const pick = await select(rl, "Which Chrome profile should ada drive?  (↑/↓ · Enter)", choices.map((c) => c.label));
+    if (pick === null) return null;
+    const chosen = choices[pick]!;
+    setGlobal({ chromeProfile: chosen.dir });
+    console.log(`[2m  saved — ada will use \"${chosen.label}\". Change it in ~/.ada/settings.json (chromeProfile).[0m`);
+    return chosen.dir;
+  });
 
   const agent = new Agent({
     client,
