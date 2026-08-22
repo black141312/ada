@@ -169,8 +169,8 @@ function render(a) {
     '</div>' +
     '<div class="grid2">' +
       '<div class="card"><h2>Top accounts · ' + a.windowDays + 'd</h2>' + (a.topUsers.length ?
-        '<table><tr><th>account</th><th>plan</th><th style="text-align:right">tokens</th><th style="text-align:right">quota</th></tr>' +
-        a.topUsers.map((u) => '<tr><td>'+esc(u.user)+'</td><td><span class="pill">'+esc(u.plan)+'</span></td><td class="num">'+fmt(u.tokens)+'</td><td class="num">'+u.pctOfQuota+'%</td></tr>').join('') + '</table>'
+        '<table><tr><th>account</th><th>plan</th><th style="text-align:right">tokens</th><th style="text-align:right">cost</th><th style="text-align:right">quota</th></tr>' +
+        a.topUsers.map((u) => '<tr><td>'+esc(u.user)+'</td><td><span class="pill">'+esc(u.plan)+'</span></td><td class="num">'+fmt(u.tokens)+'</td><td class="num">$'+u.usd.toFixed(2)+'</td><td class="num">'+u.pctOfQuota+'%</td></tr>').join('') + '</table>'
         : '<p class="empty">No usage in this window.</p>') + '</div>' +
       '<div class="card"><h2>Where to improve</h2>' + (a.insights.length ?
         '<ul class="insights">' + a.insights.map((i) => '<li class="'+i.level+'">'+esc(i.text)+'</li>').join('') + '</ul>'

@@ -4,33 +4,48 @@
 // which is the wrong question for a product anyone can sign up for — the question is "what is this
 // person entitled to?". Everyone authenticated gets in; the plan decides what they get.
 //
-// Quotas are counted in TOKENS, not dollars. Dollars are what actually matters to the operator, but
-// they need a live price table per model, they drift under the user mid-month, and "you have 40k
-// tokens left" is a sentence a user can act on. Tokens are also what usage_events already stores,
-// so the number enforced is the number recorded — no conversion to disagree about later.
+// Quotas are counted in DOLLARS over a rolling 4-hour window, not tokens per month.
+//
+// Tokens were the honest unit while there was no price table — but a token cap prices a $25/1M
+// model the same as a $0.10/1M one, so the only tier that could be offered safely was one that
+// assumed the worst. Now that usage is costed from models.dev prices (usage.ts), the cap can be the
+// thing the operator actually cares about: spend.
+//
+// 4 hours, not a month, because a monthly cap lets one bad afternoon burn the whole allowance and
+// leaves the account dead for three weeks. A short window fails small and recovers on its own.
 import type { Pool } from "pg";
 import type Database from "better-sqlite3";
 import { authDatabase, usingPostgres } from "./db.js";
 import { adminUsers } from "./identity.js";
-import { billableUsageSince } from "./usage.js";
+import { costSince, priceUsd } from "./usage.js";
 
 export type PlanName = "free" | "pro" | "team";
 export type PlanStatus = "active" | "past_due" | "canceled" | "banned";
 
 export interface PlanDef {
-  /** `free` restricts to `:free` models, which cost nothing upstream. `all` is the full catalogue. */
+  /** `free` restricts to the cheap free-tier models (see isFreeModel). `all` is the full catalogue. */
   models: "free" | "all";
-  /** Prompt + completion tokens per billing period. */
-  monthlyTokens: number;
+  /** Upstream spend allowed per WINDOW_MS. NULL MEANS UNCAPPED — enterprise is billed by contract,
+   *  so metering it is reporting, not gating. */
+  capUsd: number | null;
   label: string;
 }
+
+/** The rolling spend window. */
+export const WINDOW_MS = 4 * 60 * 60 * 1000;
+
+/** Start of the current window. Fixed UTC buckets rather than a true rolling sum, so there is a real
+ *  reset time to show a user ("resets at 16:00") instead of "some of it ages off gradually".
+ *  ponytail: a burst can span a bucket edge and spend 2× the cap in a few minutes; move to a true
+ *  rolling sum (sum over now-WINDOW_MS) if that ever shows up in the numbers. */
+export const windowStart = (now = Date.now()): number => Math.floor(now / WINDOW_MS) * WINDOW_MS;
 
 // Definitions live in code, not a table: they change rarely, and in git a limit change is reviewable
 // and has an author. A `plans` table would make quotas editable with no diff and no history.
 export const PLANS: Record<PlanName, PlanDef> = {
-  free: { models: "free", monthlyTokens: 2_000_000, label: "Free" },
-  pro: { models: "all", monthlyTokens: 25_000_000, label: "Pro" },
-  team: { models: "all", monthlyTokens: 120_000_000, label: "Team" },
+  free: { models: "free", capUsd: 0.5, label: "Free" },
+  pro: { models: "all", capUsd: 2, label: "Pro" },
+  team: { models: "all", capUsd: null, label: "Team" },
 };
 
 export interface UserPlan {
@@ -42,9 +57,9 @@ export interface UserPlan {
   /** Access is good until this ms timestamp. NULL MEANS NEVER EXPIRES — a plan granted by hand
    *  should not die because nobody wrote a date. Only a payment provider sets a real one. */
   paidThrough: number | null;
-  /** Per-user monthly token cap. Null = use the plan's cap. Set by an admin to raise (or shrink)
-   *  one account's allowance without inventing a plan for it. */
-  maxTokens: number | null;
+  /** Per-user spend cap per window, in USD. Null = use the plan's cap. Set by an admin to raise (or
+   *  shrink) one account's allowance without inventing a plan for it. */
+  maxUsd: number | null;
 }
 
 const pg = () => authDatabase() as Pool;
@@ -70,12 +85,13 @@ function ensure(): Promise<void> {
       // that predates these columns would silently never get them.
       await pg().query("alter table user_plans add column if not exists paid_through bigint");
       await pg().query("alter table user_plans add column if not exists max_tokens bigint");
+      await pg().query("alter table user_plans add column if not exists max_usd double precision");
     } else {
       lite().exec(ddl.replace(/bigint/g, "integer"));
       // SQLite has no `add column if not exists`; adding a column twice is an error, so ask first.
       const cols = lite().prepare("pragma table_info(user_plans)").all() as Array<{ name: string }>;
-      for (const col of ["paid_through", "max_tokens"]) {
-        if (!cols.some((c) => c.name === col)) lite().exec(`alter table user_plans add column ${col} integer`);
+      for (const [col, type] of [["paid_through", "integer"], ["max_tokens", "integer"], ["max_usd", "real"]] as const) {
+        if (!cols.some((c) => c.name === col)) lite().exec(`alter table user_plans add column ${col} ${type}`);
       }
     }
   })();
@@ -89,7 +105,7 @@ export function invalidatePlanCache(user?: string): void {
   else cache.clear();
 }
 
-const DEFAULT_PLAN = (user: string): UserPlan => ({ user, plan: "free", status: "active", periodStart: null, paidThrough: null, maxTokens: null });
+const DEFAULT_PLAN = (user: string): UserPlan => ({ user, plan: "free", status: "active", periodStart: null, paidThrough: null, maxUsd: null });
 
 /** The plan for an account. No row means free — signing up is enough to be a free user, so a
  *  missing row is a normal state, not an error. A DB failure also yields free rather than throwing:
@@ -97,12 +113,12 @@ const DEFAULT_PLAN = (user: string): UserPlan => ({ user, plan: "free", status: 
 export async function planFor(user: string): Promise<UserPlan> {
   const hit = cache.get(user);
   if (hit && hit.exp > Date.now()) return hit.plan;
-  let row: { plan?: string; status?: string; period_start?: number | string | null; paid_through?: number | string | null; max_tokens?: number | string | null } | undefined;
+  let row: { plan?: string; status?: string; period_start?: number | string | null; paid_through?: number | string | null; max_usd?: number | string | null } | undefined;
   try {
     await ensure();
     row = usingPostgres
-      ? ((await pg().query("select plan, status, period_start, paid_through, max_tokens from user_plans where user_id = $1", [user])).rows[0] as typeof row)
-      : (lite().prepare("select plan, status, period_start, paid_through, max_tokens from user_plans where user_id = ?").get(user) as typeof row);
+      ? ((await pg().query("select plan, status, period_start, paid_through, max_usd from user_plans where user_id = $1", [user])).rows[0] as typeof row)
+      : (lite().prepare("select plan, status, period_start, paid_through, max_usd from user_plans where user_id = ?").get(user) as typeof row);
   } catch (e) {
     console.error("[ada] plan lookup failed:", e instanceof Error ? e.message : e);
     return DEFAULT_PLAN(user);
@@ -114,7 +130,7 @@ export async function planFor(user: string): Promise<UserPlan> {
     status: (row?.status ?? "active") as PlanStatus,
     periodStart: row?.period_start != null ? Number(row.period_start) : null,
     paidThrough: row?.paid_through != null ? Number(row.paid_through) : null,
-    maxTokens: row?.max_tokens != null ? Number(row.max_tokens) : null,
+    maxUsd: row?.max_usd != null ? Number(row.max_usd) : null,
   };
   cache.set(user, { plan, exp: Date.now() + TTL });
   return plan;
@@ -162,57 +178,87 @@ export interface Entitlement {
   status?: 402 | 403;
   message?: string;
   plan: PlanName;
-  used: number;
-  limit: number;
+  /** Upstream spend so far this window, USD. */
+  usedUsd: number;
+  /** The cap in force (plan cap, or the account's override). Null = uncapped. */
+  capUsd: number | null;
+  /** When this window rolls over, ms. */
+  resetsAt: number;
 }
 
-/** Free tier covers `:free`-suffixed models (zero upstream cost) plus any IDs the operator lists
- *  in ADA_FREE_MODELS (comma-separated). Read per call so a restart isn't needed mid-test. */
+/** Blended $/1M above which a model is NOT on the free tier. Tuned so a free session runs on the
+ *  small-and-fast tier (flash/mini/nano/small class) and the caps below buy a useful amount of it:
+ *  at $0.30 blended, $0.50 is ~1.6M tokens every 4 hours. ADA_FREE_MAX_PRICE overrides. */
+const FREE_MAX_PRICE = 0.6;
+
+/** May the free plan run this model?
+ *
+ *  `:free` OpenRouter variants qualify, but they are no longer the point of the tier. Their upstream
+ *  quota is shared across every OpenRouter user, so it is exhausted for most of the day and answers
+ *  429/404 — which reads to a user as "Ada is broken", not "the free tier is busy". So the free tier
+ *  is defined by PRICE instead: anything CHEAP enough that we can afford to give it away under the
+ *  spend cap. Cheap-and-always-up beats free-and-rate-limited.
+ *
+ *  A price RULE rather than a hand-written list of ids on purpose — a list goes stale the week a lab
+ *  ships a cheaper model or reprices an old one, and nobody notices because nothing breaks. An
+ *  unpriced model is not free (fail closed), and ADA_FREE_MODELS still force-includes specific ids.
+ *  Read per call so a restart isn't needed mid-test. */
 export function isFreeModel(id: string): boolean {
   if (/:free$/i.test(id)) return true;
   const extra = process.env.ADA_FREE_MODELS;
-  if (!extra) return false;
-  const want = id.toLowerCase();
-  return extra.split(",").some((m) => m.trim().toLowerCase() === want);
+  if (extra) {
+    const want = id.toLowerCase();
+    if (extra.split(",").some((m) => m.trim().toLowerCase() === want)) return true;
+  }
+  const [inPrice, outPrice] = priceUsd(id);
+  // Blended 3:1 input:output — roughly the shape of a chat turn, and it stops a model with cheap
+  // input and $20 output from sneaking in on its input price alone.
+  const blended = (inPrice * 3 + outPrice) / 4;
+  const max = Number(process.env.ADA_FREE_MAX_PRICE) || FREE_MAX_PRICE;
+  // priceUsd() returns the pessimistic UNKNOWN_PRICE for an id it can't find, which is far above
+  // any threshold — so "we don't know what this costs" resolves to "not free".
+  return blended > 0 && blended <= max;
 }
 
 /** The whole gate: may this account run this model right now? */
 export async function checkEntitlement(user: string, model: string): Promise<Entitlement> {
+  const since = windowStart();
+  const resetsAt = since + WINDOW_MS;
+  const spend = () => costSince(user, since).then((c) => c.usd).catch(() => 0);
   // God mode: env-listed admins are never metered or model-gated. The list lives in env, not the
   // database, so it cannot be self-granted through any API. Usage is still recorded and reported —
   // unlimited spend should still be visible spend.
   if (adminUsers()?.includes(user)) {
-    const used = await billableUsageSince(user, periodStart(DEFAULT_PLAN(user))).then((u) => u.promptTokens + u.completionTokens).catch(() => 0);
-    return { ok: true, plan: "team", used, limit: Number.MAX_SAFE_INTEGER };
+    return { ok: true, plan: "team", usedUsd: await spend(), capUsd: null, resetsAt };
   }
   const up = await planFor(user);
   // Banned beats everything except god mode (above): no models, not even free ones. 403, not 402 —
   // there is nothing the user can pay to fix.
   if (up.status === "banned") {
-    return { ok: false, status: 403, message: "This account is suspended.", plan: up.plan, used: 0, limit: 0 };
+    return { ok: false, status: 403, message: "This account is suspended.", plan: up.plan, usedUsd: 0, capUsd: 0, resetsAt };
   }
   const def = effectivePlan(up);
-  const since = periodStart(up);
-  const used = await billableUsageSince(user, since).then((u) => u.promptTokens + u.completionTokens).catch(() => 0);
+  const usedUsd = await spend();
   // A per-user override beats the plan's cap — how an admin grants one account more (or less)
-  // without inventing a plan for it.
-  const limit = up.maxTokens ?? def.monthlyTokens;
-  const base = { plan: def.name, used, limit };
+  // without inventing a plan for it. Both can be null, which means uncapped.
+  const capUsd = up.maxUsd ?? def.capUsd;
+  const base = { plan: def.name, usedUsd, capUsd, resetsAt };
 
   if (def.models === "free" && !isFreeModel(model)) {
     return {
       ...base,
       ok: false,
       status: 403,
-      message: `${def.label} plan covers free-tier models only. Upgrade to use ${model}.`,
+      message: `${def.label} plan covers the free model tier only. Upgrade to use ${model}.`,
     };
   }
-  if (used >= limit) {
+  if (capUsd != null && usedUsd >= capUsd) {
+    const at = new Date(resetsAt).toISOString().slice(11, 16);
     return {
       ...base,
       ok: false,
       status: 402,
-      message: `${def.label} plan quota reached — ${used.toLocaleString()} of ${limit.toLocaleString()} tokens this period. Resets ${new Date(since).toISOString().slice(0, 10)} + 1 month.`,
+      message: `${def.label} plan cap reached — $${usedUsd.toFixed(2)} of $${capUsd.toFixed(2)} per ${WINDOW_MS / 3_600_000} hours. Resets at ${at} UTC.`,
     };
   }
   return { ...base, ok: true };
@@ -245,26 +291,26 @@ export async function setPlan(
   anchorNow = true,
   paidThrough: number | null = null,
   /** undefined = leave any existing override alone (so payment webhooks can't wipe an admin-set
-   *  cap); null = clear the override; a number = set it. */
-  maxTokens: number | null | undefined = undefined,
+   *  cap); null = clear the override; a number = set it. USD per window. */
+  maxUsd: number | null | undefined = undefined,
 ): Promise<void> {
   await ensure();
   const now = Date.now();
   const start = anchorNow && plan !== "free" ? now : null;
-  const setMax = maxTokens === undefined ? "" : "max_tokens = excluded.max_tokens, ";
+  const setMax = maxUsd === undefined ? "" : "max_usd = excluded.max_usd, ";
   if (usingPostgres) {
     await pg().query(
-      `insert into user_plans (user_id, plan, status, period_start, paid_through, max_tokens, updated_at) values ($1,$2,$3,$4,$5,$6,$7)
+      `insert into user_plans (user_id, plan, status, period_start, paid_through, max_usd, updated_at) values ($1,$2,$3,$4,$5,$6,$7)
        on conflict (user_id) do update set plan = excluded.plan, status = excluded.status, period_start = excluded.period_start, paid_through = excluded.paid_through, ${setMax}updated_at = excluded.updated_at`,
-      [user, plan, status, start, paidThrough, maxTokens ?? null, now],
+      [user, plan, status, start, paidThrough, maxUsd ?? null, now],
     );
   } else {
     lite()
       .prepare(
-        `insert into user_plans (user_id, plan, status, period_start, paid_through, max_tokens, updated_at) values (?,?,?,?,?,?,?)
+        `insert into user_plans (user_id, plan, status, period_start, paid_through, max_usd, updated_at) values (?,?,?,?,?,?,?)
          on conflict (user_id) do update set plan = excluded.plan, status = excluded.status, period_start = excluded.period_start, paid_through = excluded.paid_through, ${setMax}updated_at = excluded.updated_at`,
       )
-      .run(user, plan, status, start, paidThrough, maxTokens ?? null, now);
+      .run(user, plan, status, start, paidThrough, maxUsd ?? null, now);
   }
   invalidatePlanCache(user);
 }

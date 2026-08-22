@@ -11,7 +11,8 @@
 import type { Pool } from "pg";
 import type Database from "better-sqlite3";
 import { authDatabase, usingPostgres } from "./db.js";
-import { PLANS, type PlanName } from "./plans.js";
+import { PLANS, WINDOW_MS, type PlanName } from "./plans.js";
+import { priceUsd } from "./usage.js";
 import { kelviqEnabled, listKelviqSubscriptions } from "./kelviq.js";
 
 const DAY_MS = 86_400_000;
@@ -67,7 +68,7 @@ export interface Analytics {
   totals: { requests: number; tokens: number; activeUsers: number };
   daily: DailyPoint[];
   models: { model: string; requests: number; tokens: number }[];
-  topUsers: { user: string; requests: number; tokens: number; plan: PlanName; pctOfQuota: number }[];
+  topUsers: { user: string; requests: number; tokens: number; usd: number; plan: PlanName; pctOfQuota: number }[];
   plans: { plan: string; users: number }[];
   funnel: { minted: number; paid: number; expired: number; pending: number; conversionPct: number | null };
   timing: Timing;
@@ -162,21 +163,39 @@ export async function computeAnalytics(windowDays = 30): Promise<Analytics> {
   for (const p of planOf.values()) planCounts.set(p, (planCounts.get(p) ?? 0) + 1);
   const plans = [...planCounts.entries()].map(([plan, users]) => ({ plan, users })).sort((a, b) => b.users - a.users);
 
-  const topUsers = (
-    await all<{ user_id: string; c: number; t: number }>(
-      "select user_id, count(*) as c, sum(prompt_tokens + completion_tokens) as t from usage_events where ts >= ? group by user_id order by t desc limit 10",
-      [since],
-    )
-  ).map((r) => {
-    const plan = planOf.get(r.user_id) ?? "free";
-    return {
-      user: r.user_id,
-      requests: Number(r.c),
-      tokens: Number(r.t),
-      plan,
-      pctOfQuota: Math.round((Number(r.t) / PLANS[plan].monthlyTokens) * 100),
-    };
-  });
+  // Grouped by (user, model) rather than by user alone: cost needs the model, and a user's spend is
+  // not derivable from a token total once a $0.10 model and a $25 one both count as "a token".
+  const perUser = new Map<string, { requests: number; tokens: number; usd: number }>();
+  for (const r of await all<{ user_id: string; model: string; c: number; p: number; o: number }>(
+    "select user_id, model, count(*) as c, sum(prompt_tokens) as p, sum(completion_tokens) as o from usage_events where ts >= ? group by user_id, model",
+    [since],
+  )) {
+    const acc = perUser.get(r.user_id) ?? { requests: 0, tokens: 0, usd: 0 };
+    const [inPrice, outPrice] = priceUsd(r.model);
+    acc.requests += Number(r.c);
+    acc.tokens += Number(r.p) + Number(r.o);
+    acc.usd += (Number(r.p) * inPrice + Number(r.o) * outPrice) / 1_000_000;
+    perUser.set(r.user_id, acc);
+  }
+  // How many spend windows the report covers — what the per-window cap would have allowed over it.
+  const windowsInPeriod = (windowDays * DAY_MS) / WINDOW_MS;
+  const topUsers = [...perUser.entries()]
+    .sort((a, b) => b[1].usd - a[1].usd)
+    .slice(0, 10)
+    .map(([user, acc]) => {
+      const plan = planOf.get(user) ?? "free";
+      const cap = PLANS[plan].capUsd;
+      return {
+        user,
+        requests: acc.requests,
+        tokens: acc.tokens,
+        usd: Math.round(acc.usd * 100) / 100,
+        plan,
+        // Against what the plan would have ALLOWED over this whole report window. Uncapped tiers
+        // have no denominator, so they read 0 rather than dividing by null.
+        pctOfQuota: cap == null ? 0 : Math.round((acc.usd / (cap * windowsInPeriod)) * 100),
+      };
+    });
 
   const funnelRows = await all<{ status: string; c: number }>(
     "select status, count(*) as c from checkout_sessions where created_at >= ? group by status",

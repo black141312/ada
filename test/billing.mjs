@@ -53,7 +53,7 @@ assert.equal(await completeCheckout("garbage"), false, "an unknown id must be a 
 // Age a pending session past its window and it must stop being usable.
 const stale = await createCheckout("bob", "team");
 const { authDatabase } = await import(pathToFileURL(join(base, "src/server/auth.ts")).href);
-authDatabase.prepare("update checkout_sessions set expires_at = ? where id = ?").run(Date.now() - 1000, stale.id);
+authDatabase().prepare("update checkout_sessions set expires_at = ? where id = ?").run(Date.now() - 1000, stale.id);
 assert.equal((await getCheckout(stale.id)).status, "expired", "a session past its window reads as expired");
 assert.equal(await completeCheckout(stale.id), false, "an expired session must not grant a plan");
 invalidatePlanCache("bob");
