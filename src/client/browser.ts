@@ -167,6 +167,26 @@ function settingsProfile(): string | undefined {
   }
 }
 
+/** Is that browser already running? A running Chrome ignores --load-extension, so spawning one
+ *  cannot do the job it is there for - and the `about:blank` it is handed STEALS the user's active
+ *  tab. `browse` then reads that tab and reports their browser is empty, which is how ada came to
+ *  answer "your browser is on a blank page" while their work sat one tab away. Measured: the active
+ *  tab went from a LeetCode problem to about:blank, and a blank tab was left behind each time. */
+function browserRunning(exe: string): boolean {
+  const name = exe.split(/[\/]/).pop() ?? "";
+  if (!name) return false;
+  try {
+    if (process.platform === "win32") {
+      const out = execFileSync("tasklist", ["/FI", `IMAGENAME eq ${name}`, "/NH"], { encoding: "utf8", timeout: 4000, stdio: ["ignore", "pipe", "ignore"] });
+      return out.toLowerCase().includes(name.toLowerCase());
+    }
+    execFileSync("pgrep", ["-f", name], { timeout: 4000, stdio: "ignore" });
+    return true;
+  } catch {
+    return false; // tasklist/pgrep missing, or no match - treat as not running
+  }
+}
+
 /** The bridge drives the user's REAL browser (their logins, their tabs) via a loaded extension;
  *  the debug port drives ada's own profile. Prefer the bridge when the extension is actually
  *  connected, because that is the browser the user means. ADA_BROWSER_BRIDGE=0 opts out. */
@@ -225,7 +245,8 @@ async function getBridge(): Promise<BridgeLike | null> {
   // "drive a different browser" any time their window happens to be closed.
   if (!bridge.connected && process.env.ADA_BROWSER_BRIDGE !== "0") {
     const exe = browserPaths().find((p) => existsSync(p));
-    if (exe) {
+    const alreadyOpen = exe ? browserRunning(exe) : false;
+    if (exe && !alreadyOpen) {
       // Which profile? The extension is per-profile, so launching Default when the extension lives in
       // another one drives a browser ada cannot reach. Ask where it actually is.
       const chosen = await resolveChromeProfile(EXT_DIR, settingsProfile());
@@ -740,7 +761,15 @@ async function browserActionInner(action: BrowserVerb, opts: BrowserOpts = {}): 
   const { cdp, tabKey } = await openSession(opts.tab);
   const target = { id: tabKey };
   try {
-    await cdp.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
+    // Never resize a window somebody is looking at. A fixed viewport is right for ada's own
+    // scratch browser, where it makes screenshots comparable between runs - but applied to the
+    // real browser it squeezes the page the user is reading into 1280x800 inside their much
+    // larger window, letterboxed. Worse, BridgeSession stays attached on purpose (detaching per
+    // action would flicker Chrome's "ada bridge is debugging this browser" bar), so the override
+    // was never cleared: one browse left their tab squeezed until Chrome restarted. Measured on
+    // a live tab: 1920x889 forced down to 1280x800 and left there.
+    const sizeAsked = opts.width !== undefined || opts.height !== undefined;
+    if (!bridgeMode || sizeAsked) await cdp.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
     if (url) {
       await cdp.send("Page.enable");
       // Log.enable replays whatever the page already stored, which would arrive alongside the live

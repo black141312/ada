@@ -4,6 +4,36 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [Unreleased]
+
+### Fixed — ada stops resizing the window you are looking at
+
+Every browser action set `Emulation.setDeviceMetricsOverride` to 1280x800. That is right for ada's own
+scratch browser, where a fixed viewport makes screenshots comparable between runs. Applied to the
+user's real browser it squeezed the page they were reading into 1280x800 inside a much larger window,
+letterboxed in black — and because `BridgeSession` stays attached deliberately (detaching per action
+would flicker Chrome's "ada bridge is debugging this browser" bar), the override was never cleared.
+One `browse` left the tab squeezed until Chrome restarted. Measured on a live tab: 1920x889 forced
+down to 1280x800 and left there.
+
+The override now applies only to ada's own browser, or when a caller explicitly asks for a `width` or
+`height`. A window somebody is looking at is theirs to size.
+
+### Fixed — ada stops blanking the tab it is about to read
+
+When the bridge had not connected yet, ada launched the user's Chrome to side-load the extension,
+handing it `about:blank`. A running Chrome ignores `--load-extension` — the code said as much — so the
+launch could not do its job. What it *could* do was open that blank tab and focus it. `browse` then
+read the active tab and reported "your browser is currently on a blank page", while the page the user
+was asking about sat one tab away.
+
+Measured on a real window: active tab went from `Interleaving String - LeetCode` to `about:blank`, one
+tab added, and another left behind on every session that started before the extension dialled in.
+Five had accumulated.
+
+Ada now checks whether that browser is already running and skips the launch when it is: there is
+nothing it can achieve there, and the only thing it reliably achieved was taking the user's tab.
+
 ## [0.16.3] — 2026-08-23
 
 ### Changed — quotas are capped on spend per 4 hours, and the free tier is a price rule
