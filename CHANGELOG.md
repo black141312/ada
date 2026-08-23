@@ -6,6 +6,19 @@ All notable changes to ada are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — ada stops resizing the window you are looking at
+
+Every browser action set `Emulation.setDeviceMetricsOverride` to 1280x800. That is right for ada's own
+scratch browser, where a fixed viewport makes screenshots comparable between runs. Applied to the
+user's real browser it squeezed the page they were reading into 1280x800 inside a much larger window,
+letterboxed in black — and because `BridgeSession` stays attached deliberately (detaching per action
+would flicker Chrome's "ada bridge is debugging this browser" bar), the override was never cleared.
+One `browse` left the tab squeezed until Chrome restarted. Measured on a live tab: 1920x889 forced
+down to 1280x800 and left there.
+
+The override now applies only to ada's own browser, or when a caller explicitly asks for a `width` or
+`height`. A window somebody is looking at is theirs to size.
+
 ### Fixed — ada stops blanking the tab it is about to read
 
 When the bridge had not connected yet, ada launched the user's Chrome to side-load the extension,

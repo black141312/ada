@@ -761,7 +761,15 @@ async function browserActionInner(action: BrowserVerb, opts: BrowserOpts = {}): 
   const { cdp, tabKey } = await openSession(opts.tab);
   const target = { id: tabKey };
   try {
-    await cdp.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
+    // Never resize a window somebody is looking at. A fixed viewport is right for ada's own
+    // scratch browser, where it makes screenshots comparable between runs - but applied to the
+    // real browser it squeezes the page the user is reading into 1280x800 inside their much
+    // larger window, letterboxed. Worse, BridgeSession stays attached on purpose (detaching per
+    // action would flicker Chrome's "ada bridge is debugging this browser" bar), so the override
+    // was never cleared: one browse left their tab squeezed until Chrome restarted. Measured on
+    // a live tab: 1920x889 forced down to 1280x800 and left there.
+    const sizeAsked = opts.width !== undefined || opts.height !== undefined;
+    if (!bridgeMode || sizeAsked) await cdp.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
     if (url) {
       await cdp.send("Page.enable");
       // Log.enable replays whatever the page already stored, which would arrive alongside the live
