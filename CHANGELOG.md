@@ -4,6 +4,23 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [Unreleased]
+
+### Fixed — ada stops blanking the tab it is about to read
+
+When the bridge had not connected yet, ada launched the user's Chrome to side-load the extension,
+handing it `about:blank`. A running Chrome ignores `--load-extension` — the code said as much — so the
+launch could not do its job. What it *could* do was open that blank tab and focus it. `browse` then
+read the active tab and reported "your browser is currently on a blank page", while the page the user
+was asking about sat one tab away.
+
+Measured on a real window: active tab went from `Interleaving String - LeetCode` to `about:blank`, one
+tab added, and another left behind on every session that started before the extension dialled in.
+Five had accumulated.
+
+Ada now checks whether that browser is already running and skips the launch when it is: there is
+nothing it can achieve there, and the only thing it reliably achieved was taking the user's tab.
+
 ## [0.16.3] — 2026-08-23
 
 ### Changed — quotas are capped on spend per 4 hours, and the free tier is a price rule
