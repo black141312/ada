@@ -4,7 +4,7 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
-## [Unreleased]
+## [0.16.4] — 2026-08-23
 
 ### Fixed — ada stops resizing the window you are looking at
 
