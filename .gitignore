@@ -10,6 +10,9 @@ node_modules/
 .wrangler/
 
 ada-auth.db*
+# `screenshot` with no path writes here, so `npm run check:browser` leaves one in the repo root -
+# and `npm run release` refuses to tag a dirty tree. It blocked two releases before this line.
+page.png
 runs/
 
 # subagent-driven-development scratch
