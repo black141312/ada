@@ -4,7 +4,36 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
-## [Unreleased]
+## [0.16.3] — 2026-08-23
+
+### Changed — quotas are capped on spend per 4 hours, and the free tier is a price rule
+
+Quotas were tokens per month, which prices a $25/1M model the same as a $0.10/1M one — so the only
+free tier safe to offer was one that assumed the worst. The tier actually offered, OpenRouter's
+`:free` pool, shares its upstream quota with every OpenRouter user, is exhausted most of the day, and
+answers 429/404 — which reads as "ada is broken", not "the free tier is busy".
+
+Usage is now costed from models.dev prices at read time and capped on **spend**: $0.50/4h free,
+$2/4h pro, uncapped team (billed by contract, so metering it is reporting rather than gating). Four
+hours rather than a month, because a monthly cap lets one bad afternoon burn the whole allowance and
+leaves the account dead for three weeks; a short window fails small and recovers on its own.
+
+The free tier is a price rule, not a list of ids: anything at or under $0.60 blended per 1M, tunable
+with `ADA_FREE_MAX_PRICE`. A hand-written list goes stale the week a lab reprices and nobody
+notices, because nothing breaks. An unpriced model is never free — fail closed.
+
+`/v1/plan` reports `usedUsd`/`capUsd`/`resetsAt`; `used` stays in tokens, because the composer's live
+turn meter reads it to show a turn's own consumption. A per-user override moves from `max_tokens` to
+`max_usd`, the same unit as the plan, and analytics ranks accounts by real spend rather than by a
+token total that cannot be costed once cheap and expensive models both count.
+
+Also fixes `test/plans.mjs` and `test/billing.mjs`, which had been failing on `authDatabase.prepare()`
+since it became a function.
+
+### Fixed — `.gitignore` covers the sqlite sidecars
+
+`ada-auth.db` was ignored but not the `-journal`, `-wal` and `-shm` files sqlite writes beside it, so
+a stale journal sat untracked in the tree — and `npm run release` refuses to tag a dirty one.
 
 ### Fixed — ada no longer answers about the wrong browser, silently and forever
 
