@@ -6,6 +6,28 @@ All notable changes to ada are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — ada no longer answers about the wrong browser, silently and forever
+
+Two faults that compounded into one bad afternoon: ada reporting a scratch browser's contents as the
+user's own, confidently, with no way for them to tell.
+
+- **The transport was decided once and never revisited.** Whether the bridge could reach the user's
+  Chrome was settled at the first browser action and cached for the life of the process. A session
+  that happened to start while the extension was reloading, or while another ada held port 9223, was
+  demoted to ada's own profile permanently — the extension could return a second later and that
+  session would never look again. It now re-checks: success stays sticky, because switching browsers
+  mid-session is the confusion this arrangement exists to avoid, but failure is retried — immediately
+  if a bridge is already listening and the extension merely reconnected, otherwise once a minute.
+- **The fallback said nothing.** Ada would open `leetcode.com` in its own logged-out profile, land on
+  the homepage, and report "I found your open LeetCode tab, but it's on the main homepage" — while
+  the user's real tab sat open in Chrome with their code in the editor. `tabs` already named which
+  browser it read; every other verb did not. Results from the scratch profile now carry a one-line
+  note saying so, so the model repeats it instead of guessing.
+
+`--disable-features=CalculateNativeWinOcclusion` cannot help on the bridge path: that browser is the
+user's, already running, and ada cannot relaunch it. A coordinate click into an occluded window is
+still dropped there.
+
 ### Fixed — ada opens the Chrome profile that actually has the extension
 
 The bridge extension is per-profile: it is loaded into one profile, and only that profile's tabs are

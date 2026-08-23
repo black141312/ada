@@ -150,6 +150,12 @@ let bridgeChecked = false;
 /** Decided once per process. Re-deciding per action let a single run start in ada's own profile and
  *  then silently switch to the user's real browser halfway through. */
 let bridgeMode: boolean | null = null;
+/** When the last failed check happened. A session that started while the extension was reloading, or
+ *  while another ada held the port, used to be downgraded to the scratch profile FOREVER - it never
+ *  looked again, and never said so. Re-check periodically instead; success stays sticky, because
+ *  switching browsers mid-session is the confusion this whole arrangement exists to avoid. */
+let bridgeCheckedAt = 0;
+const BRIDGE_RECHECK_MS = 60_000;
 
 /** The saved profile choice, if any. Read lazily: settings can change between runs, and a browser
  *  action is rare enough that re-reading a small JSON file costs nothing. */
@@ -166,7 +172,19 @@ function settingsProfile(): string | undefined {
  *  connected, because that is the browser the user means. ADA_BROWSER_BRIDGE=0 opts out. */
 async function getBridge(): Promise<BridgeLike | null> {
   if (process.env.ADA_BROWSER_BRIDGE === "0") return null;
-  if (bridgeMode !== null) return bridgeMode ? bridge : null;
+  if (bridgeMode === true) return bridge;
+  if (bridgeMode === false) {
+    // Already own a listening bridge? The extension may simply have reconnected since - that costs
+    // one property read, so it is worth trying on every action rather than on the slow clock.
+    if (bridge?.connected) {
+      bridgeMode = true;
+      return bridge;
+    }
+    if (Date.now() - bridgeCheckedAt < BRIDGE_RECHECK_MS) return null;
+    bridgeMode = null;
+    bridgeChecked = false;
+    bridge = null;
+  }
   if (bridgeChecked) return null;
   bridgeChecked = true;
   // Strict mode: the caller means the REAL browser. Falling back to ada's own profile would run the
@@ -182,11 +200,13 @@ async function getBridge(): Promise<BridgeLike | null> {
     if (remote) {
       bridge = remote;
       bridgeMode = remote.connected;
+      bridgeCheckedAt = Date.now();
       if (!bridgeMode && strict) throw new Error("ADA_BROWSER_BRIDGE=1: borrowed another ada's bridge, but its extension is not connected.");
       return bridgeMode ? bridge : null;
     }
     bridge = null;
     bridgeMode = false;
+    bridgeCheckedAt = Date.now();
     if (strict)
       throw new Error(
         "ADA_BROWSER_BRIDGE=1 but port 9223 is held by something that cannot reach the browser — " +
@@ -221,6 +241,7 @@ async function getBridge(): Promise<BridgeLike | null> {
     }
   }
   bridgeMode = bridge.connected;
+  bridgeCheckedAt = Date.now();
   if (process.env.ADA_BROWSER_DEBUG) console.error(`[bridge] own=true connected=${bridgeMode}`);
   if (!bridgeMode && strict) {
     throw new Error(
@@ -680,8 +701,24 @@ async function viaContentScript(b: BridgeLike, action: BrowserVerb, opts: Browse
   return null;
 }
 
-/** Run one browser action. `url` navigates first when given; otherwise acts on the current page. */
+/** Which browser the action actually ran in. Falling back to ada's own profile is invisible
+ *  otherwise: it answers about a browser the user has never seen, with their tabs and logins
+ *  absent, and sounds equally confident either way. Someone watching ada describe "your open
+ *  tab" while it reads a scratch profile has no way to tell. So say it in the text the model
+ *  reads - a note it can pass on beats a silence nobody notices. ~20 tokens, and only while the
+ *  fallback is in force; ADA_BROWSER_BRIDGE=0 is a deliberate opt-out and stays quiet. */
+const SCRATCH_NOTE =
+  "[ada's own browser - NOT the user's Chrome: their tabs, logins and sessions are not here. Say so before calling anything on this page theirs.]";
+
 export async function browserAction(action: BrowserVerb, opts: BrowserOpts = {}): Promise<BrowserResult> {
+  const r = await browserActionInner(action, opts);
+  if (bridgeMode === false && process.env.ADA_BROWSER_BRIDGE !== "0") return { ...r, text: `${SCRATCH_NOTE}
+${r.text}` };
+  return r;
+}
+
+/** Run one browser action. `url` navigates first when given; otherwise acts on the current page. */
+async function browserActionInner(action: BrowserVerb, opts: BrowserOpts = {}): Promise<BrowserResult> {
   const { url, width = 1280, height = 800 } = opts;
   if (url && bridgeMode) assertBridgeAllowed(url);
 
