@@ -25,13 +25,17 @@ const fresh = await planFor("newcomer");
 assert.equal(fresh.plan, "free", "an account with no row must default to free");
 assert.equal(fresh.status, "active");
 
-// --- free tier is :free models only -----------------------------------------
+// --- the free tier is what we can AFFORD to give away, not what upstream calls free ------------
 const denied = await checkEntitlement("newcomer", "anthropic/claude-opus-5");
 assert.equal(denied.ok, false, "free must not reach a paid model");
 assert.equal(denied.status, 403, "a plan restriction is 403, not 402 — it isn't a quota problem");
 
-const allowed = await checkEntitlement("newcomer", "meta-llama/llama-3.3-70b-instruct:free");
-assert.equal(allowed.ok, true, "free must be able to run :free models");
+// A `:free` id is NOT free-tier. Its quota is capped per-minute per ACCOUNT across the whole free
+// pool, not per model: a handful of calls returns `Rate limit exceeded: free-models-per-min` for
+// every free model at once. Running one account, one user on a free model locks out everyone else,
+// and it reads as "ada is broken" rather than "the free tier is busy".
+const upstreamFree = await checkEntitlement("newcomer", "meta-llama/llama-3.3-70b-instruct:free");
+assert.equal(upstreamFree.ok, false, "a :free id must not qualify on its suffix");
 
 // --- the free tier is defined by PRICE, not by the :free suffix ---------------
 // The point of the change: :free upstream quota runs dry, so the tier is cheap models we pay for.
@@ -80,7 +84,9 @@ assert.equal((await checkEntitlement("other", "anthropic/claude-opus-5")).ok, tr
 await setPlan("lapsed", "pro", "past_due");
 const lapsed = await planFor("lapsed");
 assert.equal(effectivePlan(lapsed).name, "free", "past_due must fall back to free");
-assert.equal((await checkEntitlement("lapsed", "some/model:free")).ok, true, "a lapsed account keeps free access");
+// A cheap model, not a `:free` id — the free tier is a price rule, and what matters here is that
+// the account keeps SOME access, not which model it is.
+assert.equal((await checkEntitlement("lapsed", "gemini-2.5-flash-lite")).ok, true, "a lapsed account keeps free access");
 assert.equal((await checkEntitlement("lapsed", "anthropic/claude-opus-5")).status, 403, "a lapsed account loses paid models");
 
 // --- an unknown plan string must not grant anything --------------------------

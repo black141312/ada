@@ -193,18 +193,18 @@ const FREE_MAX_PRICE = 0.6;
 
 /** May the free plan run this model?
  *
- *  `:free` OpenRouter variants qualify, but they are no longer the point of the tier. Their upstream
- *  quota is shared across every OpenRouter user, so it is exhausted for most of the day and answers
- *  429/404 — which reads to a user as "Ada is broken", not "the free tier is busy". So the free tier
- *  is defined by PRICE instead: anything CHEAP enough that we can afford to give it away under the
- *  spend cap. Cheap-and-always-up beats free-and-rate-limited.
+ *  `:free` OpenRouter variants no longer qualify at all. Their quota is shared across every
+ *  OpenRouter user AND capped per-minute per ACCOUNT — measured: a handful of calls in a minute
+ *  returns `Rate limit exceeded: free-models-per-min` for every free model at once, not just the
+ *  one being called. We run one account, so one user on a free model locks out everybody else on
+ *  it. Two of them (google/gemma-4-*:free) answered 429 on every probe across an afternoon.
  *
- *  A price RULE rather than a hand-written list of ids on purpose — a list goes stale the week a lab
- *  ships a cheaper model or reprices an old one, and nobody notices because nothing breaks. An
- *  unpriced model is not free (fail closed), and ADA_FREE_MODELS still force-includes specific ids.
+ *  So the tier is defined by PRICE: anything cheap enough to give away under the spend cap.
+ *  Cheap-and-always-up beats free-and-rate-limited. A price RULE rather than a hand-written list
+ *  of ids on purpose — a list goes stale the week a lab reprices and nobody notices, because
+ *  nothing breaks. ADA_FREE_MODELS still force-includes specific ids for testing.
  *  Read per call so a restart isn't needed mid-test. */
 export function isFreeModel(id: string): boolean {
-  if (/:free$/i.test(id)) return true;
   const extra = process.env.ADA_FREE_MODELS;
   if (extra) {
     const want = id.toLowerCase();
@@ -216,7 +216,8 @@ export function isFreeModel(id: string): boolean {
   const blended = (inPrice * 3 + outPrice) / 4;
   const max = Number(process.env.ADA_FREE_MAX_PRICE) || FREE_MAX_PRICE;
   // priceUsd() returns the pessimistic UNKNOWN_PRICE for an id it can't find, which is far above
-  // any threshold — so "we don't know what this costs" resolves to "not free".
+  // any threshold — so "we don't know what this costs" resolves to "not free". A zero-priced model
+  // fails `> 0` for the same reason: free upstream is not a reason to hand it out (see above).
   return blended > 0 && blended <= max;
 }
 

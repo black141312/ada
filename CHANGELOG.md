@@ -4,6 +4,31 @@ All notable changes to ada are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims for
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once it reaches 1.0.
 
+## [Unreleased]
+
+### Changed — ada stops offering models it cannot use, and free ones it cannot rely on
+
+The catalogue was whatever the upstream returned. OpenRouter returns 416 models; 83 of them are no
+use to ada, and both kinds fail only once a user has already picked them.
+
+- **67 cannot be handed tools.** Ada is an agent — a model that cannot take a tool definition cannot
+  run a turn. Translation heads, image generators, and the `lyria` music models, which answer a chat
+  completion with a 502.
+- **16 are zero-priced.** The `:free` pool is capped per-minute per ACCOUNT, not per model: a handful
+  of calls returns `Rate limit exceeded: free-models-per-min` for *every* free model at once, not
+  just the one being called. Running one account, a single user on a free model locks out everyone
+  else. Measured over an afternoon, `google/gemma-4-*:free` answered 429 on every probe.
+
+Both filters are evidence-based. An entry that publishes none of this metadata comes through
+untouched — most providers send little more than an id, and a catalogue must not empty itself the day
+an upstream stops sending a field. An empty `supported_parameters` is "not stated", not "stated as
+none".
+
+`isFreeModel` no longer qualifies an id on its `:free` suffix either. That contradicted the reasoning
+already written above it: the tier has been a price rule since 0.16.3, and a zero-priced model
+already failed that rule's `> 0` test — the suffix was the only thing letting it back in.
+`ADA_FREE_MODELS` still force-includes specific ids.
+
 ## [0.16.4] — 2026-08-23
 
 ### Fixed — ada stops resizing the window you are looking at
