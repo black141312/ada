@@ -119,6 +119,30 @@ async function authHeaders(provider: ProviderName): Promise<Record<string, strin
   return key ? { authorization: `Bearer ${key}` } : {};
 }
 
+/** Can ada actually use this model? Applied to an upstream /models entry.
+ *
+ *  Both tests are evidence-based: an entry that publishes none of this metadata comes through
+ *  untouched, because "no data" must not read as "unusable" — most providers send little more than
+ *  an id, and a working catalogue must not vanish the day one stops sending a field.
+ *
+ *  No tool support: ada is an agent, and a model that cannot be handed tools cannot run a turn.
+ *  OpenRouter alone lists 70 — translation heads, image generators, and the lyria music models,
+ *  which answer a chat completion with a 502. Offering them puts an entry in the picker that fails
+ *  the instant it is chosen.
+ *
+ *  Zero-priced: the `:free` pool is capped per-minute per ACCOUNT, not per model. Measured — a
+ *  handful of calls returns `Rate limit exceeded: free-models-per-min` for every free model at once,
+ *  not just the one called. We run one account, so one user on a free model locks out everyone else,
+ *  and the free tier is a price rule now (plans.ts) rather than this list. */
+export function offerableModel(m: { supported_parameters?: unknown; pricing?: { prompt?: unknown; completion?: unknown } }): boolean {
+  const params = m.supported_parameters;
+  // An EMPTY list is "not stated", not "stated as none" — only a populated list is evidence.
+  if (Array.isArray(params) && params.length > 0 && !params.includes("tools")) return false;
+  const p = m.pricing;
+  if (p && Number(p.prompt ?? NaN) === 0 && Number(p.completion ?? NaN) === 0) return false;
+  return true;
+}
+
 export const openAICompatAdapter: Adapter = {
   async chat({ provider, body, res }: ChatRequest): Promise<void> {
     const def = PROVIDERS[provider];
@@ -191,13 +215,17 @@ export const openAICompatAdapter: Adapter = {
     }
   },
 
+  /** The upstream's catalogue, minus what ada cannot use — see offerableModel(). */
   async listModels(provider: ProviderName): Promise<string[]> {
     const def = PROVIDERS[provider];
     try {
       const r = await fetch(`${def.baseURL}/models`, { headers: await authHeaders(provider) });
       if (!r.ok) return [];
-      const j = (await r.json()) as { data?: Array<{ id?: unknown }> };
-      return (j.data ?? []).map((m) => m.id).filter((x): x is string => typeof x === "string");
+      const j = (await r.json()) as { data?: Array<Parameters<typeof offerableModel>[0] & { id?: unknown }> };
+      return (j.data ?? [])
+        .filter(offerableModel)
+        .map((m) => m.id)
+        .filter((x): x is string => typeof x === "string");
     } catch {
       return [];
     }
