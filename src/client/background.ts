@@ -10,7 +10,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type OpenAI from "openai";
-import { Agent, type OnApprove, subagentModel } from "./agent.ts";
+import { type AgentEvent, Agent, type OnApprove, subagentModel } from "./agent.ts";
 import { Session } from "./session.ts";
 import { ensureAdaDir } from "./settings.ts";
 import { registerTool } from "./tools.ts";
@@ -21,6 +21,11 @@ export interface Job {
   task: string;
   status: "running" | "done" | "error" | "cancelled";
   result?: string;
+  /** What the job is doing right now — the last tool call, status line, or line of text from the
+   *  sub-agent. Live only: a running job's row had nothing but a clock before this, so a long job
+   *  was indistinguishable from a wedged one. Dropped on revive, since a reloaded job's last
+   *  activity belongs to a process that is gone. */
+  progress?: string;
   started: number;
   ended?: number;
   /** The serve session whose chat started this job. Absent for a job started from a terminal, which
@@ -165,8 +170,13 @@ export function listJobs(): Job[] {
   return [...jobs.values()].sort((a, b) => b.started - a.started);
 }
 
-/** Start `run()` in the background; returns a job id immediately. */
-export function startJob(task: string, run: (signal?: AbortSignal) => Promise<string>, sessionId?: string): string {
+/** Start `run()` in the background; returns a job id immediately. `run` gets a `progress` callback
+ *  for its live activity line — see `Job.progress`. */
+export function startJob(
+  task: string,
+  run: (signal?: AbortSignal, progress?: (text: string) => void) => Promise<string>,
+  sessionId?: string,
+): string {
   load();
   const id = `j${++seq}`;
   const job: Job = { id, task, status: "running", started: Date.now(), sessionId };
@@ -190,6 +200,7 @@ export function startJob(task: string, run: (signal?: AbortSignal) => Promise<st
     if (job.status !== "running") return;
     job.status = status;
     job.result = result;
+    job.progress = undefined; // the result replaces it; a stale "reading x.ts" under a finished job is noise
     job.ended = Date.now();
     save();
     // Close the loop: the agent that started this job hears the result instead of it sitting
@@ -197,7 +208,28 @@ export function startJob(task: string, run: (signal?: AbortSignal) => Promise<st
     // next turn. Result clipped — the notification is a summary, the full text stays on the job.
     notify(job.sessionId, `[background job ${id} ${status}: ${job.task.slice(0, 80)}]\n${result.slice(0, 1500)}`);
   };
-  run(ac.signal).then(
+  // Progress is chatter — a tool call every second or two — and save() rewrites the whole file, so
+  // it is throttled to the poll interval the app reads it at. ponytail: last write can be lost if
+  // the job settles inside the window; settle() saves the result anyway, which is the part that matters.
+  let progressSavedAt = 0;
+  const progress = (text: string): void => {
+    if (job.status !== "running") return;
+    // Everything reaches here through the terminal renderer, which styles its lines before they are
+    // events — a tool-result summary arrives dim-wrapped in SGR codes. Strip them: the
+    // app puts this in textContent, where they would show up as literal escape gibberish.
+    const clean = text
+      .replace(/\x1b\[[0-9;]*m/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/^[⎿└]+ ?/, "") // the terminal's result glyph, meaningless in the app's panel
+      .slice(0, 200);
+    if (!clean) return; // a styling-only frame is not news — keep the last line that said something
+    job.progress = clean;
+    if (Date.now() - progressSavedAt < 3000) return;
+    progressSavedAt = Date.now();
+    save();
+  };
+  run(ac.signal, progress).then(
     (r) => settle("done", r),
     (e) => settle("error", e instanceof Error ? e.message : String(e)),
   );
@@ -238,6 +270,24 @@ const TASK_PARAMS = {
   required: ["task"],
   additionalProperties: false,
 };
+
+/** A sub-agent's event stream, boiled down to the one line a running job shows: the tool it just
+ *  called, a status line from the run, or the tail of the text it has written so far — the closest
+ *  thing to an intermediate result a job has before it finishes. Reasoning is skipped: it is not
+ *  the answer, and it would drown out the other two.
+ *  ponytail: last line only, no scrollback. */
+function liveLine(progress: (text: string) => void): (e: AgentEvent) => void {
+  let text = "";
+  return (e) => {
+    if (e.type === "tool_call") progress(`${e.name} ${e.detail}`);
+    else if (e.type === "progress") progress(e.text);
+    else if (e.type === "text") {
+      text = (text + e.delta).slice(-400);
+      const line = text.split("\n").filter((l) => l.trim()).pop();
+      if (line) progress(line);
+    }
+  };
+}
 
 /** Register `spawn_agent` + `background_task`. Call before an Agent snapshots the tool registry. */
 export function registerSubagentTools(opts: SubagentOpts): void {
@@ -294,9 +344,9 @@ export function registerSubagentTools(opts: SubagentOpts): void {
         // with this placeholder here would hand `settle` a truthy string and it would overwrite the
         // "cancelled" sentinel with "(sub-agent returned no text)" instead. Leave it empty when
         // aborted and let `settle` decide.
-        (signal) =>
+        (signal, progress) =>
           sub(true, ctx?.sessionId)
-            .send(task, { quiet: true, delegated: true, signal })
+            .send(task, { quiet: true, delegated: true, signal, onEvent: progress && liveLine(progress) })
             .then((text) => (signal?.aborted ? text : text || "(sub-agent returned no text)")),
         ctx?.sessionId,
       );
@@ -309,6 +359,6 @@ export function renderJobs(): string {
   const all = listJobs();
   if (!all.length) return "(no background jobs)";
   return all
-    .map((j) => `${j.id} [${j.status}] ${j.task.slice(0, 60)}${j.result && j.status !== "running" ? `\n   → ${j.result.slice(0, 240)}` : ""}`)
+    .map((j) => `${j.id} [${j.status}] ${j.task.slice(0, 60)}${j.result && j.status !== "running" ? `\n   → ${j.result.slice(0, 240)}` : j.progress ? `\n   ... ${j.progress.slice(0, 240)}` : ""}`)
     .join("\n");
 }
