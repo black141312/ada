@@ -25,6 +25,16 @@ Three things you provision (accounts I can't create for you), then I wire + test
 4. Create → copy the **Client ID**, then **Generate a new client secret** → copy it.
    These are **`GITHUB_CLIENT_ID`** and **`GITHUB_CLIENT_SECRET`**.
 
+## 2b. Google OAuth client (optional second login) — free
+
+1. https://console.cloud.google.com/apis/credentials → **Create credentials → OAuth client ID** → **Web application**.
+2. **Authorized redirect URI:** `<backend-url>/api/auth/callback/google`
+   (must be **https** except for `http://localhost`.)
+3. Copy the **Client ID** and **Client secret** → **`GOOGLE_CLIENT_ID`** and **`GOOGLE_CLIENT_SECRET`**.
+
+Set both and the sign-in page grows a "Continue with Google" button; leave them unset and it stays
+GitHub-only. Nothing else changes — same device flow, same session.
+
 ## 3. Deploy on Google Cloud Run (stateless → this now works)
 
 ```bash
@@ -36,7 +46,7 @@ gcloud config set project <your-project>
 gcloud run deploy ada-server \
   --source . \
   --region <region> --allow-unauthenticated \
-  --set-env-vars "BETTER_AUTH_ENABLED=1,DATABASE_URL=<your-supabase-uri>,BETTER_AUTH_SECRET=<random-32-bytes>,OPENROUTER_API_KEY=<your-key>,GITHUB_CLIENT_ID=<id>,GITHUB_CLIENT_SECRET=<secret>"
+  --set-env-vars "BETTER_AUTH_ENABLED=1,DATABASE_URL=<your-supabase-uri>,BETTER_AUTH_SECRET=<random-32-bytes>,OPENROUTER_API_KEY=<your-key>,GITHUB_CLIENT_ID=<id>,GITHUB_CLIENT_SECRET=<secret>,GOOGLE_CLIENT_ID=<id>,GOOGLE_CLIENT_SECRET=<secret>"
 # → prints https://ada-server-xxxx.run.app  ← your public URL
 ```
 

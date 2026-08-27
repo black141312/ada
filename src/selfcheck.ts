@@ -1319,6 +1319,23 @@ async function main(): Promise<void> {
     assert.equal(partial?.result, "half an answer", "but its partial text is kept — the spec promises this");
   }
 
+  // --- a running job reports what it is doing --------------------------------------------------
+  {
+    const { startJob, listJobs } = await import("./client/background.ts");
+    let report: ((t: string) => void) | undefined;
+    const id = startJob("progress job", (_signal, progress) => {
+      report = progress;
+      return new Promise<string>((res) => setTimeout(() => res("final answer"), 60));
+    });
+    report?.("\x1b[2m  ⎿   reading   src/foo.ts\x1b[0m\n");
+    const live = listJobs().find((j) => j.id === id);
+    assert.equal(live?.progress, "reading src/foo.ts", "a running job carries its latest activity line, stripped of the terminal renderer's ANSI and glyphs");
+    await new Promise((r) => setTimeout(r, 120));
+    const done = listJobs().find((j) => j.id === id);
+    assert.equal(done?.result, "final answer", "and still settles with its result");
+    assert.equal(done?.progress, undefined, "which clears the progress line — a stale one under a finished job is noise");
+  }
+
   // --- a nested job inherits the chat ---------------------------------------------------------
   {
     const { startJob, listJobs } = await import("./client/background.ts");
