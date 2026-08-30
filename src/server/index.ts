@@ -85,28 +85,44 @@ const SOCIAL_BUTTONS = [
 
 export function devicePage(): string {
   const enabled = SOCIAL_BUTTONS.filter((p) => process.env[`${p.env}_CLIENT_ID`] && process.env[`${p.env}_CLIENT_SECRET`]);
+  const btn = "width:100%;padding:11px;margin-top:10px;border-radius:8px;border:0;background:#fff;color:#0d0f12;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px";
   const buttons =
     enabled
-      .map(
-        (p) =>
-          `<button data-provider="${p.id}" style="width:100%;padding:11px;margin-top:10px;border-radius:8px;border:0;background:#fff;color:#0d0f12;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px">${p.icon}Continue with ${p.label}</button>`,
-      )
+      .map((p) => `<button data-provider="${p.id}" style="${btn}">${p.icon}Continue with ${p.label}</button>`)
       .join("") || `<p style="font-size:13px;color:#ff6b6b">No sign-in provider is configured on this backend.</p>`;
   return `<!doctype html><meta charset="utf-8"><title>Ada — sign in</title>
 <body style="font-family:system-ui;background:#0d0f12;color:#c5cdd6;display:flex;justify-content:center;padding-top:14vh;margin:0">
 <div style="width:320px;text-align:center">
 <h2 style="color:#fff;font-weight:600">Sign in to Ada</h2>
 <p style="font-size:13px;opacity:.7">Approve this device to finish signing in.</p>
+<div id="known" style="display:none">
+<button id="continue" style="${btn}"></button>
+<p style="font-size:12px;opacity:.55;margin:18px 0 0">or use a different account</p>
+</div>
 <div id="btns">${buttons}</div>
 <p id="msg" style="font-size:13px;min-height:18px;margin-top:16px"></p>
 </div>
 <script>
 const q=(s)=>document.querySelector(s); const msg=(t,ok)=>{q('#msg').textContent=t;q('#msg').style.color=ok?'#3ecf8e':'#ff6b6b'};
-const code=new URLSearchParams(location.search).get('user_code')||'';
+const params=new URLSearchParams(location.search);
+const code=params.get('user_code')||'';
+// Set on the callbackURL we hand the provider, so a return trip from OAuth is distinguishable from
+// a fresh visit that merely still holds the browser's session cookie. Without it, signing out in
+// Ada and clicking Log In silently re-approved the SAME account: the page saw a live session and
+// finished before anyone could choose.
+const back=params.get('done')==='1';
 async function session(){try{const r=await fetch('/api/auth/get-session');const j=await r.json();return j&&j.user}catch{return null}}
-async function approve(){ if(!code){msg('Missing device code — reopen from Ada.',false);return;} await fetch('/api/auth/device?user_code='+encodeURIComponent(code)); const r=await fetch('/api/auth/device/approve',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userCode:code})}); if(r.ok){msg('Signed in — you can return to Ada.',true);q('#btns').style.display='none';}else{const j=await r.json().catch(()=>({}));msg('Approve failed: '+(j.message||r.status),false);} }
-for(const b of document.querySelectorAll('#btns button')){ b.onclick=async()=>{ const p=b.dataset.provider; const u=await session(); if(u){await approve();return;} const r=await fetch('/api/auth/sign-in/social',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({provider:p,callbackURL:location.pathname+location.search})}); const j=await r.json().catch(()=>({})); if(j.url){location.href=j.url}else{msg('Could not start '+p+' sign-in.',false);} }; }
-(async()=>{ const u=await session(); if(u&&code){ msg('Signed in as '+(u.email||u.name)+' — approving…',true); await approve(); } })();
+async function approve(){ if(!code){msg('Missing device code — reopen from Ada.',false);return;} await fetch('/api/auth/device?user_code='+encodeURIComponent(code)); const r=await fetch('/api/auth/device/approve',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userCode:code})}); if(r.ok){msg('Signed in — you can return to Ada.',true);q('#known').style.display='none';q('#btns').style.display='none';}else{const j=await r.json().catch(()=>({}));msg('Approve failed: '+(j.message||r.status),false);} }
+async function social(p){ const url=location.pathname+'?user_code='+encodeURIComponent(code)+'&done=1'; const r=await fetch('/api/auth/sign-in/social',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({provider:p,callbackURL:url})}); const j=await r.json().catch(()=>({})); if(j.url){location.href=j.url}else{msg('Could not start '+p+' sign-in.',false);} }
+// Picking a provider while a session is live means "not that account" — drop the cookie first, or
+// the provider hands back the very identity the user is trying to get away from.
+for(const b of document.querySelectorAll('#btns button')){ b.onclick=async()=>{ b.disabled=true; if(await session()) await fetch('/api/auth/sign-out',{method:'POST'}); await social(b.dataset.provider); }; }
+(async()=>{ const u=await session(); if(!u||!code) return;
+  if(back){ msg('Signed in as '+(u.email||u.name)+' — approving…',true); return approve(); }
+  q('#continue').textContent='Continue as '+(u.email||u.name);
+  q('#continue').onclick=approve;
+  q('#known').style.display='block';
+})();
 </script></body>`;
 }
 import { assertOidcConfig, discover, isProvisionAllowed, mapIdentityToSeatFields, oidcConfig, oidcEnabled, verifyOidcToken } from "./oidc.ts";

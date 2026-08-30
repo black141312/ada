@@ -22,5 +22,15 @@ assert.match(both, /data-provider="github"/);
 assert.match(both, /data-provider="google"/, "Google creds → Google button");
 assert.match(both, /Continue with Google/, "labelled for a human");
 
-console.log("device page: buttons follow the configured providers (github, google)");
+
+// Signing out in Ada leaves the BROWSER's session cookie alone, so the page can open with a live
+// session the user has just said they're done with. It must offer a choice, not finish on its own.
+const chooser = devicePage();
+assert.match(chooser, /id="known"/, "renders a Continue-as block for an existing session");
+assert.match(chooser, /Continue as/, "and names the account it would continue as");
+assert.match(chooser, /params\.get\('done'\)===?'1'/, "auto-approve is gated on the OAuth return marker");
+assert.match(chooser, /&done=1/, "which the callbackURL sets");
+assert.match(chooser, /'\/api\/auth\/sign-out'/, "picking a provider drops the old cookie first");
+
+console.log("device page: providers follow env, and an existing session gets a chooser");
 process.exit(0);
