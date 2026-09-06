@@ -18,12 +18,20 @@
  *   ADA_MCP_OAUTH_GOOGLE_CLIENT_ID/_SECRET  → oauth2.googleapis.com
  *   ADA_MCP_OAUTH_GITHUB_CLIENT_ID/_SECRET  → github.com   (Ada already has a GitHub OAuth app)
  *   ADA_MCP_OAUTH_SLACK_CLIENT_ID/_SECRET   → slack.com
+ *   ADA_MCP_OAUTH_X_CLIENT_ID/_SECRET       → api.x.com
+ *   ADA_MCP_OAUTH_LINKEDIN_CLIENT_ID/_SECRET → www.linkedin.com
  */
 function providers(): Record<string, { client_id: string; client_secret: string; provider: string }> {
   const defs: [envKey: string, host: string, provider: string][] = [
     ["GOOGLE", "oauth2.googleapis.com", "google"],
     ["GITHUB", "github.com", "github"],
     ["SLACK", "slack.com", "slack"],
+    // Neither is an MCP server; both are plain OAuth 2 + REST. They are here for the same reason as
+    // the others — no dynamic client registration — and additionally because posting scopes are
+    // granted per REGISTERED APP, so there is no version of this where the client lives on the
+    // user's machine. X's token endpoint requires the secret even for a "public" PKCE client.
+    ["X", "api.x.com", "x"],
+    ["LINKEDIN", "www.linkedin.com", "linkedin"],
   ];
   const out: Record<string, { client_id: string; client_secret: string; provider: string }> = {};
   for (const [key, host, provider] of defs) {
@@ -49,7 +57,7 @@ export function exchangeHosts(): string[] {
  */
 export function exchangeMisconfigured(): string[] {
   const out: string[] = [];
-  for (const key of ["GOOGLE", "GITHUB", "SLACK"]) {
+  for (const key of ["GOOGLE", "GITHUB", "SLACK", "X", "LINKEDIN"]) {
     const id = process.env[`ADA_MCP_OAUTH_${key}_CLIENT_ID`];
     const secret = process.env[`ADA_MCP_OAUTH_${key}_CLIENT_SECRET`];
     if (!id && !secret) continue; // not set up at all — deliberate, not a mistake

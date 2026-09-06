@@ -9,6 +9,7 @@ import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { registerTool } from "./tools.ts";
 import { registerGoogleRestTools } from "./google-rest.ts";
+import { registerSocialTools } from "./social-rest.ts";
 import { scrubbedEnv } from "./secret-env.ts";
 import { backendHasProvider, beginLogin, clearAuth, getAuth, validAccessToken } from "./mcp-oauth.ts";
 
@@ -154,7 +155,12 @@ interface McpServerDef {
   oauthProvider?: string;
   // Tools come from Ada rather than from an MCP server at `url`. `url` still identifies the token,
   // so the sign-in flow is untouched — only where the tools come from changes.
-  rest?: "gmail" | "calendar";
+  rest?: "gmail" | "calendar" | "x" | "linkedin";
+  // Endpoints for a provider that is NOT an MCP server and therefore cannot be discovered: no 401
+  // with WWW-Authenticate, no RFC 8414 metadata document, just a documented pair of URLs. Present
+  // only for those; everything else still goes through discovery, which is the safer default
+  // because it cannot be pointed at an endpoint by a config file.
+  oauthEndpoints?: { authorization_endpoint: string; token_endpoint: string };
 }
 
 /**
@@ -276,7 +282,7 @@ export async function loadMcpServers(includeProject: boolean): Promise<string[]>
   for (const [name, def] of Object.entries(servers)) {
     const cat = CATALOG[name]?.server;
     if (!cat) continue;
-    servers[name] = { ...def, url: cat.url ?? def.url, scopes: cat.scopes ?? def.scopes, oauthProvider: cat.oauthProvider ?? def.oauthProvider, rest: cat.rest };
+    servers[name] = { ...def, url: cat.url ?? def.url, scopes: cat.scopes ?? def.scopes, oauthProvider: cat.oauthProvider ?? def.oauthProvider, rest: cat.rest, oauthEndpoints: cat.oauthEndpoints };
   }
   const loaded: string[] = [];
   for (const [name, def] of Object.entries(servers)) {
@@ -295,7 +301,10 @@ export async function loadMcpServers(includeProject: boolean): Promise<string[]>
         }
         needsAuth.delete(name);
         // Resolved per call, not captured: a token refreshed mid-session must be the one used.
-        const n = registerGoogleRestTools(name, def.rest, () => validAccessToken(def.url ?? ""));
+        const n =
+          def.rest === "x" || def.rest === "linkedin"
+            ? registerSocialTools(name, def.rest, () => validAccessToken(def.url ?? ""))
+            : registerGoogleRestTools(name, def.rest, () => validAccessToken(def.url ?? ""));
         loaded.push(`${name} (${n} tools)`);
         continue;
       }
@@ -466,6 +475,40 @@ export const CATALOG: Record<string, { description: string; server: McpServerDef
       oauth: { client_id: "" },
       oauthProvider: "google",
       rest: "calendar",
+    },
+  },
+  x: {
+    description: "X (Twitter) — publish a post as the connected account. Drafts first; posting always asks.",
+    server: {
+      // Not an MCP endpoint: it identifies the token in the auth store and is the API the tools call.
+      url: "https://api.x.com/2",
+      // tweet.write is the posting grant; users.read identifies the account; offline.access is what
+      // makes a refresh token appear, without which a scheduled post stops working within hours.
+      scopes: ["tweet.read", "tweet.write", "users.read", "offline.access"],
+      oauth: { client_id: "" },
+      oauthProvider: "x",
+      oauthEndpoints: {
+        authorization_endpoint: "https://x.com/i/oauth2/authorize",
+        token_endpoint: "https://api.x.com/2/oauth2/token",
+      },
+      rest: "x",
+    },
+  },
+  linkedin: {
+    description: "LinkedIn — publish a post as you, or as a company page. Drafts first; posting always asks.",
+    server: {
+      url: "https://api.linkedin.com/rest",
+      // openid+profile are what /v2/userinfo needs to resolve the author URN; w_member_social is the
+      // posting grant. Posting as a COMPANY PAGE additionally needs w_organization_social, which is
+      // granted per app by LinkedIn review rather than by the member consenting.
+      scopes: ["openid", "profile", "w_member_social"],
+      oauth: { client_id: "" },
+      oauthProvider: "linkedin",
+      oauthEndpoints: {
+        authorization_endpoint: "https://www.linkedin.com/oauth/v2/authorization",
+        token_endpoint: "https://www.linkedin.com/oauth/v2/accessToken",
+      },
+      rest: "linkedin",
     },
   },
   "gmail-remote": {
@@ -712,6 +755,9 @@ export async function loginConnector(name: string): Promise<{ ok: boolean; url?:
     client: def.oauth?.client_id ? def.oauth : undefined,
     scopes: def.scopes,
     label: prettyName(name), // names the service on the page the browser lands on
+    // Only set for providers that publish no discovery metadata (X, LinkedIn). Absent for everyone
+    // else, so the normal chain still runs and a config file cannot redirect a sign-in.
+    meta: def.oauthEndpoints,
   });
   if ("error" in started) return { ok: false, error: started.error };
   loginErrors.delete(name);

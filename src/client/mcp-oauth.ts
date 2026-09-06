@@ -577,9 +577,23 @@ export async function validAccessToken(serverUrl: string): Promise<string | null
 export async function beginLogin(
   serverUrl: string,
   wwwAuthenticate: string | null,
-  opts: { client?: { client_id: string; client_secret?: string }; scopes?: string[]; label?: string } = {},
+  opts: {
+    client?: { client_id: string; client_secret?: string };
+    scopes?: string[];
+    label?: string;
+    /**
+     * Endpoints supplied by the caller, for providers that are not MCP servers at all.
+     *
+     * The discovery chain below assumes the thing being signed into is an MCP endpoint that
+     * answers 401 with a WWW-Authenticate header and publishes RFC 8414 metadata. X and LinkedIn
+     * are plain OAuth 2 REST APIs: fixed, documented endpoints and no metadata document anywhere.
+     * Passing them in is the difference between supporting such a provider and not; everything
+     * after this line already works from a metadata object and does not care where it came from.
+     */
+    meta?: AsMetadata;
+  } = {},
 ): Promise<{ url: string; finish: () => Promise<{ ok: boolean; error?: string }> } | { error: string }> {
-  const meta = await discover(serverUrl, wwwAuthenticate);
+  const meta = opts.meta ?? (await discover(serverUrl, wwwAuthenticate));
   if (!meta) return { error: "this server did not advertise an OAuth authorization server" };
 
   const state = randomBytes(16).toString("base64url");
