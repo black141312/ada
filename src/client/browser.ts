@@ -768,8 +768,12 @@ async function browserActionInner(action: BrowserVerb, opts: BrowserOpts = {}): 
     // action would flicker Chrome's "ada bridge is debugging this browser" bar), so the override
     // was never cleared: one browse left their tab squeezed until Chrome restarted. Measured on
     // a live tab: 1920x889 forced down to 1280x800 and left there.
-    const sizeAsked = opts.width !== undefined || opts.height !== undefined;
-    if (!bridgeMode || sizeAsked) await cdp.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
+    // Even when the model passes a size: models fill optional parameters by habit, and one such call
+    // is all it takes to letterbox the user's tab. In the real browser the size is theirs, full stop -
+    // and any override a previous run left behind is cleared, so a squeezed tab recovers on the next
+    // action instead of on the next Chrome restart.
+    if (bridgeMode) await cdp.send("Emulation.clearDeviceMetricsOverride").catch(() => {});
+    else await cdp.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
     if (url) {
       await cdp.send("Page.enable");
       // Log.enable replays whatever the page already stored, which would arrive alongside the live
