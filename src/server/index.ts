@@ -12,6 +12,7 @@ import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, creat
 import { adminUsers, verifyIdentity } from "./identity.ts";
 import { addAllowed, listAllowed, removeAllowed } from "./allowlist.ts";
 import { costSince, recordUsage } from "./usage.ts";
+import { buildSpeechRequest, SPEECH_MODEL } from "./speech.ts";
 import { prefetch as prefetchModelCatalog } from "../client/models-dev.ts";
 import { billingWebhookImplemented, checkEntitlement, effectivePlan, isFreeModel, PLANS, planFor, periodStart, setPlan, WINDOW_MS, windowStart, type PlanName } from "./plans.ts";
 import { checkoutUrl, createCheckout, getCheckout, setCheckoutPlan } from "./billing.ts";
@@ -506,6 +507,47 @@ async function handleImages(req: IncomingMessage, res: ServerResponse, who: Iden
   res.end(text);
 }
 
+/** Cloud narration. Shaped like handleImages: OpenAI-only, metered, bytes passed through. The plan
+ *  check runs like chat's so a capped account hears the system voice instead of running a bill. */
+async function handleSpeech(req: IncomingMessage, res: ServerResponse, who: Identity): Promise<void> {
+  const raw = await readBody(req);
+  let body: unknown;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return json(res, 400, { error: { message: "invalid JSON body" } });
+  }
+  const sr = buildSpeechRequest(body);
+  if (!sr.ok) return json(res, sr.status, { error: { message: sr.message } });
+  if (who.user === "anon") return json(res, 403, { error: { message: "sign in to use cloud voice" } });
+  if (!enterpriseMode()) {
+    const ent = await checkEntitlement(who.user, SPEECH_MODEL);
+    if (!ent.ok) {
+      return json(res, ent.status!, { error: { message: ent.message, type: ent.status === 402 ? "insufficient_quota" : "plan_restricted" }, plan: ent.plan, usedUsd: ent.usedUsd, capUsd: ent.capUsd, resetsAt: ent.resetsAt });
+    }
+  }
+  const key = providerKey("openai");
+  if (!key) return json(res, 503, { error: { message: "speech is not configured on this backend (no OPENAI_API_KEY)" } });
+  const upstreamRes = await fetch(`${PROVIDERS.openai.baseURL}/audio/speech`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+    body: JSON.stringify({ model: sr.model, input: sr.input, voice: sr.voice, response_format: sr.response_format }),
+  });
+  if (!upstreamRes.ok) {
+    const text = await upstreamRes.text();
+    res.writeHead(upstreamRes.status, { "content-type": "application/json" });
+    return void res.end(text);
+  }
+  const bytes = Buffer.from(await upstreamRes.arrayBuffer());
+  // ponytail: chars/4 as prompt tokens against the model's catalog price (unknown → default rate).
+  // Close enough to keep the cap honest; a per-character TTS price is the upgrade if it drifts.
+  const row = { ts: Date.now(), user: who.user, model: SPEECH_MODEL, provider: "openai" as const, promptTokens: Math.ceil(sr.input.length / 4), completionTokens: 0, ...originOf(req) };
+  appendUsage(row);
+  void recordUsage(row);
+  res.writeHead(200, { "content-type": "audio/mpeg", "content-length": String(bytes.length) });
+  res.end(bytes);
+}
+
 /** Public: advertise enabled login methods so the terminal client can self-configure (no OIDC env on
  *  the client). For OIDC it returns the issuer + client id + device/token endpoints (all public
  *  discovery values) plus the exchange path. Unauthenticated by design. */
@@ -905,6 +947,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     }
     if (req.method === "POST" && url.pathname === "/v1/images/generations") {
       return await handleImages(req, res, who);
+    }
+    if (req.method === "POST" && url.pathname === "/v1/audio/speech") {
+      return await handleSpeech(req, res, who);
     }
 
     // ---- enterprise control plane ----
