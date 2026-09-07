@@ -402,7 +402,20 @@ p{margin:0;color:var(--dim);word-break:break-word}
 </div></html>`;
 }
 
-export function awaitCallback(state: string, label?: string): Promise<{ port: number; code: Promise<string> }> {
+/**
+ * `fixedPort` is for providers that will not accept an arbitrary loopback port.
+ *
+ * Ada normally binds :0 and takes whatever the OS gives, which is right for anything following
+ * RFC 8252 — Google and GitHub both allow any port on 127.0.0.1. LinkedIn and X do not: their
+ * redirect URI must EXACTLY match one registered in the developer console, and neither lets you
+ * wildcard the port. With a random port every sign-in fails on redirect_uri mismatch, so those
+ * providers pin one and it is registered by hand alongside the client id.
+ *
+ * A pinned port that is already taken FAILS rather than falling back to a random one: falling back
+ * would produce exactly the mismatch this exists to prevent, and the error would name the provider
+ * rather than the port that was actually in use.
+ */
+export function awaitCallback(state: string, label?: string, fixedPort?: number): Promise<{ port: number; code: Promise<string> }> {
   return new Promise((resolveOuter, rejectOuter) => {
     let settle: (code: string) => void;
     let fail: (e: Error) => void;
@@ -426,7 +439,16 @@ export function awaitCallback(state: string, label?: string): Promise<{ port: nu
       setTimeout(() => server.close(), 500);
     });
     server.on("error", rejectOuter);
-    server.listen(0, "127.0.0.1", () => {
+    server.on("error", (e: NodeJS.ErrnoException) => {
+      rejectOuter(
+        e.code === "EADDRINUSE" && fixedPort
+          ? new Error(
+              `port ${fixedPort} is in use, and this provider requires that exact redirect URI — close whatever is holding it and sign in again`,
+            )
+          : e,
+      );
+    });
+    server.listen(fixedPort ?? 0, "127.0.0.1", () => {
       const port = (server.address() as { port: number }).port;
       resolveOuter({ port, code });
     });
@@ -591,13 +613,15 @@ export async function beginLogin(
      * after this line already works from a metadata object and does not care where it came from.
      */
     meta?: AsMetadata;
+    /** Bind the callback to this exact port — see awaitCallback. Only for providers that demand it. */
+    redirectPort?: number;
   } = {},
 ): Promise<{ url: string; finish: () => Promise<{ ok: boolean; error?: string }> } | { error: string }> {
   const meta = opts.meta ?? (await discover(serverUrl, wwwAuthenticate));
   if (!meta) return { error: "this server did not advertise an OAuth authorization server" };
 
   const state = randomBytes(16).toString("base64url");
-  const { port, code } = await awaitCallback(state, opts.label);
+  const { port, code } = await awaitCallback(state, opts.label, opts.redirectPort);
   const redirectUri = `http://127.0.0.1:${port}/callback`;
 
   // Three ways to be a client, in the order that costs the user least:

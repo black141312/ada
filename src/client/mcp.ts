@@ -161,6 +161,9 @@ interface McpServerDef {
   // only for those; everything else still goes through discovery, which is the safer default
   // because it cannot be pointed at an endpoint by a config file.
   oauthEndpoints?: { authorization_endpoint: string; token_endpoint: string };
+  // Providers whose redirect URI must match one registered by hand, character for character. Ada
+  // otherwise binds an ephemeral port, which those reject. See awaitCallback.
+  redirectPort?: number;
 }
 
 /**
@@ -282,7 +285,7 @@ export async function loadMcpServers(includeProject: boolean): Promise<string[]>
   for (const [name, def] of Object.entries(servers)) {
     const cat = CATALOG[name]?.server;
     if (!cat) continue;
-    servers[name] = { ...def, url: cat.url ?? def.url, scopes: cat.scopes ?? def.scopes, oauthProvider: cat.oauthProvider ?? def.oauthProvider, rest: cat.rest, oauthEndpoints: cat.oauthEndpoints };
+    servers[name] = { ...def, url: cat.url ?? def.url, scopes: cat.scopes ?? def.scopes, oauthProvider: cat.oauthProvider ?? def.oauthProvider, rest: cat.rest, oauthEndpoints: cat.oauthEndpoints, redirectPort: cat.redirectPort };
   }
   const loaded: string[] = [];
   for (const [name, def] of Object.entries(servers)) {
@@ -491,6 +494,9 @@ export const CATALOG: Record<string, { description: string; server: McpServerDef
         authorization_endpoint: "https://x.com/i/oauth2/authorize",
         token_endpoint: "https://api.x.com/2/oauth2/token",
       },
+      // Register EXACTLY this as the callback URL in X's developer console:
+      //   http://127.0.0.1:8912/callback
+      redirectPort: 8912,
       rest: "x",
     },
   },
@@ -508,6 +514,9 @@ export const CATALOG: Record<string, { description: string; server: McpServerDef
         authorization_endpoint: "https://www.linkedin.com/oauth/v2/authorization",
         token_endpoint: "https://www.linkedin.com/oauth/v2/accessToken",
       },
+      // Register EXACTLY this as an authorized redirect URL in the LinkedIn app:
+      //   http://127.0.0.1:8913/callback
+      redirectPort: 8913,
       rest: "linkedin",
     },
   },
@@ -758,6 +767,7 @@ export async function loginConnector(name: string): Promise<{ ok: boolean; url?:
     // Only set for providers that publish no discovery metadata (X, LinkedIn). Absent for everyone
     // else, so the normal chain still runs and a config file cannot redirect a sign-in.
     meta: def.oauthEndpoints,
+    redirectPort: def.redirectPort,
   });
   if ("error" in started) return { ok: false, error: started.error };
   loginErrors.delete(name);
