@@ -65,6 +65,7 @@ assert.deepEqual(await s.putProgress("bob", "cls_abcd1234", { sceneIndex: 1, upd
 assert.deepEqual((await s.getShared("bob", share.token)).progress, { sceneIndex: 3, updatedAt: 50 });
 assert.equal((await s.putProgress("carol", "cls_abcd1234", { updatedAt: 1 })).status, 403, "never opened it");
 assert.deepEqual(await s.putProgress("alice", "cls_abcd1234", { sceneIndex: 9, updatedAt: 60 }), { ok: true, stale: false });
+assert.equal((await s.listClasses("alice"))[0].progressUpdatedAt, 60, "the owner's own progress stamp is listed so another device can pull it");
 assert.deepEqual((await s.getClass("alice", "cls_abcd1234")).progress, { sceneIndex: 9, updatedAt: 60 });
 
 // --- doc update keeps progress; newer doc wins on updatedAt only ---

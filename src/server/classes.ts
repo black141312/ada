@@ -146,7 +146,12 @@ export async function getClass(user: string, id: string): Promise<{ doc: unknown
 
 export async function listClasses(user: string): Promise<ClassSummary[]> {
   await ensure();
-  const mine = await all<Row>("select * from classes where owner = $1 order by updated_at desc", [user]);
+  const mine = await all<Row & { p_updated_at: number | string | null }>(
+    `select c.*, p.updated_at as p_updated_at from classes c
+     left join class_progress p on p.class_id = c.id and p.user_id = $1
+     where c.owner = $2 order by c.updated_at desc`,
+    [user, user],
+  );
   const opened = await all<Row & { p_updated_at: number | string }>(
     // $1 and $2 are both the user: SQLite positional `?` cannot reuse a parameter, so bind it twice.
     // The `via_token` check drops an opener whose token was revoked or superseded by a re-share: their
@@ -158,6 +163,7 @@ export async function listClasses(user: string): Promise<ClassSummary[]> {
   const out: ClassSummary[] = mine.map((r) => ({
     id: r.id, title: r.title, status: r.status, updatedAt: num(r.updated_at), sceneCount: sceneCount(r.doc), mine: true,
     ...(r.share_token ? { shareToken: r.share_token } : {}),
+    ...(r.p_updated_at != null ? { progressUpdatedAt: num(r.p_updated_at) } : {}),
   }));
   for (const r of opened) {
     out.push({ id: r.id, title: r.title, status: r.status, updatedAt: num(r.updated_at), sceneCount: sceneCount(r.doc), mine: false, shareToken: r.share_token!, progressUpdatedAt: num(r.p_updated_at) });
