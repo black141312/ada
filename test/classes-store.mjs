@@ -79,13 +79,23 @@ assert.deepEqual(await s.listClasses("bob"), []);
 assert.equal((await s.putProgress("bob", "cls_abcd1234", { updatedAt: 99 })).status, 403);
 assert.equal((await s.shareClass("alice", "cls_abcd1234")).token !== share.token, true, "a new share mints a new token");
 
+// --- re-share does not re-admit an opener who never saw the new token ---
+const t2b = (await s.shareClass("alice", "cls_abcd1234")).token;
+assert.deepEqual(await s.listClasses("bob"), [], "bob opened under the old token");
+assert.equal((await s.putProgress("bob", "cls_abcd1234", { updatedAt: 55 })).status, 403);
+await s.getShared("bob", t2b);
+assert.equal((await s.listClasses("bob")).length, 1, "opening with the new token re-admits him");
+assert.deepEqual((await s.getShared("bob", t2b)).progress, { sceneIndex: 3, updatedAt: 50 }, "and keeps his progress");
+
 // --- opener removes their own row; owner cannot ---
 const t2 = (await s.shareClass("alice", "cls_abcd1234")).token;
 await s.getShared("bob", t2);
 assert.equal((await s.listClasses("bob")).length, 1);
 assert.equal(await s.deleteProgress("bob", "cls_abcd1234"), true);
 assert.deepEqual(await s.listClasses("bob"), []);
+await s.putProgress("alice", "cls_abcd1234", { sceneIndex: 1, updatedAt: 70 }); // alice now has her own row
 assert.equal(await s.deleteProgress("alice", "cls_abcd1234"), false);
+assert.deepEqual((await s.getClass("alice", "cls_abcd1234")).progress, { sceneIndex: 1, updatedAt: 70 }, "the owner's row survives her own deleteProgress");
 
 // --- delete cascades ---
 await s.getShared("bob", t2);
@@ -94,4 +104,12 @@ assert.equal(await s.deleteClass("alice", "cls_abcd1234"), true);
 assert.equal(await s.getClass("alice", "cls_abcd1234"), null);
 assert.deepEqual(await s.listClasses("bob"), []);
 assert.equal(await s.getShared("bob", t2), null);
+
+// --- cascade is real: after delete + re-create, no ghost progress row survives ---
+await s.putClass("alice", "cls_abcd1234", doc("cls_abcd1234", 400));
+const t3 = (await s.shareClass("alice", "cls_abcd1234")).token;
+assert.deepEqual(await s.listClasses("bob"), [], "bob's old row must have gone with the delete");
+assert.equal((await s.putProgress("bob", "cls_abcd1234", { updatedAt: 1 })).status, 403, "no row, no push");
+await s.getShared("bob", t3);
+assert.equal((await s.listClasses("bob")).length, 1);
 console.log("ok");
