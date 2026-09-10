@@ -52,6 +52,9 @@ function ensure(): Promise<void> {
         updated_at bigint not null,
         primary key (class_id, user_id)
       )`,
+      // listClasses' hot query filters on p.user_id, which the (class_id, user_id) primary key
+      // cannot serve on its own.
+      `create index if not exists class_progress_user on class_progress (user_id)`,
     ];
     for (const stmt of ddl) {
       if (usingPostgres) await pg().query(stmt);
@@ -65,7 +68,10 @@ function ensure(): Promise<void> {
       const cols = lite().prepare("pragma table_info(class_progress)").all() as Array<{ name: string }>;
       if (!cols.some((c) => c.name === "via_token")) lite().exec("alter table class_progress add column via_token text");
     }
-  })();
+  })().catch((e) => {
+    ready = null; // let the next request try again — a concurrent first-run race is transient
+    throw e;
+  });
   return ready;
 }
 
@@ -129,11 +135,18 @@ export async function putClass(user: string, id: string, doc: unknown): Promise<
   const title = String(stored.title || "Untitled class").slice(0, 200);
   const status = String(stored.status || "ready");
   const now = Date.now();
-  await run(
+  // The pre-check above is only advisory (TOCTOU): two concurrent PUTs on a colliding id could both
+  // pass it, so the upsert itself must also guard ownership. `where classes.owner = $8` makes a losing
+  // writer's conflicting row a no-op instead of an overwrite; a zero change count means "lost the race
+  // to a different owner," which is the same 403 the pre-check gives. $8 repeats the $2 value rather
+  // than reusing the placeholder: SQLite's positional `?` binding (unlike Postgres) can't reference the
+  // same parameter twice, so it needs a second copy in the params array.
+  const n = await run(
     `insert into classes (id, owner, title, status, doc, share_token, created_at, updated_at) values ($1,$2,$3,$4,$5,null,$6,$7)
-     on conflict (id) do update set title = excluded.title, status = excluded.status, doc = excluded.doc, updated_at = excluded.updated_at`,
-    [id, user, title, status, JSON.stringify(stored), now, updatedAt],
+     on conflict (id) do update set title = excluded.title, status = excluded.status, doc = excluded.doc, updated_at = excluded.updated_at where classes.owner = $8`,
+    [id, user, title, status, JSON.stringify(stored), now, updatedAt, user],
   );
+  if (n === 0) return { ok: false, status: 403, message: "not your class" };
   return { ok: true, updatedAt };
 }
 

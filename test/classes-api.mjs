@@ -56,6 +56,7 @@ try {
 
   // someone else: 403 on write, 404 on read (must not confirm existence)
   assert.equal((await call(bob, "PUT", "/v1/classes/cls_abcd1234", { doc: doc("cls_abcd1234") })).status, 403);
+  assert.equal((await call(alice, "GET", "/v1/classes/cls_abcd1234")).json.doc.title, "DNS");
   assert.equal((await call(bob, "GET", "/v1/classes/cls_abcd1234")).status, 404);
   assert.equal((await call(bob, "DELETE", "/v1/classes/cls_abcd1234")).status, 404);
 

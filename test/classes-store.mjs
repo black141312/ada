@@ -32,6 +32,7 @@ const put = await s.putClass("alice", "cls_abcd1234", doc("cls_abcd1234", 100));
 assert.deepEqual(put, { ok: true, updatedAt: 100 });
 assert.equal((await s.putClass("alice", "cls_abcd1234", doc("cls_other001", 1))).status, 400, "doc.id must match the path id");
 assert.equal((await s.putClass("bob", "cls_abcd1234", doc("cls_abcd1234", 200))).status, 403, "someone else's id");
+assert.equal((await s.getClass("alice", "cls_abcd1234")).doc.title, "DNS", "a foreign PUT must not overwrite the doc");
 const got = await s.getClass("alice", "cls_abcd1234");
 assert.equal(got.doc.title, "DNS");
 assert.equal(got.doc.progress, undefined, "progress is never inside the stored doc");
