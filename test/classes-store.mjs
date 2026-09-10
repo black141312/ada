@@ -99,6 +99,7 @@ assert.deepEqual((await s.getClass("alice", "cls_abcd1234")).progress, { sceneIn
 
 // --- delete cascades ---
 await s.getShared("bob", t2);
+assert.deepEqual(await s.putProgress("bob", "cls_abcd1234", { sceneIndex: 5, updatedAt: 90 }), { ok: true, stale: false });
 assert.equal(await s.deleteClass("bob", "cls_abcd1234"), false);
 assert.equal(await s.deleteClass("alice", "cls_abcd1234"), true);
 assert.equal(await s.getClass("alice", "cls_abcd1234"), null);
@@ -111,5 +112,6 @@ const t3 = (await s.shareClass("alice", "cls_abcd1234")).token;
 assert.deepEqual(await s.listClasses("bob"), [], "bob's old row must have gone with the delete");
 assert.equal((await s.putProgress("bob", "cls_abcd1234", { updatedAt: 1 })).status, 403, "no row, no push");
 await s.getShared("bob", t3);
+assert.deepEqual((await s.getShared("bob", t3)).progress, {}, "a cascaded delete leaves no ghost progress: bob starts fresh");
 assert.equal((await s.listClasses("bob")).length, 1);
 console.log("ok");
