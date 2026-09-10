@@ -10,10 +10,6 @@ import type Database from "better-sqlite3";
 import { authDatabase, usingPostgres } from "./db.ts";
 import type { Identity } from "./enterprise.ts";
 
-// Task 2 (the HTTP handler, added to this same file) needs these; referenced here so the
-// imports aren't dead code in the meantime — `noUnusedLocals` flags an unused `import type` too.
-export type _Http = [IncomingMessage, ServerResponse, Identity];
-
 const pg = () => authDatabase() as Pool;
 const lite = () => authDatabase() as Database.Database;
 
@@ -238,4 +234,110 @@ export async function deleteProgress(user: string, id: string): Promise<boolean>
   const r = await one<Row>("select owner from classes where id = $1", [id]);
   if (!r || r.owner === user) return false;
   return (await run("delete from class_progress where class_id = $1 and user_id = $2", [id, user])) > 0;
+}
+
+// ---------- HTTP ----------
+
+/** Body with a byte cap. Null means "too big" — the caller answers 413. */
+export function readBodyLimited(req: IncomingMessage, max = BODY_LIMIT): Promise<string | null> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let over = false;
+    req.on("data", (c: Buffer) => {
+      size += c.length;
+      if (size > max) {
+        over = true;
+        req.resume();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(over ? null : Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+function send(res: ServerResponse, status: number, obj?: unknown): void {
+  if (obj === undefined) {
+    res.writeHead(status);
+    res.end();
+    return;
+  }
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(obj));
+}
+const err = (res: ServerResponse, status: number, message: string) => send(res, status, { error: { message } });
+
+async function jsonBody(req: IncomingMessage, res: ServerResponse): Promise<Record<string, unknown> | null> {
+  const raw = await readBodyLimited(req);
+  if (raw === null) {
+    err(res, 413, `body exceeds ${BODY_LIMIT} bytes`);
+    return null;
+  }
+  try {
+    const v = JSON.parse(raw);
+    if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, unknown>;
+  } catch {
+    // fall through
+  }
+  err(res, 400, "invalid JSON body");
+  return null;
+}
+
+/** Everything under /v1/classes. Signed-in only; nothing here is readable without ownership or a token. */
+export async function handleClasses(req: IncomingMessage, res: ServerResponse, who: Identity, url: URL): Promise<void> {
+  if (who.user === "anon") return err(res, 403, "sign in to use classes");
+  const user = who.user;
+  const m = req.method ?? "GET";
+  const p = url.pathname;
+
+  if (p === "/v1/classes" && m === "GET") return send(res, 200, { classes: await listClasses(user) });
+
+  const shared = p.match(/^\/v1\/classes\/shared\/([^/]+)$/);
+  if (shared && m === "GET") {
+    const r = await getShared(user, decodeURIComponent(shared[1]!));
+    return r ? send(res, 200, r) : err(res, 404, "This link is no longer shared.");
+  }
+
+  const one = p.match(/^\/v1\/classes\/([^/]+)$/);
+  if (one) {
+    const id = one[1]!;
+    if (m === "GET") {
+      const r = await getClass(user, id);
+      return r ? send(res, 200, r) : err(res, 404, "not found");
+    }
+    if (m === "PUT") {
+      const b = await jsonBody(req, res);
+      if (!b) return;
+      const r = await putClass(user, id, b.doc);
+      return r.ok ? send(res, 200, r) : err(res, r.status, r.message);
+    }
+    if (m === "DELETE") return (await deleteClass(user, id)) ? send(res, 204) : err(res, 404, "not found");
+  }
+
+  const share = p.match(/^\/v1\/classes\/([^/]+)\/share$/);
+  if (share) {
+    const id = share[1]!;
+    if (m === "POST") {
+      const r = await shareClass(user, id);
+      return r ? send(res, 200, r) : err(res, 404, "not found");
+    }
+    if (m === "DELETE") return (await unshareClass(user, id)) ? send(res, 204) : err(res, 404, "not found");
+  }
+
+  const prog = p.match(/^\/v1\/classes\/([^/]+)\/progress$/);
+  if (prog) {
+    const id = prog[1]!;
+    if (m === "PUT") {
+      const b = await jsonBody(req, res);
+      if (!b) return;
+      if (!b.progress || typeof b.progress !== "object") return err(res, 400, "missing 'progress'");
+      const r = await putProgress(user, id, b.progress);
+      return r.ok ? send(res, 200, r) : err(res, r.status, "not allowed");
+    }
+    if (m === "DELETE") return (await deleteProgress(user, id)) ? send(res, 204) : err(res, 404, "not found");
+  }
+
+  return err(res, 404, "not found");
 }

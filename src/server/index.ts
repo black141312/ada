@@ -13,6 +13,7 @@ import { adminUsers, verifyIdentity } from "./identity.ts";
 import { addAllowed, listAllowed, removeAllowed } from "./allowlist.ts";
 import { costSince, recordUsage } from "./usage.ts";
 import { buildSpeechRequest, SPEECH_MODEL } from "./speech.ts";
+import { handleClasses } from "./classes.ts";
 import { prefetch as prefetchModelCatalog } from "../client/models-dev.ts";
 import { billingWebhookImplemented, checkEntitlement, effectivePlan, isFreeModel, PLANS, planFor, periodStart, setPlan, WINDOW_MS, windowStart, type PlanName } from "./plans.ts";
 import { checkoutUrl, createCheckout, getCheckout, setCheckoutPlan } from "./billing.ts";
@@ -950,6 +951,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     }
     if (req.method === "POST" && url.pathname === "/v1/audio/speech") {
       return await handleSpeech(req, res, who);
+    }
+    if (url.pathname === "/v1/classes" || url.pathname.startsWith("/v1/classes/")) {
+      return await handleClasses(req, res, who, url);
     }
 
     // ---- enterprise control plane ----
