@@ -208,6 +208,7 @@ export function convert(messages: OAIMessage[]): { system?: string; messages: Bl
           if (m) return { type: "image", source: { type: "base64", media_type: m[1], data: m[2] } };
           return { type: "image", source: { type: "url", url } };
         }
+        // Stricter than the image_url regex on purpose: a parameterised type like text/plain;charset=… is not a document, and an empty payload is not a file.
         if (part.type === "file") {
           // OpenAI-style file part → Anthropic document (pdf) / image block. Anything else is named in a
           // text note rather than silently becoming the string "undefined".
@@ -554,7 +555,10 @@ async function demo(): Promise<void> {
   const odd = convert([{ role: "user", content: [{ type: "file", file: { filename: "a.zip", file_data: "data:application/zip;base64,AA" } }] }] as OAIMessage[]).messages[0]!.content as Block[];
   assert(odd[0]!.type === "text" && String(odd[0]!.text).includes("a.zip") && String(odd[0]!.text).includes("application/zip"), "an unknown type becomes a bracketed note, never the word undefined");
   const bareFile = convert([{ role: "user", content: [{ type: "file", file: {} }] }] as OAIMessage[]).messages[0]!.content as Block[];
-  assert(bareFile[0]!.type === "text" && !String(bareFile[0]!.text).includes("undefined"), "a malformed file part is a note too");
+  assert(
+    bareFile[0]!.type === "text" && String(bareFile[0]!.text) === "[attached file of type unknown could not be forwarded]",
+    "a malformed file part becomes the bracketed note, never the word undefined",
+  );
   console.log("anthropic file parts ok");
 
   console.log("anthropic: all checks passed");
