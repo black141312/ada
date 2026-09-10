@@ -208,6 +208,18 @@ export function convert(messages: OAIMessage[]): { system?: string; messages: Bl
           if (m) return { type: "image", source: { type: "base64", media_type: m[1], data: m[2] } };
           return { type: "image", source: { type: "url", url } };
         }
+        if (part.type === "file") {
+          // OpenAI-style file part → Anthropic document (pdf) / image block. Anything else is named in a
+          // text note rather than silently becoming the string "undefined".
+          const file = (part.file ?? {}) as { filename?: unknown; file_data?: unknown };
+          const title = typeof file.filename === "string" && file.filename ? file.filename : undefined;
+          const m = /^data:([^;,]+);base64,(.+)$/.exec(typeof file.file_data === "string" ? file.file_data : "");
+          if (m && m[1] === "application/pdf") {
+            return { type: "document", source: { type: "base64", media_type: "application/pdf", data: m[2] }, ...(title ? { title } : {}) };
+          }
+          if (m && /^image\//.test(m[1]!)) return { type: "image", source: { type: "base64", media_type: m[1], data: m[2] } };
+          return { type: "text", text: `[attached file${title ? ` ${title}` : ""} of type ${m ? m[1] : "unknown"} could not be forwarded]` };
+        }
         return { type: "text", text: String(part.text ?? "") };
       });
       out.push({ role: "user", content: blocks });
@@ -524,6 +536,26 @@ async function demo(): Promise<void> {
   assert(blocksOf(withText[0]).map((b) => b.type).join() === "thinking,text,tool_use", "thinking, then text, then the call");
 
   assert(THINK_BUDGET.low! >= 1024 && THINK_BUDGET.high! > THINK_BUDGET.medium!, "budgets clear Anthropic's 1024 floor and increase with effort");
+
+  // File parts: a PDF becomes a document block, an image data URL an image block, anything else a note.
+  const pdf = convert([
+    { role: "user", content: [
+      { type: "file", file: { filename: "paper.pdf", file_data: "data:application/pdf;base64,JVBERi0=" } },
+      { type: "text", text: "Summarise" },
+    ] },
+  ] as OAIMessage[]).messages[0]!.content as Block[];
+  assert(pdf[0]!.type === "document", "a pdf file part becomes a document block");
+  assert((pdf[0]!.source as Record<string, unknown>).media_type === "application/pdf", "with the pdf media type");
+  assert((pdf[0]!.source as Record<string, unknown>).data === "JVBERi0=", "and the raw base64");
+  assert(pdf[0]!.title === "paper.pdf", "the filename becomes the document title");
+  assert(pdf[1]!.type === "text" && pdf[1]!.text === "Summarise", "the trailing text part is untouched");
+  const img = convert([{ role: "user", content: [{ type: "file", file: { filename: "x.png", file_data: "data:image/png;base64,AA" } }] }] as OAIMessage[]).messages[0]!.content as Block[];
+  assert(img[0]!.type === "image" && (img[0]!.source as Record<string, unknown>).media_type === "image/png", "an image file part becomes an image block");
+  const odd = convert([{ role: "user", content: [{ type: "file", file: { filename: "a.zip", file_data: "data:application/zip;base64,AA" } }] }] as OAIMessage[]).messages[0]!.content as Block[];
+  assert(odd[0]!.type === "text" && String(odd[0]!.text).includes("a.zip") && String(odd[0]!.text).includes("application/zip"), "an unknown type becomes a bracketed note, never the word undefined");
+  const bareFile = convert([{ role: "user", content: [{ type: "file", file: {} }] }] as OAIMessage[]).messages[0]!.content as Block[];
+  assert(bareFile[0]!.type === "text" && !String(bareFile[0]!.text).includes("undefined"), "a malformed file part is a note too");
+  console.log("anthropic file parts ok");
 
   console.log("anthropic: all checks passed");
 }
