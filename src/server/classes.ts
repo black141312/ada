@@ -296,7 +296,13 @@ export async function handleClasses(req: IncomingMessage, res: ServerResponse, w
 
   const shared = p.match(/^\/v1\/classes\/shared\/([^/]+)$/);
   if (shared && m === "GET") {
-    const r = await getShared(user, decodeURIComponent(shared[1]!));
+    let token: string;
+    try {
+      token = decodeURIComponent(shared[1]!);
+    } catch {
+      return err(res, 404, "This link is no longer shared."); // a malformed escape is just not a token
+    }
+    const r = await getShared(user, token);
     return r ? send(res, 200, r) : err(res, 404, "This link is no longer shared.");
   }
 

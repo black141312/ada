@@ -61,9 +61,11 @@ try {
 
   // share → open by token as bob → in bob's list
   assert.equal((await call(bob, "POST", "/v1/classes/cls_abcd1234/share")).status, 404);
+  assert.equal((await call(bob, "DELETE", "/v1/classes/cls_abcd1234/share")).status, 404);
   const share = (await call(alice, "POST", "/v1/classes/cls_abcd1234/share")).json;
   assert.match(share.url, /^https:\/\/adacodelabs\.com\/class\/#[A-Za-z0-9_-]{22}$/);
   assert.equal((await call(bob, "GET", "/v1/classes/shared/short")).status, 404);
+  assert.equal((await call(bob, "GET", "/v1/classes/shared/%zz")).status, 404, "a malformed escape is a 404, not a 500");
   const opened = (await call(bob, "GET", `/v1/classes/shared/${share.token}`)).json;
   assert.equal(opened.id, "cls_abcd1234");
   assert.deepEqual(opened.progress, {});
