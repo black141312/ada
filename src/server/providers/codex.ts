@@ -60,11 +60,14 @@ export function toResponsesInput(messages: OAIMessage[]): { instructions: string
 
     // user
     if (Array.isArray(m.content)) {
-      const parts = (m.content as Array<Record<string, unknown>>).map((p) =>
-        p.type === "image_url"
-          ? { type: "input_image", image_url: String((p.image_url as { url?: string })?.url ?? "") }
-          : { type: "input_text", text: String(p.text ?? "") },
-      );
+      const parts = (m.content as Array<Record<string, unknown>>).map((p) => {
+        if (p.type === "image_url") return { type: "input_image", image_url: String((p.image_url as { url?: string })?.url ?? "") };
+        if (p.type === "file") {
+          const file = (p.file ?? {}) as { filename?: unknown; file_data?: unknown };
+          return { type: "input_file", filename: String(file.filename ?? "file"), file_data: String(file.file_data ?? "") };
+        }
+        return { type: "input_text", text: String(p.text ?? "") };
+      });
       input.push({ type: "message", role: "user", content: parts });
     } else {
       input.push({ type: "message", role: "user", content: [{ type: "input_text", text: String(m.content ?? "") }] });
@@ -317,6 +320,17 @@ async function demo(): Promise<void> {
   assert(got.length === 3, `three records across the split, got ${got.length}`);
   assert(got[1] === '{"b":2}', "a record split across reads is reassembled");
   assert(got[2] === "[DONE]", "the terminator survives");
+
+  const { input: withFile } = toResponsesInput([
+    { role: "user", content: [
+      { type: "file", file: { filename: "paper.pdf", file_data: "data:application/pdf;base64,JVBERi0=" } },
+      { type: "text", text: "Summarise" },
+    ] },
+  ] as Parameters<typeof toResponsesInput>[0]);
+  const parts2 = (withFile[0]!.content as Array<Record<string, unknown>>);
+  assert(parts2[0]!.type === "input_file" && parts2[0]!.filename === "paper.pdf" && parts2[0]!.file_data === "data:application/pdf;base64,JVBERi0=", "a file part becomes input_file with filename and file_data");
+  assert(parts2[1]!.type === "input_text" && parts2[1]!.text === "Summarise", "the trailing text part is untouched");
+  console.log("codex file parts ok");
 
   console.log("codex: all checks passed");
 }
