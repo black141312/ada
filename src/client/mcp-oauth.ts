@@ -438,7 +438,8 @@ export function awaitCallback(state: string, label?: string, fixedPort?: number)
       else fail(new Error(err ?? "state mismatch — the callback did not come from the sign-in Ada started"));
       setTimeout(() => server.close(), 500);
     });
-    server.on("error", rejectOuter);
+    // ONE handler: two registrations meant the first settled the promise and the second's message
+    // — the one that says what to do about a busy port — could never be seen.
     server.on("error", (e: NodeJS.ErrnoException) => {
       rejectOuter(
         e.code === "EADDRINUSE" && fixedPort
@@ -621,7 +622,21 @@ export async function beginLogin(
   if (!meta) return { error: "this server did not advertise an OAuth authorization server" };
 
   const state = randomBytes(16).toString("base64url");
-  const { port, code } = await awaitCallback(state, opts.label, opts.redirectPort);
+  // Binding the callback listener can FAIL, and every caller of beginLogin expects a returned
+  // {error}, never a throw. Unguarded, that rejection escaped this function, was awaited by the
+  // /v1/mcp/:name/login handler, and took the whole agent down — so clicking Connect killed the
+  // engine, and the NEXT click reported "the agent did not answer (fetch failed)", blaming the
+  // connector for a process that was no longer running.
+  //
+  // Reachable since providers began pinning a port: an abandoned sign-in holds its listener until
+  // the timeout below fires, and a second attempt inside that window hits EADDRINUSE.
+  let bound: { port: number; code: Promise<string> };
+  try {
+    bound = await awaitCallback(state, opts.label, opts.redirectPort);
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+  const { port, code } = bound;
   const redirectUri = `http://127.0.0.1:${port}/callback`;
 
   // Three ways to be a client, in the order that costs the user least:
