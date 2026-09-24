@@ -12,7 +12,7 @@ import { CorruptStore, type Identity, appendAudit, appendUsage, auditTail, creat
 import { adminUsers, verifyIdentity } from "./identity.ts";
 import { addAllowed, listAllowed, removeAllowed } from "./allowlist.ts";
 import { costSince, recordUsage } from "./usage.ts";
-import { handleClasses } from "./classes.ts";
+import { handleClasses, readBodyLimited } from "./classes.ts";
 import { prefetch as prefetchModelCatalog } from "../client/models-dev.ts";
 import { billingWebhookImplemented, checkEntitlement, effectivePlan, isFreeModel, PLANS, planFor, periodStart, setPlan, WINDOW_MS, windowStart, type PlanName } from "./plans.ts";
 import { checkoutUrl, createCheckout, getCheckout, setCheckoutPlan } from "./billing.ts";
@@ -141,6 +141,11 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
+// Chat completions is the one route that routinely carries file uploads (a 20 MB PDF makes ~27 MB
+// base64 bodies routine) — cap it so a client can't run the process out of memory with an unbounded
+// upload. Other readBody() call sites here are small admin/JSON payloads and stay uncapped.
+const CHAT_BODY_LIMIT = 40 * 1024 * 1024; // 40 MB
+
 function locked(): boolean {
   // OIDC must lock the backend the instant ADA_OIDC_ISSUER is set — BEFORE any seat exists — else a
   // fresh SSO deployment with zero seats would fall through identify() to dev-open.
@@ -238,7 +243,10 @@ async function handleModels(res: ServerResponse, freeOnly = false): Promise<void
 }
 
 async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identity): Promise<void> {
-  const raw = await readBody(req);
+  const raw = await readBodyLimited(req, CHAT_BODY_LIMIT);
+  if (raw === null) {
+    return json(res, 413, { error: { message: `request body too large (40 MB cap)` } });
+  }
   let body: Record<string, unknown>;
   try {
     body = JSON.parse(raw);
