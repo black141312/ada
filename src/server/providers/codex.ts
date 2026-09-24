@@ -64,7 +64,14 @@ export function toResponsesInput(messages: OAIMessage[]): { instructions: string
         if (p.type === "image_url") return { type: "input_image", image_url: String((p.image_url as { url?: string })?.url ?? "") };
         if (p.type === "file") {
           const file = (p.file ?? {}) as { filename?: unknown; file_data?: unknown };
-          return { type: "input_file", filename: String(file.filename ?? "file"), file_data: String(file.file_data ?? "") };
+          const title = typeof file.filename === "string" && file.filename ? file.filename : undefined;
+          // Mirrors the Anthropic adapter's note for a malformed file part (see providers/anthropic.ts):
+          // a non-string file_data has nothing usable to forward, so say so in readable text rather
+          // than coercing it into the string "[object Object]" and shipping that as a fake file.
+          if (typeof file.file_data !== "string") {
+            return { type: "input_text", text: `[attached file${title ? ` ${title}` : ""} of type unknown could not be forwarded]` };
+          }
+          return { type: "input_file", filename: title ?? "file", file_data: file.file_data };
         }
         return { type: "input_text", text: String(p.text ?? "") };
       });
@@ -330,6 +337,18 @@ async function demo(): Promise<void> {
   const parts2 = (withFile[0]!.content as Array<Record<string, unknown>>);
   assert(parts2[0]!.type === "input_file" && parts2[0]!.filename === "paper.pdf" && parts2[0]!.file_data === "data:application/pdf;base64,JVBERi0=", "a file part becomes input_file with filename and file_data");
   assert(parts2[1]!.type === "input_text" && parts2[1]!.text === "Summarise", "the trailing text part is untouched");
+
+  // A non-string file_data (e.g. the client sent the parsed object, not the data URL) has nothing
+  // usable to forward — it must become a readable note, never the string "[object Object]" shipped
+  // as though it were real file content.
+  const { input: withBadFile } = toResponsesInput([
+    { role: "user", content: [{ type: "file", file: { filename: "paper.pdf", file_data: { not: "a string" } } }] },
+  ] as unknown as Parameters<typeof toResponsesInput>[0]);
+  const badParts = (withBadFile[0]!.content as Array<Record<string, unknown>>);
+  assert(
+    badParts[0]!.type === "input_text" && badParts[0]!.text === "[attached file paper.pdf of type unknown could not be forwarded]",
+    "a non-string file_data becomes the same readable note the Anthropic adapter uses, never [object Object]",
+  );
   console.log("codex file parts ok");
 
   console.log("codex: all checks passed");
