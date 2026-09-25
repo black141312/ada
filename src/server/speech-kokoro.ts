@@ -119,7 +119,8 @@ export class LruBytes {
 type Req = { id: number; voice: string; text: string; resolve: (b: Uint8Array) => void; reject: (e: Error) => void; timer?: NodeJS.Timeout; child?: ChildProcess };
 
 /** One request at the worker at a time; the rest wait here. A worker that exits takes its in-flight
- *  request with it and the next call forks a fresh one. Past `maxWaiting` queued lines the call fails
+ *  request with it and the next call forks a fresh one; one that doesn't answer in `timeoutMs` is
+ *  SIGKILLed, since a hung onnxruntime would otherwise hold every later line hostage. Past `maxWaiting` queued lines the call fails
  *  fast ("voice busy") — the client falls back to the browser voice rather than wait minutes. */
 export function createSynth({ spawn, timeoutMs = 120_000, maxWaiting = 32 }: { spawn: () => ChildProcess; timeoutMs?: number; maxWaiting?: number }) {
   let child: ChildProcess | null = null;
@@ -159,13 +160,18 @@ export function createSynth({ spawn, timeoutMs = 120_000, maxWaiting = 32 }: { s
       req.reject(err instanceof Error ? err : new Error(String(err)));
       return pump();
     }
-    req.child = child;
+    const c = (req.child = child);
     req.timer = setTimeout(() => {
       if (current !== req) return;
+      // Hung, not slow: kill it so the next line gets a fresh worker instead of queueing behind it.
+      if (child === c) child = null;
+      try {
+        c.kill("SIGKILL");
+      } catch {}
       finish().reject(new Error("voice timed out"));
       pump();
     }, timeoutMs);
-    child.send({ id: req.id, voice: req.voice, text: req.text });
+    c.send({ id: req.id, voice: req.voice, text: req.text });
   };
   return (voice: string, text: string): Promise<Uint8Array> =>
     new Promise((resolve, reject) => {

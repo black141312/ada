@@ -96,6 +96,11 @@ assert.notEqual(S.cacheKey("af_heart", "a"), S.cacheKey("af_bella", "a"), "the k
 function fakeChild(behave) {
   const c = new EventEmitter();
   c.sent = [];
+  c.killed = null;
+  c.kill = (sig) => {
+    c.killed = sig;
+    setImmediate(() => c.emit("exit", null, sig));
+  };
   c.send = (m) => {
     c.sent.push(m);
     behave(c, m);
@@ -164,6 +169,27 @@ function fakeChild(behave) {
   await Promise.allSettled(p);
 }
 
+{
+  // a hung worker is SIGKILLed on timeout and the next line gets a fresh one
+  const kids = [];
+  const synth = S.createSynth({
+    timeoutMs: 20,
+    spawn: () => {
+      const k = kids.length;
+      const c = fakeChild((c, m) => {
+        if (k > 0) c.emit("message", { id: m.id, ok: true, wav: new Uint8Array([7]) }); // the first one hangs
+      });
+      kids.push(c);
+      return c;
+    },
+  });
+  const first = synth("v", "hang");
+  const second = synth("v", "next"); // queued behind the hung line
+  await assert.rejects(first, /timed out/);
+  assert.equal(kids[0].killed, "SIGKILL", "the hung worker is killed");
+  assert.deepEqual([...(await second)], [7], "the queued line runs on a fresh worker");
+  assert.equal(kids.length, 2);
+}
 // --- disk prune -----------------------------------------------------------------
 {
   const dir = mkdtempSync(join(tmpdir(), "ada-tts-prune-"));
