@@ -39,10 +39,9 @@ export const DEMO: Institute = {
 };
 
 /** Model calls one doubt id may make per day on the institute's bill. A doubt is an outline, 2–4
- *  scenes, a couple of repairs each and some follow-ups — ~15–30 calls. Without a ceiling one doubt
- *  id, reused forever, would be unlimited free Haiku. ponytail: flat per-doubt ceiling; per-institute
- *  budgets are part 5. */
-export const CALLS_PER_DOUBT = 60;
+ *  scenes, and the odd repair or follow-up — ~8–20 calls. Without a ceiling one doubt id, reused
+ *  forever, would be unlimited free Haiku; the per-institute daily budget backstops the rest. */
+export const CALLS_PER_DOUBT = 25;
 
 export const isSlug = (s: unknown): s is string => typeof s === "string" && /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/.test(s);
 /** Same format the app mints for classes (classes.ts isClassId) — a doubt is a class doc. */
@@ -243,7 +242,7 @@ export async function claimDoubtCall(
  *  `reasoning_effort`, `verbosity`). An allowlist, not a denylist, so a field OpenRouter adds next
  *  month is dropped by default. */
 export const WAIVED_BODY_LIMIT = 2 * 1024 * 1024;
-export const WAIVED_MAX_TOKENS = 8192;
+export const WAIVED_MAX_TOKENS = 6000; // a chalkboard scene is ~2–4k tokens of output
 const WAIVED_KEEP = ["model", "messages", "stream", "stream_options", "temperature", "top_p", "stop", "response_format", "seed", "presence_penalty", "frequency_penalty"];
 
 /** Why this body can't be waived, or null. Text and images only: a `file` part is how a PDF gets in,

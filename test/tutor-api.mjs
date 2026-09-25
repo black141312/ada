@@ -141,7 +141,7 @@ try {
   assert.equal(cut.status, 200, "a routing hint on an institute call is ignored, not followed to an unconfigured provider");
   const sent = upstreamBodies.at(-1);
   for (const k of ["models", "route", "plugins", "transforms", "n", "reasoning", "provider"]) assert.ok(!(k in sent), `${k} is not forwarded`);
-  assert.equal(sent.max_tokens, 8192, "max_tokens clamped");
+  assert.equal(sent.max_tokens, 6000, "max_tokens clamped");
   assert.equal(sent.temperature, 0.2, "ordinary sampling settings pass");
   assert.equal(sent.model, HAIKU);
   const pdf = await call("POST", "/v1/chat/completions", { headers: doubt(1), body: { model: HAIKU, messages: [{ role: "user", content: [{ type: "file", file: { filename: "a.pdf", file_data: "data:application/pdf;base64,AA" } }] }] } });

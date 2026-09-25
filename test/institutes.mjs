@@ -135,11 +135,11 @@ assert.deepEqual(decideInstitute({ ...ok, model: "x/y", bodyBytes: 9e9, bodyProb
     transforms: ["middle-out"], web_search_options: {}, n: 8, reasoning: { effort: "high" }, reasoning_effort: "high", tools: [{}], tool_choice: "auto",
   });
   assert.deepEqual(Object.keys(out).sort(), ["max_tokens", "messages", "model", "stream", "temperature"], "allowlist: model-switching and paid extras are gone");
-  assert.equal(out.max_tokens, I.WAIVED_MAX_TOKENS, "max_tokens clamped to 8192");
-  assert.equal(I.sanitizeWaivedBody({ model: "m", messages: [] }).max_tokens, 8192, "absent → the ceiling, never unbounded");
+  assert.equal(out.max_tokens, I.WAIVED_MAX_TOKENS, "max_tokens clamped to 6000");
+  assert.equal(I.sanitizeWaivedBody({ model: "m", messages: [] }).max_tokens, 6000, "absent → the ceiling, never unbounded");
   assert.equal(I.sanitizeWaivedBody({ model: "m", messages: [], max_tokens: 900 }).max_tokens, 900);
   assert.equal(I.sanitizeWaivedBody({ model: "m", messages: [], max_completion_tokens: 700, max_tokens: 900 }).max_tokens, 700, "the smaller of the two");
-  assert.equal(I.sanitizeWaivedBody({ model: "m", messages: [], max_tokens: -5 }).max_tokens, 8192, "nonsense is ignored");
+  assert.equal(I.sanitizeWaivedBody({ model: "m", messages: [], max_tokens: -5 }).max_tokens, 6000, "nonsense is ignored");
 }
 
 // --- the gate with a fake store -----------------------------------------------
@@ -222,9 +222,9 @@ const B = { bytes: 1000, parsed: { messages: [{ role: "user", content: "2+2?" }]
   assert.equal(got.filter((d) => d.kind === "waive").length, 30, "exactly the cap succeeds");
   assert.equal(got.filter((d) => d.status === 429).length, 10);
   assert.equal((await I.doubtStats("demo", "racer", dayOf(NOW), "cls_x0000000")).doubtsToday, 30, "and exactly the cap is recorded");
-  // 75 calls at once on one doubt: exactly CALLS_PER_DOUBT get through.
+  // 40 calls at once on one doubt: exactly CALLS_PER_DOUBT get through.
   const one = req({ "x-ada-institute": "demo", "x-ada-doubt": "cls_samedoub" });
-  const calls = await Promise.all(Array.from({ length: 75 }, () => instituteGate(I.dbStore, one, "racer2", DEMO.model, B, NOW)));
+  const calls = await Promise.all(Array.from({ length: 40 }, () => instituteGate(I.dbStore, one, "racer2", DEMO.model, B, NOW)));
   assert.equal(calls.filter((d) => d.kind === "waive").length, CALLS_PER_DOUBT);
   assert.equal((await I.doubtStats("demo", "racer2", dayOf(NOW), "cls_samedoub")).doubtCalls, CALLS_PER_DOUBT);
   // Oversized body at the gate: refused, nothing counted.
