@@ -4,7 +4,10 @@
  * Kokoro-82M (the app's local voice, same voice map) runs in a forked child process
  * (kokoro-worker.mjs), one line at a time per instance. Output is 16 kHz mono 16-bit WAV
  * (~32 KB/s). Lines are cached by sha1(voice + text): in memory (LRU, 200 MB) and on disk under
- * ADA_DATA_DIR when there is one.
+ * ADA_DATA_DIR when there is one (not on Cloud Run, whose disk is memory — see diskDir).
+ *
+ * Memory: the worker holds ~400 MB once the model is loaded, plus the LRU — the service needs
+ * ~1.5–2 GiB, not Cloud Run's 512 MiB default.
  *
  * Not a free general TTS: signed-in only, text capped at 1500 characters, and a per-user rate limit.
  */
@@ -181,7 +184,10 @@ const spawnWorker = (): ChildProcess =>
 // ---------- caches ----------
 
 const memory = new LruBytes(Number(process.env.ADA_TTS_MEMORY_BYTES) || 200_000_000);
-const diskDir = (): string | null => process.env.ADA_TTS_CACHE_DIR || (process.env.ADA_DATA_DIR ? join(process.env.ADA_DATA_DIR, "tts") : null);
+// On Cloud Run (K_SERVICE set) the container filesystem IS memory and dies with the instance, so a
+// disk copy would only double what the LRU above already holds. Elsewhere /data is a real volume.
+const diskDir = (): string | null =>
+  process.env.ADA_TTS_CACHE_DIR || (process.env.ADA_DATA_DIR && !process.env.K_SERVICE ? join(process.env.ADA_DATA_DIR, "tts") : null);
 const DISK_MAX = 200_000_000;
 let writes = 0;
 
