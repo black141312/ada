@@ -30,7 +30,7 @@ RUN npm ci --omit=dev --omit=optional \
 # Not under /data: that is a VOLUME, and anything a build writes there is discarded.
 ENV ADA_KOKORO_DIR=/opt/kokoro
 COPY src/server/kokoro-worker.mjs src/server/wav.mjs ./src/server/
-RUN node --input-type=module -e "const w = await import('./src/server/kokoro-worker.mjs'); const wav = await w.synth('af_heart', 'Ready.'); if (wav.length < 2000) throw new Error('kokoro bake produced no audio'); console.log('kokoro baked:', wav.length, 'bytes'); process.exit(0);"
+RUN ADA_KOKORO_DOWNLOAD=1 node --input-type=module -e "const w = await import('./src/server/kokoro-worker.mjs'); const wav = await w.synth('af_heart', 'Ready.'); if (wav.length < 2000) throw new Error('kokoro bake produced no audio'); console.log('kokoro baked:', wav.length, 'bytes'); process.exit(0);"
 
 # App sources (tsx runs the TypeScript directly — no build step).
 COPY tsconfig.json ./

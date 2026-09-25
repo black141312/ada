@@ -27,6 +27,11 @@ async function kokoroEnv() {
 const env = await kokoroEnv();
 env.cacheDir = process.env.ADA_KOKORO_DIR || path.join(os.homedir(), '.ada', 'kokoro');
 export const modelDir = () => path.join(env.cacheDir, MODEL);
+// ADA_KOKORO_DIR set means a baked model (the Docker image): it is read-only truth. Never download
+// at request time (a cold start would silently pull 90 MB, or hang offline) and never delete it.
+// The Docker bake step itself sets ADA_KOKORO_DOWNLOAD=1 — it is the one place a download belongs.
+const baked = !!process.env.ADA_KOKORO_DIR && process.env.ADA_KOKORO_DOWNLOAD !== '1';
+if (baked) env.allowRemoteModels = false;
 
 let model = null;
 export function load() {
@@ -37,7 +42,7 @@ export function load() {
       // A download cut short leaves a truncated file that fails every load forever — drop it, but
       // only when the file actually looks corrupt (a platform failure isn't the file's fault).
       const size = fs.existsSync(quantizedPath) ? fs.statSync(quantizedPath).size : undefined;
-      if (looksCorrupt({ size, message: err?.message })) {
+      if (!baked && looksCorrupt({ size, message: err?.message })) {
         try {
           fs.rmSync(modelDir(), { recursive: true, force: true });
         } catch {}
