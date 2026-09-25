@@ -65,6 +65,15 @@ assert.notEqual(S.cacheKey("af_heart", "a"), S.cacheKey("af_bella", "a"), "the k
   assert.ok(err / out.length < 0.02, `tone preserved (mean error ${(err / out.length).toFixed(4)})`);
   assert.deepEqual([...W.resample(new Float32Array([0.25, 0.25, 0.25]), 24_000, 16_000)], [0.25, 0.25], "DC stays DC");
   assert.equal(W.resample(new Float32Array(3), 16_000, 16_000).length, 3);
+  // Anti-aliasing: what can't exist at 16 kHz (above 8 kHz) is filtered, not folded back as hiss.
+  const rms = (a) => Math.sqrt(a.reduce((q, x) => q + x * x, 0) / a.length);
+  const db = (f) => {
+    const x = new Float32Array(24_000).map((_, i) => Math.sin((2 * Math.PI * f * i) / 24_000) * 0.5);
+    return 20 * Math.log10(rms(W.resample(x, 24_000, 16_000).slice(20, -20)) / rms(x));
+  };
+  assert.ok(Math.abs(db(440)) < 0.5 && Math.abs(db(3000)) < 0.5, "the voice band passes");
+  assert.ok(db(9000) < -15, `9 kHz attenuated (${db(9000).toFixed(1)} dB)`);
+  assert.ok(db(11_000) < -40, `11 kHz attenuated (${db(11_000).toFixed(1)} dB)`);
   assert.equal(W.resample(new Float32Array(2), 8_000, 16_000).length, 4, "upsampling works too");
 
   const wav = W.pcm16Wav(out, 16_000);

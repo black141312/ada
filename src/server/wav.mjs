@@ -2,8 +2,12 @@
 // child process, no tsx loader — can import them, and so can the tests.
 
 /** Downsample (or upsample) mono float PCM. Kokoro speaks at 24 kHz; the phone gets 16 kHz, which
- *  is a third fewer bytes and still clear for a voice. Downsampling averages each output sample's
- *  span of input (a box filter) so the dropped highs fold in less than plain decimation would. */
+ *  is a third fewer bytes and still clear for a voice. Downsampling is a 15-tap Blackman-windowed
+ *  sinc low-pass centred on each output instant, cut off just under the new Nyquist (8 kHz), so
+ *  the 8–12 kHz band Kokoro produces is filtered out instead of folding back as hiss. The taps are
+ *  normalised per sample, which keeps DC exact and the edges sane. */
+const TAPS = 15;
+const HALF = (TAPS - 1) / 2;
 export function resample(samples, from, to) {
   if (!(from > 0) || !(to > 0)) throw new Error('bad sample rate');
   if (from === to) return Float32Array.from(samples);
@@ -11,15 +15,21 @@ export function resample(samples, from, to) {
   const n = Math.floor(samples.length / ratio);
   const out = new Float32Array(n);
   if (ratio > 1) {
+    const fc = 0.45 / ratio; // cycles per input sample: 0.9 × the output Nyquist
     for (let i = 0; i < n; i++) {
-      const start = i * ratio;
-      const end = start + ratio;
+      const t = i * ratio;
+      const lo = Math.max(0, Math.ceil(t - HALF));
+      const hi = Math.min(samples.length - 1, Math.floor(t + HALF));
       let acc = 0;
       let w = 0;
-      for (let j = Math.floor(start); j < Math.ceil(end) && j < samples.length; j++) {
-        const part = Math.min(end, j + 1) - Math.max(start, j);
-        acc += samples[j] * part;
-        w += part;
+      for (let j = lo; j <= hi; j++) {
+        const x = j - t;
+        const sinc = x === 0 ? 1 : Math.sin(2 * Math.PI * fc * x) / (2 * Math.PI * fc * x);
+        const p = (x + HALF + 1) / (TAPS + 1); // window position in (0, 1)
+        const win = 0.42 - 0.5 * Math.cos(2 * Math.PI * p) + 0.08 * Math.cos(4 * Math.PI * p);
+        const k = sinc * win;
+        acc += samples[j] * k;
+        w += k;
       }
       out[i] = w ? acc / w : 0;
     }
