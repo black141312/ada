@@ -91,16 +91,20 @@ type ProgressRow = { progress: string; updated_at: number | string; via_token: s
 
 export type ClassSummary = {
   id: string; title: string; status: string; updatedAt: number; sceneCount: number; mine: boolean;
+  /** The doc's `kind` ("doubt" for Ada Tutor), null for a plain class — so a list can be filtered. */
+  kind: string | null;
   shareToken?: string; progressUpdatedAt?: number;
 };
 
 const num = (v: number | string | null | undefined) => (v == null ? 0 : Number(v));
-const sceneCount = (doc: string) => {
+/** What a list row needs from the stored doc — read from the JSON already being parsed for the scene
+ *  count, so every existing row gets it with no column or backfill. */
+const docMeta = (doc: string): { sceneCount: number; kind: string | null } => {
   try {
-    const d = JSON.parse(doc) as { scenes?: unknown };
-    return Array.isArray(d.scenes) ? d.scenes.length : 0;
+    const d = JSON.parse(doc) as { scenes?: unknown; kind?: unknown };
+    return { sceneCount: Array.isArray(d.scenes) ? d.scenes.length : 0, kind: typeof d.kind === "string" && d.kind ? d.kind.slice(0, 40) : null };
   } catch {
-    return 0;
+    return { sceneCount: 0, kind: null };
   }
 };
 const parse = (s: string): unknown => {
@@ -174,12 +178,12 @@ export async function listClasses(user: string): Promise<ClassSummary[]> {
     [user, user],
   );
   const out: ClassSummary[] = mine.map((r) => ({
-    id: r.id, title: r.title, status: r.status, updatedAt: num(r.updated_at), sceneCount: sceneCount(r.doc), mine: true,
+    id: r.id, title: r.title, status: r.status, updatedAt: num(r.updated_at), ...docMeta(r.doc), mine: true,
     ...(r.share_token ? { shareToken: r.share_token } : {}),
     ...(r.p_updated_at != null ? { progressUpdatedAt: num(r.p_updated_at) } : {}),
   }));
   for (const r of opened) {
-    out.push({ id: r.id, title: r.title, status: r.status, updatedAt: num(r.updated_at), sceneCount: sceneCount(r.doc), mine: false, shareToken: r.share_token!, progressUpdatedAt: num(r.p_updated_at) });
+    out.push({ id: r.id, title: r.title, status: r.status, updatedAt: num(r.updated_at), ...docMeta(r.doc), mine: false, shareToken: r.share_token!, progressUpdatedAt: num(r.p_updated_at) });
   }
   return out;
 }

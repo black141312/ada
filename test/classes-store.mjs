@@ -38,8 +38,14 @@ assert.equal(got.doc.title, "DNS");
 assert.equal(got.doc.progress, undefined, "progress is never inside the stored doc");
 assert.equal(got.progress, null);
 assert.equal(await s.getClass("bob", "cls_abcd1234"), null);
-assert.deepEqual(await s.listClasses("alice"), [{ id: "cls_abcd1234", title: "DNS", status: "ready", updatedAt: 100, sceneCount: 3, mine: true }]);
+assert.deepEqual(await s.listClasses("alice"), [{ id: "cls_abcd1234", title: "DNS", status: "ready", updatedAt: 100, sceneCount: 3, kind: null, mine: true }]);
 assert.deepEqual(await s.listClasses("bob"), []);
+
+// --- kind: read from the stored doc, so rows written before it existed list as null ---
+await s.putClass("carol", "cls_doubt001", { ...doc("cls_doubt001", 50), kind: "doubt", question: "2+2?" });
+await s.putClass("carol", "cls_plain001", doc("cls_plain001", 40));
+await s.putClass("carol", "cls_weird001", { ...doc("cls_weird001", 30), kind: 7 });
+assert.deepEqual((await s.listClasses("carol")).map((c) => [c.id, c.kind]), [["cls_doubt001", "doubt"], ["cls_plain001", null], ["cls_weird001", null]], "a non-string kind is null");
 
 // --- share / open by token ---
 assert.equal(await s.shareClass("bob", "cls_abcd1234"), null);

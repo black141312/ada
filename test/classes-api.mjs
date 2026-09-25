@@ -49,6 +49,7 @@ try {
   const mine = (await call(alice, "GET", "/v1/classes")).json.classes;
   assert.equal(mine.length, 1);
   assert.equal(mine[0].mine, true);
+  assert.equal(mine[0].kind, null, "a plain class has no kind");
   const one = (await call(alice, "GET", "/v1/classes/cls_abcd1234")).json;
   assert.equal(one.doc.title, "DNS");
   assert.equal(one.doc.progress, undefined);
@@ -97,6 +98,14 @@ try {
   assert.equal((await call(bob, "GET", `/v1/classes/shared/${share.token}`)).status, 404);
   assert.equal((await call(bob, "PUT", "/v1/classes/cls_abcd1234/progress", { progress: { updatedAt: 9 } })).status, 403);
   assert.deepEqual((await call(bob, "GET", "/v1/classes")).json.classes, []);
+
+  // kind rides on list rows (the student site's "My doubts" filters on it) — mine and shared alike
+  await call(alice, "PUT", "/v1/classes/cls_doubt001", { doc: { ...doc("cls_doubt001", 300), kind: "doubt" } });
+  assert.equal((await call(alice, "GET", "/v1/classes")).json.classes.find((c) => c.id === "cls_doubt001").kind, "doubt");
+  const dshare = (await call(alice, "POST", "/v1/classes/cls_doubt001/share")).json;
+  await call(bob, "GET", `/v1/classes/shared/${dshare.token}`);
+  assert.equal((await call(bob, "GET", "/v1/classes")).json.classes.find((c) => c.id === "cls_doubt001").kind, "doubt");
+  assert.equal((await call(alice, "DELETE", "/v1/classes/cls_doubt001")).status, 204);
 
   // delete cascades
   assert.equal((await call(alice, "DELETE", "/v1/classes/cls_abcd1234")).status, 204);
