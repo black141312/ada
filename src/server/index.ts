@@ -14,6 +14,7 @@ import { addAllowed, listAllowed, removeAllowed } from "./allowlist.ts";
 import { costSince, recordUsage } from "./usage.ts";
 import { handleClasses, readBodyLimited } from "./classes.ts";
 import { dbStore, instituteGate, isSlug, publicInstitute } from "./institutes.ts";
+import { handleSpeech } from "./speech-kokoro.ts";
 import { prefetch as prefetchModelCatalog } from "../client/models-dev.ts";
 import { billingWebhookImplemented, checkEntitlement, effectivePlan, isFreeModel, PLANS, planFor, periodStart, setPlan, WINDOW_MS, windowStart, type PlanName } from "./plans.ts";
 import { checkoutUrl, createCheckout, getCheckout, setCheckoutPlan } from "./billing.ts";
@@ -937,6 +938,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     }
     if (req.method === "POST" && url.pathname === "/v1/images/generations") {
       return await handleImages(req, res, who);
+    }
+    if (req.method === "POST" && url.pathname === "/v1/tutor/speech") {
+      return await handleSpeech(req, res, who);
     }
     if (url.pathname === "/v1/classes" || url.pathname.startsWith("/v1/classes/")) {
       return await handleClasses(req, res, who, url);
