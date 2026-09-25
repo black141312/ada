@@ -24,6 +24,7 @@ const { DEMO, CALLS_PER_DOUBT, DAILY_LIMIT_MESSAGE, decideInstitute, instituteGa
 // --- seed + store -------------------------------------------------------------
 const demo = await I.getInstitute("demo");
 assert.deepEqual(demo, DEMO, "the demo institute is created on first use");
+assert.equal(demo.dailyBudgetUsd, 5, "the pilot is live but capped at $5 a day");
 assert.equal(demo.model, "anthropic/claude-haiku-4.5");
 assert.equal(demo.dailyDoubtsPerStudent, 30);
 assert.deepEqual(await I.publicInstitute("demo"), { slug: "demo", name: "Demo Coaching", logoUrl: null }, "public view carries no model or cap");
@@ -39,6 +40,8 @@ assert.equal(await I.publicInstitute("acme"), null, "an inactive institute is in
 await I.putInstitute({ ...DEMO, name: "Demo Coaching (edited)" });
 assert.equal((await I.getInstitute("demo")).name, "Demo Coaching (edited)");
 await I.putInstitute(DEMO);
+await I.putInstitute({ ...DEMO, slug: "open", dailyBudgetUsd: null });
+assert.equal((await I.getInstitute("open")).dailyBudgetUsd, null, "unlimited only when set explicitly");
 
 // membership: idempotent
 assert.equal(await I.isMember("demo", "stu"), false);
@@ -98,7 +101,7 @@ assert.equal(dayOf(Date.UTC(2026, 8, 26, 23, 59)), "2026-09-26");
 
 // --- the decision (pure) ------------------------------------------------------
 const fresh = { doubtsToday: 0, doubtCalls: null };
-const ok = { slug: "demo", institute: DEMO, model: DEMO.model, doubtId: "cls_aaaaaaaa", banned: false, bodyBytes: 1000, bodyProblem: null, stats: fresh };
+const ok = { slug: "demo", institute: DEMO, model: DEMO.model, doubtId: "cls_aaaaaaaa", banned: false, bodyBytes: 1000, bodyProblem: null, stats: fresh, spentTodayUsd: 0 };
 assert.deepEqual(decideInstitute(ok), { kind: "waive", slug: "demo", doubtId: "cls_aaaaaaaa", newDoubt: true });
 assert.deepEqual(decideInstitute({ ...ok, slug: null }), { kind: "none" }, "no header → today's rules");
 assert.deepEqual(decideInstitute({ ...ok, institute: null }), { kind: "none" }, "unknown institute → today's rules");
@@ -109,7 +112,7 @@ assert.deepEqual(decideInstitute({ ...ok, model: "Anthropic/Claude-Haiku-4.5" })
 assert.deepEqual(decideInstitute({ ...ok, doubtId: null }), { kind: "none" }, "no doubt id → nothing to count → no waiver");
 assert.equal(decideInstitute({ ...ok, banned: true }).status, 403, "a banned student is refused, not waived");
 const full = decideInstitute({ ...ok, stats: { doubtsToday: 30, doubtCalls: null } });
-assert.deepEqual(full, { kind: "deny", status: 429, message: DAILY_LIMIT_MESSAGE }, "the 31st doubt of the day is refused");
+assert.deepEqual(full, { kind: "deny", status: 429, message: DAILY_LIMIT_MESSAGE, type: "doubt_limit" }, "the 31st doubt of the day is refused");
 assert.equal(decideInstitute({ ...ok, stats: { doubtsToday: 29, doubtCalls: null } }).kind, "waive", "the 30th is allowed");
 assert.deepEqual(
   decideInstitute({ ...ok, stats: { doubtsToday: 30, doubtCalls: 4 } }),
@@ -121,6 +124,17 @@ assert.equal(decideInstitute({ ...ok, bodyBytes: I.WAIVED_BODY_LIMIT + 1 }).stat
 assert.equal(decideInstitute({ ...ok, bodyBytes: I.WAIVED_BODY_LIMIT }).kind, "waive");
 assert.deepEqual(decideInstitute({ ...ok, bodyProblem: "no" }), { kind: "deny", status: 400, message: "no" });
 assert.deepEqual(decideInstitute({ ...ok, model: "x/y", bodyBytes: 9e9, bodyProblem: "no" }), { kind: "none" }, "body limits only bind the waiver");
+// the institute's daily budget
+assert.deepEqual(
+  decideInstitute({ ...ok, spentTodayUsd: 5 }),
+  { kind: "deny", status: 429, message: "This site has reached today's limit. Try again tomorrow.", type: "institute_budget" },
+  "at the budget, waived calls stop",
+);
+assert.equal(decideInstitute({ ...ok, spentTodayUsd: 4.99 }).kind, "waive", "under it, they run");
+assert.equal(decideInstitute({ ...ok, stats: { doubtsToday: 3, doubtCalls: 2 }, spentTodayUsd: 9 }).type, "institute_budget", "even for a doubt already under way");
+assert.equal(decideInstitute({ ...ok, institute: { ...DEMO, dailyBudgetUsd: null }, spentTodayUsd: 1e6 }).kind, "waive", "null = unlimited");
+assert.deepEqual(decideInstitute({ ...ok, model: "x/y", spentTodayUsd: 1e6 }), { kind: "none" }, "the budget only binds the institute's own calls");
+assert.equal(decideInstitute({ ...ok, stats: { doubtsToday: 30, doubtCalls: null } }).type, "doubt_limit");
 
 // --- the waived body --------------------------------------------------------------
 {
@@ -156,6 +170,7 @@ function fakeStore(over = {}) {
       return d;
     },
     isBanned: async () => over.banned ?? false,
+    spentSince: async (slug, since) => (log.push(["spent", slug, since]), over.spent ?? 0),
   };
   return store;
 }
@@ -166,7 +181,7 @@ const B = { bytes: 1000, parsed: { messages: [{ role: "user", content: "2+2?" }]
   const s = fakeStore();
   const d = await instituteGate(s, req({ "x-ada-institute": "demo", "x-ada-doubt": "cls_aaaaaaaa" }), "stu", DEMO.model, B, NOW);
   assert.equal(d.kind, "waive");
-  assert.deepEqual(s.log, [["get", "demo"], ["member", "demo", "stu"], ["stats", "demo", "stu", "2026-09-26", "cls_aaaaaaaa"], ["record", "demo", "stu", "2026-09-26", "cls_aaaaaaaa"]]);
+  assert.deepEqual(s.log, [["get", "demo"], ["member", "demo", "stu"], ["spent", "demo", Date.UTC(2026, 8, 26)], ["stats", "demo", "stu", "2026-09-26", "cls_aaaaaaaa"], ["record", "demo", "stu", "2026-09-26", "cls_aaaaaaaa"]], "spend is read from UTC midnight");
 }
 {
   const s = fakeStore();
@@ -202,6 +217,31 @@ const B = { bytes: 1000, parsed: { messages: [{ role: "user", content: "2+2?" }]
   const s = fakeStore();
   assert.equal((await instituteGate(s, req({ "x-ada-institute": "ghost", "x-ada-doubt": "cls_aaaaaaaa" }), "stu", DEMO.model, B, NOW)).kind, "none");
   assert.deepEqual(s.log, [["get", "ghost"]], "unknown institute: no membership, nothing counted");
+}
+
+{
+  const s = fakeStore({ spent: 5 });
+  const d = await instituteGate(s, req({ "x-ada-institute": "demo", "x-ada-doubt": "cls_aaaaaaaa" }), "stu", DEMO.model, B, NOW);
+  assert.equal(d.type, "institute_budget");
+  assert.ok(!s.log.some((l) => l[0] === "record"), "an over-budget call is not counted");
+}
+
+// --- the budget against real usage rows ------------------------------------------
+{
+  const { recordUsage, instituteCostSince } = await import(pathToFileURL(join(base, "src/server/usage.ts")).href);
+  await I.putInstitute({ ...DEMO, slug: "spendy", dailyBudgetUsd: 1 });
+  const since = Date.parse(`${dayOf()}T00:00:00Z`);
+  // Haiku at $1 / $5 per 1M: 100k in + 100k out = $0.60
+  await recordUsage({ ts: Date.now(), user: "s1", model: DEMO.model, provider: "openrouter", promptTokens: 100_000, completionTokens: 100_000, institute: "spendy" });
+  await recordUsage({ ts: Date.now(), user: "s1", model: DEMO.model, provider: "openrouter", promptTokens: 999_999, completionTokens: 0 }); // own plan: not the institute's
+  await recordUsage({ ts: since - 1000, user: "s1", model: DEMO.model, provider: "openrouter", promptTokens: 9e6, completionTokens: 0, institute: "spendy" }); // yesterday
+  assert.ok(Math.abs((await instituteCostSince("spendy", since)) - 0.6) < 1e-9, "today's rows for this institute, priced like any usage");
+  const h = (n) => req({ "x-ada-institute": "spendy", "x-ada-doubt": `cls_b${String(n).padStart(7, "0")}` });
+  assert.equal((await instituteGate(I.dbStore, h(1), "s2", DEMO.model, B)).kind, "waive", "$0.60 of $1");
+  await recordUsage({ ts: Date.now(), user: "s2", model: DEMO.model, provider: "openrouter", promptTokens: 0, completionTokens: 80_000, institute: "spendy" }); // +$0.40
+  const over = await instituteGate(I.dbStore, h(2), "s3", DEMO.model, B);
+  assert.equal(over.type, "institute_budget", "any student is stopped once the institute is at $1");
+  assert.equal((await I.doubtStats("spendy", "s3", dayOf(), "cls_b0000002")).doubtsToday, 0, "and nothing is counted");
 }
 
 // --- the gate against the real store: 30 doubts, then refused ----------------

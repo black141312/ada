@@ -134,6 +134,20 @@ try {
   assert.equal(await doubtRows(), 10);
   await I.putInstitute(I.DEMO);
 
+  // --- the institute's daily budget: refused BEFORE the provider is called -------------------------
+  {
+    const hits = upstreamHits.length;
+    await I.putInstitute({ ...I.DEMO, dailyBudgetUsd: 0.000001 }); // already spent more than this today
+    const broke = await chat(HAIKU, doubt(1));
+    assert.equal(broke.status, 429);
+    assert.deepEqual(broke.json, { error: { message: "This site has reached today's limit. Try again tomorrow.", type: "institute_budget" } });
+    assert.equal(upstreamHits.length, hits, "the over-budget call never reached the provider");
+    assert.equal((await chat("anthropic/claude-opus-4.5", doubt(1))).json.error.type, "plan_restricted", "other models: today's rules, not the budget");
+    await I.putInstitute({ ...I.DEMO, dailyBudgetUsd: null });
+    assert.equal((await chat(HAIKU, doubt(1))).status, 200, "an explicit null budget is unlimited");
+    await I.putInstitute(I.DEMO);
+  }
+
   // --- the waived body is cut to what a doubt needs --------------------------------------------
   const before = upstreamHits.length;
   const extras = { max_tokens: 100_000, models: ["anthropic/claude-opus-4.5"], route: "fallback", plugins: [{ id: "web" }], transforms: ["middle-out"], n: 4, reasoning: { effort: "high" }, provider: "openai", temperature: 0.2 };

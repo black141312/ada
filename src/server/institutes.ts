@@ -8,12 +8,18 @@
  * institute — falls through to the student's own plan exactly as before.
  *
  * Same shape as plans.ts/classes.ts: the module owns its DDL, runs it once, speaks Postgres and SQLite.
+ *
+ * ponytail: the backend trusts x-ada-institute from anyone who can reach it; the Worker overwrites it,
+ * but a client calling Cloud Run directly can set it too. Every institute is therefore bounded by its
+ * daily budget, per-student cap and per-doubt ceilings. If abuse appears, the upgrade is a shared
+ * secret the Worker adds (e.g. x-ada-worker-key) and the backend requires before honouring the header.
  */
 import type { IncomingMessage } from "node:http";
 import type { Pool } from "pg";
 import type Database from "better-sqlite3";
 import { authDatabase, usingPostgres } from "./db.ts";
 import { planFor } from "./plans.ts";
+import { instituteCostSince } from "./usage.ts";
 
 const pg = () => authDatabase() as Pool;
 const lite = () => authDatabase() as Database.Database;
@@ -25,6 +31,9 @@ export interface Institute {
   /** The one model the institute pays for. Exact id, compared exactly. */
   model: string;
   dailyDoubtsPerStudent: number;
+  /** Most the institute pays per UTC day, USD, summed from its usage rows. Null = unlimited — only
+   *  ever by explicit choice: the column defaults to 5. */
+  dailyBudgetUsd: number | null;
   active: boolean;
 }
 
@@ -35,6 +44,7 @@ export const DEMO: Institute = {
   logoUrl: null,
   model: "anthropic/claude-haiku-4.5",
   dailyDoubtsPerStudent: 30,
+  dailyBudgetUsd: 5,
   active: true,
 };
 
@@ -61,7 +71,8 @@ function ensure(): Promise<void> {
         model text not null,
         daily_doubts_per_student integer not null,
         active boolean not null default true,
-        created_at bigint not null
+        created_at bigint not null,
+        daily_budget_usd double precision default 5
       )`,
       // ponytail: open join — anyone signed in who uses the subdomain becomes a member. Part 3 adds
       // invite / email-domain rules; this table is where they'll be checked.
@@ -84,12 +95,20 @@ function ensure(): Promise<void> {
     ];
     for (const stmt of ddl) {
       if (usingPostgres) await pg().query(stmt);
-      else lite().exec(stmt.replace(/bigint/g, "integer"));
+      else lite().exec(stmt.replace(/bigint/g, "integer").replace(/double precision/g, "real"));
+    }
+    // Added after the table first shipped (on this branch). DEFAULT 5 gives any row that predates it
+    // the safe budget rather than "unlimited".
+    if (usingPostgres) {
+      await pg().query("alter table institutes add column if not exists daily_budget_usd double precision default 5");
+    } else {
+      const cols = lite().prepare("pragma table_info(institutes)").all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === "daily_budget_usd")) lite().exec("alter table institutes add column daily_budget_usd real default 5");
     }
     await run(
-      `insert into institutes (slug, name, logo_url, model, daily_doubts_per_student, active, created_at)
-       values ($1, $2, $3, $4, $5, $6, $7) on conflict (slug) do nothing`,
-      [DEMO.slug, DEMO.name, DEMO.logoUrl, DEMO.model, DEMO.dailyDoubtsPerStudent, usingPostgres ? true : 1, Date.now()],
+      `insert into institutes (slug, name, logo_url, model, daily_doubts_per_student, active, created_at, daily_budget_usd)
+       values ($1, $2, $3, $4, $5, $6, $7, $8) on conflict (slug) do nothing`,
+      [DEMO.slug, DEMO.name, DEMO.logoUrl, DEMO.model, DEMO.dailyDoubtsPerStudent, usingPostgres ? true : 1, Date.now(), DEMO.dailyBudgetUsd],
     );
   })().catch((e) => {
     ready = null; // a concurrent first-run race is transient — let the next request retry
@@ -107,13 +126,22 @@ async function run(sql: string, params: unknown[]): Promise<number> {
   return lite().prepare(sql.replace(/\$\d+/g, "?")).run(...params).changes;
 }
 
-type Row = { slug: string; name: string; logo_url: string | null; model: string; daily_doubts_per_student: number | string; active: boolean | number };
+type Row = {
+  slug: string;
+  name: string;
+  logo_url: string | null;
+  model: string;
+  daily_doubts_per_student: number | string;
+  active: boolean | number;
+  daily_budget_usd: number | string | null;
+};
 const fromRow = (r: Row): Institute => ({
   slug: r.slug,
   name: r.name,
   logoUrl: r.logo_url,
   model: r.model,
   dailyDoubtsPerStudent: Number(r.daily_doubts_per_student),
+  dailyBudgetUsd: r.daily_budget_usd == null ? null : Number(r.daily_budget_usd),
   active: r.active === true || r.active === 1,
 });
 
@@ -121,7 +149,7 @@ const fromRow = (r: Row): Institute => ({
 export async function getInstitute(slug: string): Promise<Institute | null> {
   if (!isSlug(slug)) return null;
   await ensure();
-  const r = (await all<Row>("select slug, name, logo_url, model, daily_doubts_per_student, active from institutes where slug = $1", [slug]))[0];
+  const r = (await all<Row>("select slug, name, logo_url, model, daily_doubts_per_student, active, daily_budget_usd from institutes where slug = $1", [slug]))[0];
   return r ? fromRow(r) : null;
 }
 
@@ -129,11 +157,11 @@ export async function getInstitute(slug: string): Promise<Institute | null> {
 export async function putInstitute(i: Institute): Promise<void> {
   await ensure();
   await run(
-    `insert into institutes (slug, name, logo_url, model, daily_doubts_per_student, active, created_at)
-     values ($1, $2, $3, $4, $5, $6, $7)
+    `insert into institutes (slug, name, logo_url, model, daily_doubts_per_student, active, created_at, daily_budget_usd)
+     values ($1, $2, $3, $4, $5, $6, $7, $8)
      on conflict (slug) do update set name = excluded.name, logo_url = excluded.logo_url, model = excluded.model,
-       daily_doubts_per_student = excluded.daily_doubts_per_student, active = excluded.active`,
-    [i.slug, i.name, i.logoUrl, i.model, i.dailyDoubtsPerStudent, usingPostgres ? i.active : i.active ? 1 : 0, Date.now()],
+       daily_doubts_per_student = excluded.daily_doubts_per_student, active = excluded.active, daily_budget_usd = excluded.daily_budget_usd`,
+    [i.slug, i.name, i.logoUrl, i.model, i.dailyDoubtsPerStudent, usingPostgres ? i.active : i.active ? 1 : 0, Date.now(), i.dailyBudgetUsd],
   );
 }
 
@@ -273,7 +301,7 @@ export type InstituteDecision =
   | { kind: "none" }
   /** The institute pays: skip the student's price gate, count the call against the doubt. */
   | { kind: "waive"; slug: string; doubtId: string; newDoubt: boolean }
-  | { kind: "deny"; status: 400 | 403 | 413 | 429; message: string };
+  | { kind: "deny"; status: 400 | 403 | 413 | 429; message: string; type?: "doubt_limit" | "institute_budget" };
 
 export interface DecisionInput {
   /** Validated x-ada-institute, or null. */
@@ -288,9 +316,12 @@ export interface DecisionInput {
   bodyBytes: number;
   bodyProblem: string | null;
   stats: DoubtStats;
+  /** What the institute has paid for so far today (UTC), USD. */
+  spentTodayUsd: number;
 }
 
 export const DAILY_LIMIT_MESSAGE = "Daily doubt limit reached";
+export const BUDGET_MESSAGE = "This site has reached today's limit. Try again tomorrow.";
 export const DOUBT_LIMIT_MESSAGE = "This doubt has reached its limit — ask a new doubt to continue";
 
 /** The whole institute rule, kept pure so every branch is tested without a database.
@@ -303,9 +334,12 @@ export function decideInstitute(i: DecisionInput): InstituteDecision {
   if (i.banned) return { kind: "deny", status: 403, message: "This account is suspended." };
   if (i.bodyBytes > WAIVED_BODY_LIMIT) return { kind: "deny", status: 413, message: "doubt too large (2 MB max) — use a smaller photo" };
   if (i.bodyProblem) return { kind: "deny", status: 400, message: i.bodyProblem };
+  if (i.institute.dailyBudgetUsd != null && i.spentTodayUsd >= i.institute.dailyBudgetUsd) {
+    return { kind: "deny", status: 429, message: BUDGET_MESSAGE, type: "institute_budget" };
+  }
   const isNew = i.stats.doubtCalls === null;
-  if (isNew && i.stats.doubtsToday >= i.institute.dailyDoubtsPerStudent) return { kind: "deny", status: 429, message: DAILY_LIMIT_MESSAGE };
-  if (!isNew && i.stats.doubtCalls! >= CALLS_PER_DOUBT) return { kind: "deny", status: 429, message: DOUBT_LIMIT_MESSAGE };
+  if (isNew && i.stats.doubtsToday >= i.institute.dailyDoubtsPerStudent) return { kind: "deny", status: 429, message: DAILY_LIMIT_MESSAGE, type: "doubt_limit" };
+  if (!isNew && i.stats.doubtCalls! >= CALLS_PER_DOUBT) return { kind: "deny", status: 429, message: DOUBT_LIMIT_MESSAGE, type: "doubt_limit" };
   return { kind: "waive", slug: i.slug, doubtId: i.doubtId, newDoubt: isNew };
 }
 
@@ -315,6 +349,8 @@ export interface InstituteStore {
   getInstitute(slug: string): Promise<Institute | null>;
   ensureMember(slug: string, user: string): Promise<void>;
   isBanned(user: string): Promise<boolean>;
+  /** USD the institute has paid for since a timestamp (its usage rows). */
+  spentSince(slug: string, sinceMs: number): Promise<number>;
   /** Atomic read-decide-record (see claimDoubtCall). */
   claimDoubtCall(slug: string, user: string, day: string, doubtId: string, decide: (s: DoubtStats) => InstituteDecision): Promise<InstituteDecision>;
 }
@@ -345,10 +381,13 @@ export async function instituteGate(
   const doubtId = isDoubtId(rawDoubt) ? rawDoubt : null;
   // Only look further when the answer could be a waiver — everything else is the student's plan.
   if (model !== institute.model || !doubtId) return { kind: "none" };
-  const banned = await store.isBanned(user);
+  const day = dayOf(now);
+  // ponytail: usage rows land when a response ENDS, so calls still in flight aren't counted yet — the
+  // budget can overshoot by the calls running at the moment it's crossed. Bounded, not worth a ledger.
+  const [banned, spentTodayUsd] = await Promise.all([store.isBanned(user), store.spentSince(slug, Date.parse(`${day}T00:00:00Z`))]);
   const bodyProblem = waivedBodyProblem(body.parsed);
-  return store.claimDoubtCall(slug, user, dayOf(now), doubtId, (stats) =>
-    decideInstitute({ slug, institute, model, doubtId, banned, bodyBytes: body.bytes, bodyProblem, stats }),
+  return store.claimDoubtCall(slug, user, day, doubtId, (stats) =>
+    decideInstitute({ slug, institute, model, doubtId, banned, bodyBytes: body.bytes, bodyProblem, stats, spentTodayUsd }),
   );
 }
 
@@ -358,6 +397,7 @@ export const dbStore: InstituteStore = {
   ensureMember,
   claimDoubtCall,
   isBanned: async (user) => (await planFor(user)).status === "banned",
+  spentSince: instituteCostSince,
 };
 
 /** Public branding for the student site: never the model or the cap. */

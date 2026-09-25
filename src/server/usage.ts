@@ -45,6 +45,9 @@ export interface UsageEvent {
 const pg = () => authDatabase() as Pool;
 const lite = () => authDatabase() as Database.Database;
 
+// The institute budget check reads "what has this institute spent today" on every waived call.
+const INSTITUTE_IDX = "create index if not exists usage_events_institute_ts on usage_events (institute, ts)";
+
 let ready: Promise<void> | null = null;
 function ensure(): Promise<void> {
   ready ??= (async () => {
@@ -99,12 +102,14 @@ function ensure(): Promise<void> {
       await pg().query(ddl);
       await pg().query(idx);
       for (const [col, type] of added) await pg().query(`alter table usage_events add column if not exists ${col} ${type}`);
+      await pg().query(INSTITUTE_IDX);
     } else {
       lite().exec(ddl);
       lite().exec(idx);
       // sqlite has no ADD COLUMN IF NOT EXISTS — ask the table what it already has.
       const have = new Set((lite().prepare("pragma table_info(usage_events)").all() as Array<{ name: string }>).map((r) => r.name));
       for (const [col, type] of added) if (!have.has(col)) lite().exec(`alter table usage_events add column ${col} ${type}`);
+      lite().exec(INSTITUTE_IDX);
     }
   })();
   return ready;
@@ -183,6 +188,23 @@ export async function costSince(user: string, sinceMs: number): Promise<Spend> {
   }
   total.usd = usd;
   return total;
+}
+
+/** What an institute (Ada Tutor) has paid for since a timestamp, in USD — priced exactly like a
+ *  user's spend: stored tokens × today's price for the row's model. */
+export async function instituteCostSince(slug: string, sinceMs: number): Promise<number> {
+  await ensure();
+  const sql =
+    "select model, coalesce(sum(prompt_tokens),0) as p, coalesce(sum(completion_tokens),0) as c from usage_events where institute = $1 and ts >= $2 group by model";
+  const rows = usingPostgres
+    ? ((await pg().query(sql, [slug, sinceMs])).rows as Array<{ model: string; p: string; c: string }>)
+    : (lite().prepare(sql.replace(/\$\d/g, "?")).all(slug, sinceMs) as Array<{ model: string; p: number; c: number }>);
+  let usd = 0;
+  for (const r of rows) {
+    const [inPrice, outPrice] = priceUsd(r.model);
+    usd += (Number(r.p) * inPrice + Number(r.c) * outPrice) / 1_000_000;
+  }
+  return usd;
 }
 
 /** Per-model breakdown for an account over a window — for a usage page, and for costing a period

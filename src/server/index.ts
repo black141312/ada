@@ -315,7 +315,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
     const inst = await instituteGate(dbStore, req, who.user, model, { bytes: Buffer.byteLength(raw), parsed: body });
     if (inst.kind === "deny") {
       appendAudit({ ts: Date.now(), user: who.user, event: "institute_denied", detail: `${String(req.headers["x-ada-institute"] ?? "")}: ${inst.message}` });
-      return json(res, inst.status, { error: { message: inst.message, type: inst.status === 429 ? "doubt_limit" : "plan_restricted" } });
+      return json(res, inst.status, { error: { message: inst.message, type: inst.type ?? "plan_restricted" } });
     }
     if (inst.kind === "waive") {
       institute = inst.slug;
