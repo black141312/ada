@@ -208,6 +208,39 @@ export async function claimDoubtCall(
   }
 }
 
+// ---------- the waived request body ----------
+
+/** A waived call is the institute's money, so its body is cut down to what a doubt needs. The chat
+ *  adapters forward the client's body as-is, and on OpenRouter that body can pick other models
+ *  (`models`, `route`), add paid features (`plugins` — web search, PDF OCR; `transforms`;
+ *  `web_search_options`), multiply the output (`n`), or buy extra thinking (`reasoning`,
+ *  `reasoning_effort`, `verbosity`). An allowlist, not a denylist, so a field OpenRouter adds next
+ *  month is dropped by default. */
+export const WAIVED_BODY_LIMIT = 2 * 1024 * 1024;
+export const WAIVED_MAX_TOKENS = 8192;
+const WAIVED_KEEP = ["model", "messages", "stream", "stream_options", "temperature", "top_p", "stop", "response_format", "seed", "presence_penalty", "frequency_penalty"];
+
+/** Why this body can't be waived, or null. Text and images only: a `file` part is how a PDF gets in,
+ *  and PDFs are where OpenRouter's paid parsing engines come in. */
+export function waivedBodyProblem(body: Record<string, unknown>): string | null {
+  if (!Array.isArray(body.messages)) return "'messages' must be an array";
+  for (const m of body.messages as Array<{ content?: unknown }>) {
+    if (!Array.isArray(m?.content)) continue;
+    for (const p of m.content as Array<{ type?: unknown }>) {
+      if (p?.type !== "text" && p?.type !== "image_url") return "institute doubts accept text and images only";
+    }
+  }
+  return null;
+}
+
+export function sanitizeWaivedBody(body: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k of WAIVED_KEEP) if (k in body) out[k] = body[k];
+  const asked = [body.max_tokens, body.max_completion_tokens].filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v >= 1);
+  out.max_tokens = Math.min(WAIVED_MAX_TOKENS, ...asked.map(Math.floor));
+  return out;
+}
+
 // ---------- the decision (pure) ----------
 
 export type InstituteDecision =
@@ -215,7 +248,7 @@ export type InstituteDecision =
   | { kind: "none" }
   /** The institute pays: skip the student's price gate, count the call against the doubt. */
   | { kind: "waive"; slug: string; doubtId: string; newDoubt: boolean }
-  | { kind: "deny"; status: 403 | 429; message: string };
+  | { kind: "deny"; status: 400 | 403 | 413 | 429; message: string };
 
 export interface DecisionInput {
   /** Validated x-ada-institute, or null. */
@@ -226,6 +259,9 @@ export interface DecisionInput {
   /** Validated x-ada-doubt, or null. */
   doubtId: string | null;
   banned: boolean;
+  /** Raw request body size, and waivedBodyProblem() of it. */
+  bodyBytes: number;
+  bodyProblem: string | null;
   stats: DoubtStats;
 }
 
@@ -240,6 +276,8 @@ export function decideInstitute(i: DecisionInput): InstituteDecision {
   if (i.model !== i.institute.model) return { kind: "none" };
   if (!i.doubtId) return { kind: "none" };
   if (i.banned) return { kind: "deny", status: 403, message: "This account is suspended." };
+  if (i.bodyBytes > WAIVED_BODY_LIMIT) return { kind: "deny", status: 413, message: "doubt too large (2 MB max) — use a smaller photo" };
+  if (i.bodyProblem) return { kind: "deny", status: 400, message: i.bodyProblem };
   const isNew = i.stats.doubtCalls === null;
   if (isNew && i.stats.doubtsToday >= i.institute.dailyDoubtsPerStudent) return { kind: "deny", status: 429, message: DAILY_LIMIT_MESSAGE };
   if (!isNew && i.stats.doubtCalls! >= CALLS_PER_DOUBT) return { kind: "deny", status: 429, message: DOUBT_LIMIT_MESSAGE };
@@ -263,12 +301,13 @@ const header = (req: IncomingMessage, name: string): string | null => {
 };
 
 /** Read the two headers, look everything up, and decide — counting the call atomically when the
- *  institute pays. */
+ *  institute pays. `body` is the request (raw size + parsed) for the waived-body checks. */
 export async function instituteGate(
   store: InstituteStore,
   req: IncomingMessage,
   user: string,
   model: string,
+  body: { bytes: number; parsed: Record<string, unknown> },
   now = Date.now(),
 ): Promise<InstituteDecision> {
   const rawSlug = header(req, "x-ada-institute");
@@ -282,8 +321,9 @@ export async function instituteGate(
   // Only look further when the answer could be a waiver — everything else is the student's plan.
   if (model !== institute.model || !doubtId) return { kind: "none" };
   const banned = await store.isBanned(user);
+  const bodyProblem = waivedBodyProblem(body.parsed);
   return store.claimDoubtCall(slug, user, dayOf(now), doubtId, (stats) =>
-    decideInstitute({ slug, institute, model, doubtId, banned, stats }),
+    decideInstitute({ slug, institute, model, doubtId, banned, bodyBytes: body.bytes, bodyProblem, stats }),
   );
 }
 

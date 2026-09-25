@@ -13,7 +13,7 @@ import { adminUsers, verifyIdentity } from "./identity.ts";
 import { addAllowed, listAllowed, removeAllowed } from "./allowlist.ts";
 import { costSince, recordUsage } from "./usage.ts";
 import { handleClasses, readBodyLimited } from "./classes.ts";
-import { dbStore, instituteGate, isSlug, publicInstitute } from "./institutes.ts";
+import { dbStore, instituteGate, isSlug, publicInstitute, sanitizeWaivedBody } from "./institutes.ts";
 import { handleSpeech } from "./speech-kokoro.ts";
 import { prefetch as prefetchModelCatalog } from "../client/models-dev.ts";
 import { billingWebhookImplemented, checkEntitlement, effectivePlan, isFreeModel, PLANS, planFor, periodStart, setPlan, WINDOW_MS, windowStart, type PlanName } from "./plans.ts";
@@ -205,6 +205,12 @@ async function identify(req: IncomingMessage): Promise<Identity | "corrupt" | nu
   return locked() ? null : { user: "dev", role: "dev" }; // dev mode: open
 }
 
+/** The last `"model":"…"` in a response tail — what the provider reports it actually ran. */
+export function lastModel(tail: string): string | null {
+  const all = [...tail.matchAll(/"model"\s*:\s*"([^"\\]{1,200})"/g)];
+  return all.length ? all[all.length - 1]![1]! : null;
+}
+
 function json(res: ServerResponse, status: number, obj: unknown): void {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(obj));
@@ -280,7 +286,9 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
   // When an allowlist is active, IGNORE the client's `provider` hint — else a seat holder could
   // send an allowlisted model id with a different provider and leak the body to it before the
   // upstream rejects the id. Route by the model id only.
-  const explicit = policy.models?.length ? undefined : typeof body.provider === "string" ? body.provider : undefined;
+  // An institute request (Ada Tutor) never steers routing either: the institute's model goes where
+  // the server sends it, not wherever a client-supplied hint points.
+  const explicit = policy.models?.length || req.headers["x-ada-institute"] ? undefined : typeof body.provider === "string" ? body.provider : undefined;
   const provider = route(model, explicit);
 
   // A request served by a subscription on THIS machine is paid for by that plan, direct to the
@@ -304,12 +312,16 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
   // and is capped per student per day instead. Every other request takes today's path unchanged.
   let institute: string | undefined;
   if (!isAnonymous(who) && !enterpriseMode() && !paidBySubscription && !willForward) {
-    const inst = await instituteGate(dbStore, req, who.user, model);
+    const inst = await instituteGate(dbStore, req, who.user, model, { bytes: Buffer.byteLength(raw), parsed: body });
     if (inst.kind === "deny") {
       appendAudit({ ts: Date.now(), user: who.user, event: "institute_denied", detail: `${String(req.headers["x-ada-institute"] ?? "")}: ${inst.message}` });
       return json(res, inst.status, { error: { message: inst.message, type: inst.status === 429 ? "doubt_limit" : "plan_restricted" } });
     }
-    if (inst.kind === "waive") institute = inst.slug;
+    if (inst.kind === "waive") {
+      institute = inst.slug;
+      // The institute's money: only the fields a doubt needs reach the provider, output clamped.
+      body = sanitizeWaivedBody(body);
+    }
   }
   if (!institute && !isAnonymous(who) && !enterpriseMode() && !paidBySubscription && !willForward) {
     const ent = await checkEntitlement(who.user, model);
@@ -383,7 +395,9 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
         const row = {
           ts: Date.now(),
           user: who.user,
-          model,
+          // A waived row records what the provider says it ran, so the institute's bill can't be
+          // quietly moved onto another model.
+          model: (institute && lastModel(tail)) || model,
           provider,
           promptTokens: u.promptTokens,
           completionTokens: u.completionTokens,

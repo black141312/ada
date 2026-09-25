@@ -25,13 +25,16 @@ process.chdir(dir);
 
 // The fake OpenRouter: answers every chat with a tiny completion that reports usage.
 const upstreamHits = [];
+const upstreamBodies = [];
+const SERVED = "anthropic/claude-4.5-haiku-20251001"; // what OpenRouter says it actually ran
 const fake = createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
   req.on("end", () => {
     upstreamHits.push(JSON.parse(body).model);
+    upstreamBodies.push(JSON.parse(body));
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ id: "x", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 1000, completion_tokens: 500, total_tokens: 1500 } }));
+    res.end(JSON.stringify({ id: "x", object: "chat.completion", model: SERVED, choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 1000, completion_tokens: 500, total_tokens: 1500 } }));
   });
 });
 await new Promise((r) => fake.listen(0, "127.0.0.1", r));
@@ -59,7 +62,7 @@ const call = async (method, path, { key = "student-key", headers = {}, body } = 
   return { status: res.status, json, buf, headers: res.headers };
 };
 const HAIKU = "anthropic/claude-haiku-4.5";
-const chat = (model, headers = {}) => call("POST", "/v1/chat/completions", { headers, body: { model, messages: [{ role: "user", content: "2+2?" }] } });
+const chat = (model, headers = {}, extra = {}) => call("POST", "/v1/chat/completions", { headers, body: { model, messages: [{ role: "user", content: "2+2?" }], ...extra } });
 const doubt = (n) => ({ "x-ada-institute": "demo", "x-ada-doubt": `cls_${String(n).padStart(8, "0")}` });
 const settle = () => new Promise((r) => setTimeout(r, 150)); // usage rows are written fire-and-forget
 
@@ -94,7 +97,7 @@ try {
   await settle();
   const db = new (createRequire(import.meta.url)(join(base, "node_modules/better-sqlite3")))(join(dir, "auth.db"), { readonly: true });
   const rows = db.prepare("select user_id, model, institute from usage_events").all();
-  assert.deepEqual(rows, [{ user_id: "team", model: HAIKU, institute: "demo" }], "the usage row names who pays");
+  assert.deepEqual(rows, [{ user_id: "team", model: SERVED, institute: "demo" }], "the usage row names who pays, and what the provider really ran");
   const plan = (await call("GET", "/v1/plan")).json;
   assert.equal(plan.usedUsd, 0, "the institute's calls don't eat the student's own plan");
 
@@ -116,6 +119,24 @@ try {
   assert.equal(burst.filter((r) => r.status === 429).length, 5);
   assert.equal(db.prepare("select count(*) as n from institute_doubts where user_id = 'team'").get().n, 10);
   await I.putInstitute(I.DEMO);
+
+  // --- the waived body is cut to what a doubt needs --------------------------------------------
+  const before = upstreamHits.length;
+  const extras = { max_tokens: 100_000, models: ["anthropic/claude-opus-4.5"], route: "fallback", plugins: [{ id: "web" }], transforms: ["middle-out"], n: 4, reasoning: { effort: "high" }, provider: "openai", temperature: 0.2 };
+  const cut = await chat(HAIKU, doubt(1), extras);
+  assert.equal(cut.status, 200, "a routing hint on an institute call is ignored, not followed to an unconfigured provider");
+  const sent = upstreamBodies.at(-1);
+  for (const k of ["models", "route", "plugins", "transforms", "n", "reasoning", "provider"]) assert.ok(!(k in sent), `${k} is not forwarded`);
+  assert.equal(sent.max_tokens, 8192, "max_tokens clamped");
+  assert.equal(sent.temperature, 0.2, "ordinary sampling settings pass");
+  assert.equal(sent.model, HAIKU);
+  const pdf = await call("POST", "/v1/chat/completions", { headers: doubt(1), body: { model: HAIKU, messages: [{ role: "user", content: [{ type: "file", file: { filename: "a.pdf", file_data: "data:application/pdf;base64,AA" } }] }] } });
+  assert.equal(pdf.status, 400, "no PDFs on the institute's bill");
+  const huge = await call("POST", "/v1/chat/completions", { headers: doubt(1), body: { model: HAIKU, messages: [{ role: "user", content: "x".repeat(2.5 * 1024 * 1024) }] } });
+  assert.equal(huge.status, 413, "waived bodies are capped at 2 MB");
+  assert.equal(upstreamHits.length, before + 1, "neither refused call reached the provider");
+  // Not waived (own plan) → today's rules, extras untouched by the institute code.
+  assert.equal((await chat("anthropic/claude-opus-4.5", doubt(1), extras)).status, 403);
 
   // --- speech -------------------------------------------------------------------------------------
   const spoken = [];
