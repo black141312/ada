@@ -116,17 +116,70 @@ export class LruBytes {
 
 // ---------- the worker client (the app's createSynth, over child_process) ----------
 
-type Req = { id: number; voice: string; text: string; resolve: (b: Uint8Array) => void; reject: (e: Error) => void; timer?: NodeJS.Timeout; child?: ChildProcess };
+/** A synth failure with the HTTP status it should become (429 = this user's fault, 503 = ours). */
+export class SpeechError extends Error {
+  constructor(
+    readonly status: 429 | 503,
+    message: string,
+  ) {
+    super(message);
+  }
+}
 
-/** One request at the worker at a time; the rest wait here. A worker that exits takes its in-flight
- *  request with it and the next call forks a fresh one; one that doesn't answer in `timeoutMs` is
- *  SIGKILLed, since a hung onnxruntime would otherwise hold every later line hostage. Past `maxWaiting` queued lines the call fails
- *  fast ("voice busy") — the client falls back to the browser voice rather than wait minutes. */
-export function createSynth({ spawn, timeoutMs = 120_000, maxWaiting = 32 }: { spawn: () => ChildProcess; timeoutMs?: number; maxWaiting?: number }) {
+export interface SynthOptions {
+  /** Who asked — for the per-user queue share. */
+  owner?: string;
+  /** Aborted when the HTTP request goes away: a queued line nobody will hear is dropped. */
+  signal?: AbortSignal;
+}
+export type Synth = (voice: string, text: string, opts?: SynthOptions) => Promise<Uint8Array>;
+
+type Req = {
+  id: number;
+  voice: string;
+  text: string;
+  owner?: string;
+  resolve: (b: Uint8Array) => void;
+  reject: (e: Error) => void;
+  timer?: NodeJS.Timeout;
+  waitTimer?: NodeJS.Timeout;
+  onAbort?: () => void;
+  signal?: AbortSignal;
+  child?: ChildProcess;
+};
+
+/** One request at the worker at a time; the rest wait here, fairly:
+ *  - at most `perOwner` lines queued per user (a 429 past that), `maxWaiting` in all (503);
+ *  - a line waits at most `waitMs` for its turn (503 — the client uses the browser voice);
+ *  - a line whose HTTP request closed is dropped from the queue.
+ *  A worker that exits takes its in-flight request with it; one that doesn't answer within
+ *  `timeoutMs` is SIGKILLed — a hung onnxruntime would otherwise hold every later line hostage —
+ *  and the next line forks a fresh one. */
+export function createSynth({
+  spawn,
+  timeoutMs = 60_000, // a baked model loads in ~3 s and a 1500-char line takes well under this
+  maxWaiting = 32,
+  perOwner = 2,
+  waitMs = 60_000,
+}: {
+  spawn: () => ChildProcess;
+  timeoutMs?: number;
+  maxWaiting?: number;
+  perOwner?: number;
+  waitMs?: number;
+}): Synth {
   let child: ChildProcess | null = null;
   let seq = 0;
   let current: Req | null = null;
   const waiting: Req[] = [];
+  const unqueue = (req: Req): boolean => {
+    const i = waiting.indexOf(req);
+    if (i < 0) return false;
+    waiting.splice(i, 1);
+    clearTimeout(req.waitTimer);
+    if (req.onAbort) req.signal?.removeEventListener("abort", req.onAbort);
+    return true;
+  };
   const finish = (): Req => {
     const req = current!;
     clearTimeout(req.timer);
@@ -152,7 +205,9 @@ export function createSynth({ spawn, timeoutMs = 120_000, maxWaiting = 32 }: { s
   };
   const pump = (): void => {
     if (current || !waiting.length) return;
-    const req = (current = waiting.shift()!);
+    const req = waiting[0]!;
+    unqueue(req);
+    current = req;
     try {
       child ??= start();
     } catch (err) {
@@ -168,15 +223,30 @@ export function createSynth({ spawn, timeoutMs = 120_000, maxWaiting = 32 }: { s
       try {
         c.kill("SIGKILL");
       } catch {}
-      finish().reject(new Error("voice timed out"));
+      finish().reject(new SpeechError(503, "voice timed out"));
       pump();
     }, timeoutMs);
     c.send({ id: req.id, voice: req.voice, text: req.text });
   };
-  return (voice: string, text: string): Promise<Uint8Array> =>
+  return (voice, text, opts = {}) =>
     new Promise((resolve, reject) => {
-      if (waiting.length >= maxWaiting) return reject(new Error("voice busy"));
-      waiting.push({ id: ++seq, voice, text, resolve, reject });
+      const { owner, signal } = opts;
+      if (signal?.aborted) return reject(new SpeechError(503, "cancelled"));
+      if (owner !== undefined && waiting.filter((r) => r.owner === owner).length >= perOwner) {
+        return reject(new SpeechError(429, "too many lines queued — wait for the current ones"));
+      }
+      if (waiting.length >= maxWaiting) return reject(new SpeechError(503, "voice busy"));
+      const req: Req = { id: ++seq, voice, text, owner, resolve, reject, signal };
+      req.waitTimer = setTimeout(() => {
+        if (unqueue(req)) reject(new SpeechError(503, "voice busy"));
+      }, waitMs);
+      if (signal) {
+        req.onAbort = () => {
+          if (unqueue(req)) reject(new SpeechError(503, "cancelled"));
+        };
+        signal.addEventListener("abort", req.onAbort, { once: true });
+      }
+      waiting.push(req);
       pump();
     });
 }
@@ -248,15 +318,17 @@ export function prune(dir: string, maxBytes: number): number {
 // ---------- HTTP ----------
 
 /** Swappable for tests — the real one forks Kokoro on first use. */
-export const speechEngine: { synth: (voice: string, text: string) => Promise<Uint8Array> } = {
-  synth: (voice, text) => {
+export const speechEngine: { synth: Synth } = {
+  synth: (voice, text, opts) => {
     const s = createSynth({ spawn: spawnWorker });
     speechEngine.synth = s;
-    return s(voice, text);
+    return s(voice, text, opts);
   },
 };
 
-export const speechLimiter = new RateLimiter(Number(process.env.ADA_SPEECH_PER_MINUTE) || 60);
+/** 20 lines a minute: a doubt's mini-class is ~15–40 lines, heard over several minutes, and cached
+ *  lines don't reach here twice. ADA_SPEECH_PER_MINUTE overrides. */
+export const speechLimiter = new RateLimiter(Number(process.env.ADA_SPEECH_PER_MINUTE) || 20);
 
 function fail(res: ServerResponse, status: number, message: string, headers: Record<string, string> = {}): void {
   res.writeHead(status, { "content-type": "application/json", ...headers });
@@ -289,11 +361,17 @@ export async function handleSpeech(req: IncomingMessage, res: ServerResponse, wh
   }
   if (!wav) {
     cache = "miss";
+    // The student skipped ahead or closed the page: drop the line if it's still only queued.
+    const gone = new AbortController();
+    res.on("close", () => {
+      if (!res.writableFinished) gone.abort();
+    });
     try {
-      wav = await speechEngine.synth(v.voice, v.text);
+      wav = await speechEngine.synth(v.voice, v.text, { owner: who.user, signal: gone.signal });
     } catch (e) {
       // 503, not 500: the client's answer to this is "use the browser voice", not "report a bug".
-      return fail(res, 503, `voice unavailable: ${e instanceof Error ? e.message : String(e)}`);
+      const status = e instanceof SpeechError ? e.status : 503;
+      return fail(res, status, `voice unavailable: ${e instanceof Error ? e.message : String(e)}`);
     }
     memory.set(key, wav);
     diskPut(key, wav);

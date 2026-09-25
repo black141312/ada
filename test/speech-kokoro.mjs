@@ -190,6 +190,37 @@ function fakeChild(behave) {
   assert.deepEqual([...(await second)], [7], "the queued line runs on a fresh worker");
   assert.equal(kids.length, 2);
 }
+{
+  // fairness: two queued lines per user; others still get in
+  const synth = S.createSynth({ spawn: () => fakeChild(() => {}), timeoutMs: 1000, waitMs: 1000 });
+  const held = [synth("v", "at worker", { owner: "a" }), synth("v", "a1", { owner: "a" }), synth("v", "a2", { owner: "a" })];
+  const third = await synth("v", "a3", { owner: "a" }).catch((e) => e);
+  assert.equal(third.status, 429, "a third queued line from one user is refused");
+  const b = synth("v", "b1", { owner: "b" });
+  b.catch(() => {});
+  // cancel: a closed request's queued line leaves the queue
+  const ac = new AbortController();
+  const gone = synth("v", "b2", { owner: "b", signal: ac.signal });
+  ac.abort();
+  assert.match((await gone.catch((e) => e)).message, /cancelled/);
+  const again = synth("v", "b3", { owner: "b" }); // b's slot freed by the cancel
+  again.catch(() => {});
+  assert.notEqual((await Promise.race([again.catch((e) => e), new Promise((r) => setTimeout(() => r("pending"), 30))])).status, 429);
+  await Promise.allSettled([...held, b, again]);
+}
+{
+  // a line waits at most waitMs for its turn
+  const synth = S.createSynth({ spawn: () => fakeChild(() => {}), timeoutMs: 1000, waitMs: 25 });
+  const busy = synth("v", "at worker");
+  busy.catch(() => {});
+  const t0 = Date.now();
+  const late = await synth("v", "waiting").catch((e) => e);
+  assert.equal(late.status, 503);
+  assert.match(late.message, /busy/);
+  assert.ok(Date.now() - t0 < 500, "refused at the wait bound, not after the worker timeout");
+  await busy.catch(() => {});
+}
+
 // --- disk prune -----------------------------------------------------------------
 {
   const dir = mkdtempSync(join(tmpdir(), "ada-tts-prune-"));
