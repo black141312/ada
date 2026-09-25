@@ -169,10 +169,32 @@ export async function doubtStats(slug: string, user: string, day: string, doubtI
   return toStats(await all(STATS_SQL, [slug, user, day]), doubtId);
 }
 
+/** Run `fn` after every earlier call with the same key has settled — one at a time per key, keys
+ *  independent. The entry is deleted once the key's chain goes idle, so the map only holds keys with
+ *  work in flight. */
+const chains = new Map<string, Promise<void>>();
+export function serialize<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const run = (chains.get(key) ?? Promise.resolve()).then(fn);
+  const tail = run.then(
+    () => {},
+    () => {},
+  );
+  chains.set(key, tail);
+  void tail.then(() => {
+    if (chains.get(key) === tail) chains.delete(key);
+  });
+  return run;
+}
+/** Keys with work queued or running (for tests). */
+export const serializedKeys = (): number => chains.size;
+
 /** Read the student's counts, decide, and — only on a waiver — count the call, as ONE atomic step.
  *  A read-then-write gate let N parallel requests with fresh doubt ids all see "under the cap".
  *  Postgres: a transaction holding an advisory lock on (institute, student, day), so every instance
- *  queues on the same key. SQLite: one synchronous IMMEDIATE transaction (writes are serialized). */
+ *  queues on the same key. Within one instance the same key is also queued IN MEMORY before a pool
+ *  connection is taken — otherwise one student firing 30 parallel requests parks 30 connections on
+ *  the lock and starves every other query on the instance (the pool has 10).
+ *  SQLite: one synchronous IMMEDIATE transaction (writes are serialized). */
 export async function claimDoubtCall(
   slug: string,
   user: string,
@@ -192,20 +214,24 @@ export async function claimDoubtCall(
       })
       .immediate();
   }
-  const client = await pg().connect();
-  try {
-    await client.query("begin");
-    await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [`institute-doubts|${slug}|${user}|${day}`]);
-    const d = decide(toStats((await client.query(STATS_SQL, params)).rows, doubtId));
-    if (d.kind === "waive") await client.query(RECORD_SQL, [slug, user, day, doubtId, Date.now()]);
-    await client.query("commit");
-    return d;
-  } catch (e) {
-    await client.query("rollback").catch(() => {});
-    throw e;
-  } finally {
-    client.release();
-  }
+  const key = `institute-doubts|${slug}|${user}|${day}`;
+  return serialize(key, async () => {
+    const client = await pg().connect();
+    try {
+      await client.query("begin");
+      await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [key]);
+      const d = decide(toStats((await client.query(STATS_SQL, params)).rows, doubtId));
+      if (d.kind === "waive") await client.query(RECORD_SQL, [slug, user, day, doubtId, Date.now()]);
+      await client.query("commit");
+      client.release();
+      return d;
+    } catch (e) {
+      await client.query("rollback").catch(() => {});
+      // Passing the error destroys the connection instead of returning a possibly-broken one.
+      client.release(e instanceof Error ? e : new Error(String(e)));
+      throw e;
+    }
+  });
 }
 
 // ---------- the waived request body ----------

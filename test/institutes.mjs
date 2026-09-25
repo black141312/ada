@@ -58,6 +58,36 @@ assert.equal((await I.doubtStats("demo", "stu", "2026-09-27", "cls_aaaaaaaa")).d
 assert.equal((await I.doubtStats("demo", "other", day, "cls_aaaaaaaa")).doubtsToday, 0, "counts are per student");
 assert.equal((await I.doubtStats("acme", "stu", day, "cls_aaaaaaaa")).doubtsToday, 0, "counts are per institute");
 
+// --- the in-memory per-key queue (keeps Postgres connections off the advisory lock) ---
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let running = 0;
+  let peak = 0;
+  const order = [];
+  const job = (key, n) =>
+    I.serialize(key, async () => {
+      running++;
+      peak = Math.max(peak, running);
+      await sleep(5);
+      order.push(`${key}${n}`);
+      running--;
+      if (n === 2) throw new Error("boom");
+      return n;
+    });
+  const same = await Promise.allSettled([1, 2, 3, 4].map((n) => job("a", n)));
+  assert.equal(peak, 1, "same key: one at a time");
+  assert.deepEqual(order, ["a1", "a2", "a3", "a4"], "same key: in arrival order");
+  assert.equal(same[1].status, "rejected", "a failure reaches its own caller");
+  assert.equal(same[2].value, 3, "and doesn't break the chain");
+  running = peak = 0;
+  const t0 = Date.now();
+  await Promise.all(["x", "y", "z", "w"].map((k) => job(k, 1)));
+  assert.equal(peak, 4, "different keys run concurrently");
+  assert.ok(Date.now() - t0 < 50);
+  await sleep(0);
+  assert.equal(I.serializedKeys(), 0, "idle keys are cleaned up");
+}
+
 // --- validators ---------------------------------------------------------------
 assert.ok(isSlug("demo") && isSlug("a") && isSlug("iit-prep-2") && !isSlug("-x") && !isSlug("x-") && !isSlug("Demo") && !isSlug("a".repeat(41)));
 assert.ok(isDoubtId("cls_ab12cd34") && !isDoubtId("cls_AB12CD34") && !isDoubtId("cls_1") && !isDoubtId("x"));

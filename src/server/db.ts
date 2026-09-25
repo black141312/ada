@@ -33,7 +33,8 @@ let db: Pool | Database.Database | null = null;
 export function authDatabase(): Pool | Database.Database {
   if (db) return db;
   db = usingPostgres
-    ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+    ? // A request that can't get a connection in 5 s fails rather than hanging on a starved pool.
+      new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, connectionTimeoutMillis: 5000 })
     : new (createRequire(import.meta.url)("better-sqlite3") as typeof Database)(
         process.env.ADA_AUTH_DB ?? "ada-auth.db",
         // The binary matching the runtime we're on: the app runs this under Electron's Node, whose
