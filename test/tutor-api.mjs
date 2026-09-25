@@ -163,6 +163,12 @@ try {
   const limited = await call("POST", "/v1/tutor/speech", { body: { text: "fifth" } });
   assert.equal(limited.status, 429, "past the per-user rate (6/min in this test)");
   assert.ok(Number(limited.headers.get("retry-after")) >= 1);
+
+  // banned: no voice either
+  const { setPlan } = await mod("src/server/plans.ts");
+  await setPlan("team", "free", "banned");
+  S.speechLimiter.perMinute = 1000;
+  assert.equal((await call("POST", "/v1/tutor/speech", { body: { text: "hello" } })).status, 403, "a banned account gets no speech");
   console.log("ok");
 } finally {
   server.close();

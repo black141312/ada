@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Identity } from "./enterprise.ts";
 import { readBodyLimited } from "./classes.ts";
+import { planFor } from "./plans.ts";
 
 /** Lessons carry OpenAI-style voice names; Kokoro's live only here. Identical to the app's map. */
 export const VOICE_MAP: Record<string, string> = {
@@ -337,6 +338,7 @@ function fail(res: ServerResponse, status: number, message: string, headers: Rec
 
 export async function handleSpeech(req: IncomingMessage, res: ServerResponse, who: Identity): Promise<void> {
   if (who.user === "anon") return fail(res, 401, "sign in to use voice");
+  if ((await planFor(who.user)).status === "banned") return fail(res, 403, "This account is suspended.");
   if (!speechLimiter.take(who.user)) {
     return fail(res, 429, "too many voice requests — slow down", { "retry-after": String(speechLimiter.retryAfter(who.user)) });
   }
