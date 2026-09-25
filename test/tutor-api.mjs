@@ -198,5 +198,5 @@ try {
 } finally {
   server.close();
   fake.close();
-  if (PG) setTimeout(() => process.exit(process.exitCode ?? 0), 50); // the pg pool keeps the loop alive
+  if (PG) await (await mod("src/server/db.ts")).authDatabase().end(); // else the pool keeps the process alive
 }

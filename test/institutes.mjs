@@ -234,4 +234,4 @@ const B = { bytes: 1000, parsed: { messages: [{ role: "user", content: "2+2?" }]
 }
 
 console.log(`ok (${process.env.DATABASE_URL ? "postgres" : "sqlite"})`);
-process.exit(0); // a pg pool keeps the loop alive
+if (process.env.DATABASE_URL) await (await import(pathToFileURL(join(base, "src/server/db.ts")).href)).authDatabase().end(); // else the pool keeps the process alive
