@@ -288,10 +288,8 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
   // When an allowlist is active, IGNORE the client's `provider` hint — else a seat holder could
   // send an allowlisted model id with a different provider and leak the body to it before the
   // upstream rejects the id. Route by the model id only.
-  // An institute request (Ada Tutor) never steers routing either: the institute's model goes where
-  // the server sends it, not wherever a client-supplied hint points.
-  const explicit = policy.models?.length || req.headers["x-ada-institute"] ? undefined : typeof body.provider === "string" ? body.provider : undefined;
-  const provider = route(model, explicit);
+  const explicit = policy.models?.length ? undefined : typeof body.provider === "string" ? body.provider : undefined;
+  let provider = route(model, explicit);
 
   // A request served by a subscription on THIS machine is paid for by that plan, direct to the
   // vendor — Ada never sees a token of it. Metering it against Ada's own quota would bill the user
@@ -321,8 +319,10 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
     }
     if (inst.kind === "waive") {
       institute = inst.slug;
-      // The institute's money: only the fields a doubt needs reach the provider, output clamped.
+      // The institute's money: only the fields a doubt needs reach the provider, output clamped, and
+      // the server — not a client hint — decides where the institute's model is sent.
       body = sanitizeWaivedBody(body);
+      provider = route(model);
     }
   }
   if (!institute && !isAnonymous(who) && !enterpriseMode() && !paidBySubscription && !willForward) {

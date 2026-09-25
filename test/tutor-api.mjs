@@ -147,6 +147,13 @@ try {
   assert.equal(upstreamHits.length, before + 1, "neither refused call reached the provider");
   // Not waived (own plan) → today's rules, extras untouched by the institute code.
   assert.equal((await chat("anthropic/claude-opus-4.5", doubt(1), extras)).status, 403);
+  // ...including the routing hint: made affordable on the student's own plan, a non-waived call
+  // still goes where the hint says (openai, unconfigured here → 400), exactly as before.
+  process.env.ADA_FREE_MODELS = HAIKU;
+  const hinted = await chat(HAIKU, { "x-ada-institute": "demo" }, { provider: "openai" });
+  assert.equal(hinted.status, 400);
+  assert.match(hinted.json.error.message, /openai/, "the hint is only overridden when the institute pays");
+  delete process.env.ADA_FREE_MODELS;
 
   // --- speech -------------------------------------------------------------------------------------
   const spoken = [];
