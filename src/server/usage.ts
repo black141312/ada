@@ -36,6 +36,10 @@ export interface UsageEvent {
   /** The institute that paid for this call (Ada Tutor), when it did. Null = the user's own plan.
    *  Stored so part 5 can bill institutes; never read by the spend cap. */
   institute?: string;
+  /** What the provider reported it actually ran, when that differs from `model` (e.g. OpenRouter's
+   *  dated id for an alias). Audit only: cost is always priced from `model`, the id we route and
+   *  price — a dated id models.dev doesn't know would fall to the pessimistic unknown price. */
+  servedModel?: string;
 }
 
 const pg = () => authDatabase() as Pool;
@@ -59,7 +63,8 @@ function ensure(): Promise<void> {
            ttft_ms integer,
            tz text,
            country text,
-           institute text
+           institute text,
+           served_model text
          )`
       : `create table if not exists usage_events (
            id integer primary key autoincrement,
@@ -73,7 +78,8 @@ function ensure(): Promise<void> {
            ttft_ms integer,
            tz text,
            country text,
-           institute text
+           institute text,
+           served_model text
          )`;
     const idx = "create index if not exists usage_events_user_ts on usage_events (user_id, ts)";
     // Columns added after the table shipped. `create table if not exists` is a no-op against an
@@ -87,6 +93,7 @@ function ensure(): Promise<void> {
       ["tz", "text"],
       ["country", "text"],
       ["institute", "text"],
+      ["served_model", "text"],
     ];
     if (usingPostgres) {
       await pg().query(ddl);
@@ -111,15 +118,15 @@ export async function recordUsage(e: UsageEvent): Promise<void> {
     await ensure();
     if (usingPostgres) {
       await pg().query(
-        "insert into usage_events (ts, user_id, model, provider, prompt_tokens, completion_tokens, ms, ttft_ms, tz, country, institute) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-        [e.ts, e.user, e.model, e.provider, e.promptTokens, e.completionTokens, e.ms ?? null, e.ttftMs ?? null, e.tz ?? null, e.country ?? null, e.institute ?? null],
+        "insert into usage_events (ts, user_id, model, provider, prompt_tokens, completion_tokens, ms, ttft_ms, tz, country, institute, served_model) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        [e.ts, e.user, e.model, e.provider, e.promptTokens, e.completionTokens, e.ms ?? null, e.ttftMs ?? null, e.tz ?? null, e.country ?? null, e.institute ?? null, e.servedModel ?? null],
       );
     } else {
       lite()
         .prepare(
-          "insert into usage_events (ts, user_id, model, provider, prompt_tokens, completion_tokens, ms, ttft_ms, tz, country, institute) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          "insert into usage_events (ts, user_id, model, provider, prompt_tokens, completion_tokens, ms, ttft_ms, tz, country, institute, served_model) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .run(e.ts, e.user, e.model, e.provider, e.promptTokens, e.completionTokens, e.ms ?? null, e.ttftMs ?? null, e.tz ?? null, e.country ?? null, e.institute ?? null);
+        .run(e.ts, e.user, e.model, e.provider, e.promptTokens, e.completionTokens, e.ms ?? null, e.ttftMs ?? null, e.tz ?? null, e.country ?? null, e.institute ?? null, e.servedModel ?? null);
     }
   } catch (err) {
     console.error("[ada] usage write failed:", err instanceof Error ? err.message : err);

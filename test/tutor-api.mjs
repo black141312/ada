@@ -64,6 +64,13 @@ const call = async (method, path, { key = "student-key", headers = {}, body } = 
 const HAIKU = "anthropic/claude-haiku-4.5";
 const chat = (model, headers = {}, extra = {}) => call("POST", "/v1/chat/completions", { headers, body: { model, messages: [{ role: "user", content: "2+2?" }], ...extra } });
 const doubt = (n) => ({ "x-ada-institute": "demo", "x-ada-doubt": `cls_${String(n).padStart(8, "0")}` });
+// Read the store directly.
+let lite = null;
+const q = async (sql) => {
+  lite ??= new (createRequire(import.meta.url)(join(base, "node_modules/better-sqlite3")))(join(dir, "auth.db"), { readonly: true });
+  return lite.prepare(sql).all();
+};
+const doubtRows = async () => Number((await q("select count(*) as n from institute_doubts where user_id = 'team'"))[0].n);
 const settle = () => new Promise((r) => setTimeout(r, 150)); // usage rows are written fire-and-forget
 
 try {
@@ -95,9 +102,12 @@ try {
   assert.deepEqual(upstreamHits, [HAIKU]);
   assert.equal(await I.isMember("demo", "team"), true, "first use made the student a member");
   await settle();
-  const db = new (createRequire(import.meta.url)(join(base, "node_modules/better-sqlite3")))(join(dir, "auth.db"), { readonly: true });
-  const rows = db.prepare("select user_id, model, institute from usage_events").all();
-  assert.deepEqual(rows, [{ user_id: "team", model: SERVED, institute: "demo" }], "the usage row names who pays, and what the provider really ran");
+  const rows = await q("select user_id, model, institute, served_model from usage_events");
+  assert.deepEqual(
+    rows,
+    [{ user_id: "team", model: HAIKU, institute: "demo", served_model: SERVED }],
+    "the row names who pays, is priced as the institute's model, and keeps what the provider ran",
+  );
   const plan = (await call("GET", "/v1/plan")).json;
   assert.equal(plan.usedUsd, 0, "the institute's calls don't eat the student's own plan");
 
@@ -110,14 +120,14 @@ try {
   assert.equal(capped.status, 429, "the doubt past the cap is refused");
   assert.deepEqual(capped.json, { error: { message: "Daily doubt limit reached", type: "doubt_limit" } });
   assert.equal((await chat(HAIKU, doubt(2))).status, 200, "doubts already asked today keep working");
-  assert.equal(db.prepare("select count(*) as n from institute_doubts where user_id = 'team'").get().n, 3);
+  assert.equal(await doubtRows(), 3);
 
   // --- parallel requests at the cap: exactly the cap succeeds -----------------------------------
   await I.putInstitute({ ...I.DEMO, dailyDoubtsPerStudent: 10 }); // 3 used above → 7 left
   const burst = await Promise.all(Array.from({ length: 12 }, (_, n) => chat(HAIKU, doubt(100 + n))));
   assert.equal(burst.filter((r) => r.status === 200).length, 7, "exactly the remaining cap gets through");
   assert.equal(burst.filter((r) => r.status === 429).length, 5);
-  assert.equal(db.prepare("select count(*) as n from institute_doubts where user_id = 'team'").get().n, 10);
+  assert.equal(await doubtRows(), 10);
   await I.putInstitute(I.DEMO);
 
   // --- the waived body is cut to what a doubt needs --------------------------------------------

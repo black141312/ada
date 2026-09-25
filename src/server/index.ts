@@ -205,6 +205,8 @@ async function identify(req: IncomingMessage): Promise<Identity | "corrupt" | nu
   return locked() ? null : { user: "dev", role: "dev" }; // dev mode: open
 }
 
+const servedAs = (served: string | null, model: string): { servedModel?: string } => (served && served !== model ? { servedModel: served } : {});
+
 /** The last `"model":"…"` in a response tail — what the provider reports it actually ran. */
 export function lastModel(tail: string): string | null {
   const all = [...tail.matchAll(/"model"\s*:\s*"([^"\\]{1,200})"/g)];
@@ -395,9 +397,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
         const row = {
           ts: Date.now(),
           user: who.user,
-          // A waived row records what the provider says it ran, so the institute's bill can't be
-          // quietly moved onto another model.
-          model: (institute && lastModel(tail)) || model,
+          model,
           provider,
           promptTokens: u.promptTokens,
           completionTokens: u.completionTokens,
@@ -406,7 +406,8 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
           ms: Date.now() - started,
           ...(ttft != null ? { ttftMs: ttft } : {}),
           ...originOf(req),
-          ...(institute ? { institute } : {}),
+          // A waived row also keeps what the provider says it ran (audit; priced from `model`).
+          ...(institute ? { institute, ...servedAs(lastModel(tail), model) } : {}),
         };
         appendUsage(row);
         void recordUsage(row); // fire-and-forget: this is response teardown, nothing can await here
