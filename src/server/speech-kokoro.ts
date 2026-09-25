@@ -327,8 +327,8 @@ export const speechEngine: { synth: Synth } = {
   },
 };
 
-/** 20 lines a minute: a doubt's mini-class is ~15–40 lines, heard over several minutes, and cached
- *  lines don't reach here twice. ADA_SPEECH_PER_MINUTE overrides. */
+/** 20 NEW lines a minute (cache hits aren't counted): a doubt's mini-class is ~15–40 lines, heard
+ *  over several minutes. ADA_SPEECH_PER_MINUTE overrides. */
 export const speechLimiter = new RateLimiter(Number(process.env.ADA_SPEECH_PER_MINUTE) || 20);
 
 function fail(res: ServerResponse, status: number, message: string, headers: Record<string, string> = {}): void {
@@ -339,9 +339,6 @@ function fail(res: ServerResponse, status: number, message: string, headers: Rec
 export async function handleSpeech(req: IncomingMessage, res: ServerResponse, who: Identity): Promise<void> {
   if (who.user === "anon") return fail(res, 401, "sign in to use voice");
   if ((await planFor(who.user)).status === "banned") return fail(res, 403, "This account is suspended.");
-  if (!speechLimiter.take(who.user)) {
-    return fail(res, 429, "too many voice requests — slow down", { "retry-after": String(speechLimiter.retryAfter(who.user)) });
-  }
   const raw = await readBodyLimited(req, BODY_LIMIT);
   if (raw === null) return fail(res, 413, `body too large (${MAX_TEXT} characters of text max)`);
   let body: unknown;
@@ -363,6 +360,11 @@ export async function handleSpeech(req: IncomingMessage, res: ServerResponse, wh
   }
   if (!wav) {
     cache = "miss";
+    // Only synthesis counts against the rate: a cached line costs nothing, and a replayed lesson
+    // (all hits) must not lock the student out of the next new one.
+    if (!speechLimiter.take(who.user)) {
+      return fail(res, 429, "too many voice requests — slow down", { "retry-after": String(speechLimiter.retryAfter(who.user)) });
+    }
     // The student skipped ahead or closed the page: drop the line if it's still only queued.
     const gone = new AbortController();
     res.on("close", () => {

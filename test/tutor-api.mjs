@@ -18,7 +18,7 @@ for (const k of ["DATABASE_URL", "ADA_FREE_TIER", "ADA_ADMIN_KEY", "ADA_ADMIN_US
 process.env.ADA_CLIENT_KEYS = "student-key";
 process.env.ADA_DATA_DIR = dir;
 process.env.ADA_AUTH_DB = join(dir, "auth.db");
-process.env.ADA_SPEECH_PER_MINUTE = "6"; // every request counts, rejected ones too
+process.env.ADA_SPEECH_PER_MINUTE = "3"; // only synthesised (uncached) lines count
 process.env.HOME = process.env.USERPROFILE = dir; // no stored provider credentials leak in
 process.env.OPENROUTER_API_KEY = "test-key";
 process.chdir(dir);
@@ -170,16 +170,20 @@ try {
   const again = await call("POST", "/v1/tutor/speech", { body: { text: " The answer is four. ", voice: "echo" } });
   assert.equal(again.headers.get("x-ada-cache"), "memory", "a repeated line is served from cache");
   assert.equal(spoken.length, 1);
+  for (let i = 0; i < 6; i++) {
+    assert.equal((await call("POST", "/v1/tutor/speech", { body: { text: "The answer is four.", voice: "echo" } })).status, 200, "cache hits are not rate-limited");
+  }
   S.speechEngine.synth = async () => {
     throw new Error("model missing");
   };
   const down = await call("POST", "/v1/tutor/speech", { body: { text: "not cached yet" } });
   assert.equal(down.status, 503, "a synth failure is 503 so the client falls back to the browser voice");
   assert.match(down.json.error.message, /model missing/);
-  assert.equal((await call("POST", "/v1/tutor/speech", { body: { text: "fourth" } })).status, 503, "6th request this minute still allowed (the 400s counted too)");
-  const limited = await call("POST", "/v1/tutor/speech", { body: { text: "fifth" } });
-  assert.equal(limited.status, 429, "past the per-user rate (6/min in this test)");
+  assert.equal((await call("POST", "/v1/tutor/speech", { body: { text: "third" } })).status, 503, "3rd synthesis this minute still allowed");
+  const limited = await call("POST", "/v1/tutor/speech", { body: { text: "fourth" } });
+  assert.equal(limited.status, 429, "past the per-user rate (3 new lines/min in this test)");
   assert.ok(Number(limited.headers.get("retry-after")) >= 1);
+  assert.equal((await call("POST", "/v1/tutor/speech", { body: { text: "The answer is four.", voice: "echo" } })).status, 200, "a cached line still plays when limited");
 
   // banned: no voice either
   const { setPlan } = await mod("src/server/plans.ts");
