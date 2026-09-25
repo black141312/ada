@@ -9,7 +9,10 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const dir = mkdtempSync(join(tmpdir(), "ada-institutes-"));
-delete process.env.DATABASE_URL; // sqlite; postgres takes the same SQL shape
+// SQLite by default. ADA_TEST_DATABASE_URL runs the same file against a throwaway Postgres (a fresh
+// database — the tables persist), which is the only way to exercise the advisory-lock path.
+if (process.env.ADA_TEST_DATABASE_URL) process.env.DATABASE_URL = process.env.ADA_TEST_DATABASE_URL;
+else delete process.env.DATABASE_URL;
 process.env.ADA_DATA_DIR = dir;
 process.env.ADA_AUTH_DB = join(dir, "auth.db");
 process.chdir(dir);
@@ -230,4 +233,5 @@ const B = { bytes: 1000, parsed: { messages: [{ role: "user", content: "2+2?" }]
   assert.equal((await I.doubtStats("demo", "racer3", dayOf(NOW), "cls_bigbody0")).doubtsToday, 0);
 }
 
-console.log("ok");
+console.log(`ok (${process.env.DATABASE_URL ? "postgres" : "sqlite"})`);
+process.exit(0); // a pg pool keeps the loop alive

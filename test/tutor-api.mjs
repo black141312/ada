@@ -16,6 +16,9 @@ import { pathToFileURL } from "node:url";
 const dir = mkdtempSync(join(tmpdir(), "ada-tutor-api-"));
 for (const k of ["DATABASE_URL", "ADA_FREE_TIER", "ADA_ADMIN_KEY", "ADA_ADMIN_USERS", "ADA_ALLOWED_USERS", "ADA_UPSTREAM_URL", "BETTER_AUTH_ENABLED", "ADA_OIDC_ISSUER", "ADA_FREE_MODELS", "ADA_TTS_CACHE_DIR"]) delete process.env[k];
 process.env.ADA_CLIENT_KEYS = "student-key";
+// SQLite by default; ADA_TEST_DATABASE_URL (a FRESH throwaway database) runs it all on Postgres.
+const PG = process.env.ADA_TEST_DATABASE_URL;
+if (PG) process.env.DATABASE_URL = PG;
 process.env.ADA_DATA_DIR = dir;
 process.env.ADA_AUTH_DB = join(dir, "auth.db");
 process.env.ADA_SPEECH_PER_MINUTE = "3"; // only synthesised (uncached) lines count
@@ -64,9 +67,10 @@ const call = async (method, path, { key = "student-key", headers = {}, body } = 
 const HAIKU = "anthropic/claude-haiku-4.5";
 const chat = (model, headers = {}, extra = {}) => call("POST", "/v1/chat/completions", { headers, body: { model, messages: [{ role: "user", content: "2+2?" }], ...extra } });
 const doubt = (n) => ({ "x-ada-institute": "demo", "x-ada-doubt": `cls_${String(n).padStart(8, "0")}` });
-// Read the store directly.
+// Read the store directly, on whichever engine the server is using.
 let lite = null;
 const q = async (sql) => {
+  if (PG) return (await (await mod("src/server/db.ts")).authDatabase().query(sql)).rows;
   lite ??= new (createRequire(import.meta.url)(join(base, "node_modules/better-sqlite3")))(join(dir, "auth.db"), { readonly: true });
   return lite.prepare(sql).all();
 };
@@ -190,8 +194,9 @@ try {
   await setPlan("team", "free", "banned");
   S.speechLimiter.perMinute = 1000;
   assert.equal((await call("POST", "/v1/tutor/speech", { body: { text: "hello" } })).status, 403, "a banned account gets no speech");
-  console.log("ok");
+  console.log(`ok (${PG ? "postgres" : "sqlite"})`);
 } finally {
   server.close();
   fake.close();
+  if (PG) setTimeout(() => process.exit(process.exitCode ?? 0), 50); // the pg pool keeps the loop alive
 }
