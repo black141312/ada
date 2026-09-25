@@ -1,0 +1,142 @@
+// Ada Tutor over HTTP: the public institute route, the institute waiver in /v1/chat/completions
+// (and everything that must NOT get it), the daily doubt cap, usage rows tagged with the institute
+// and kept off the student's own spend, and /v1/tutor/speech with a fake engine.
+//
+// Identity: ADA_CLIENT_KEYS gives a signed-in, non-enterprise user ("team") on the free plan —
+// exactly a student. OpenRouter points at a local fake so a waived call completes end to end.
+//   run: node --import tsx test/tutor-api.mjs
+import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { createServer } from "node:http";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const dir = mkdtempSync(join(tmpdir(), "ada-tutor-api-"));
+for (const k of ["DATABASE_URL", "ADA_FREE_TIER", "ADA_ADMIN_KEY", "ADA_ADMIN_USERS", "ADA_ALLOWED_USERS", "ADA_UPSTREAM_URL", "BETTER_AUTH_ENABLED", "ADA_OIDC_ISSUER", "ADA_FREE_MODELS", "ADA_TTS_CACHE_DIR"]) delete process.env[k];
+process.env.ADA_CLIENT_KEYS = "student-key";
+process.env.ADA_DATA_DIR = dir;
+process.env.ADA_AUTH_DB = join(dir, "auth.db");
+process.env.ADA_SPEECH_PER_MINUTE = "6"; // every request counts, rejected ones too
+process.env.HOME = process.env.USERPROFILE = dir; // no stored provider credentials leak in
+process.env.OPENROUTER_API_KEY = "test-key";
+process.chdir(dir);
+
+// The fake OpenRouter: answers every chat with a tiny completion that reports usage.
+const upstreamHits = [];
+const fake = createServer((req, res) => {
+  let body = "";
+  req.on("data", (c) => (body += c));
+  req.on("end", () => {
+    upstreamHits.push(JSON.parse(body).model);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: "x", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 1000, completion_tokens: 500, total_tokens: 1500 } }));
+  });
+});
+await new Promise((r) => fake.listen(0, "127.0.0.1", r));
+
+const base = resolve(import.meta.dirname, "..");
+const mod = (p) => import(pathToFileURL(join(base, p)).href);
+const { PROVIDERS } = await mod("src/server/config.ts");
+PROVIDERS.openrouter.baseURL = `http://127.0.0.1:${fake.address().port}`;
+const { createAdaServer } = await mod("src/server/index.ts");
+const I = await mod("src/server/institutes.ts");
+const S = await mod("src/server/speech-kokoro.ts");
+
+const server = createAdaServer();
+await new Promise((r) => server.listen(0, "127.0.0.1", r));
+const origin = `http://127.0.0.1:${server.address().port}`;
+const call = async (method, path, { key = "student-key", headers = {}, body } = {}) => {
+  const res = await fetch(origin + path, {
+    method,
+    headers: { ...(key ? { authorization: `Bearer ${key}` } : {}), "content-type": "application/json", ...headers },
+    body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body),
+  });
+  const buf = Buffer.from(await res.arrayBuffer());
+  let json = null;
+  try { json = JSON.parse(buf.toString()); } catch {}
+  return { status: res.status, json, buf, headers: res.headers };
+};
+const HAIKU = "anthropic/claude-haiku-4.5";
+const chat = (model, headers = {}) => call("POST", "/v1/chat/completions", { headers, body: { model, messages: [{ role: "user", content: "2+2?" }] } });
+const doubt = (n) => ({ "x-ada-institute": "demo", "x-ada-doubt": `cls_${String(n).padStart(8, "0")}` });
+const settle = () => new Promise((r) => setTimeout(r, 150)); // usage rows are written fire-and-forget
+
+try {
+  // --- public branding --------------------------------------------------------------------------
+  const pub = await call("GET", "/v1/institutes/demo", { key: null });
+  assert.equal(pub.status, 200, "readable before sign-in");
+  assert.deepEqual(pub.json, { slug: "demo", name: "Demo Coaching", logoUrl: null }, "no model, no cap");
+  assert.equal((await call("GET", "/v1/institutes/nobody", { key: null })).status, 404);
+  assert.equal((await call("GET", "/v1/institutes/BAD!", { key: null })).status, 404);
+  await I.putInstitute({ ...I.DEMO, slug: "closed", name: "Closed", active: false });
+  assert.equal((await call("GET", "/v1/institutes/closed", { key: null })).status, 404, "inactive is 404");
+
+  // --- today's rules without the waiver -----------------------------------------------------------
+  const plain = await chat(HAIKU);
+  assert.equal(plain.status, 403, "a free student can't use Haiku on their own plan");
+  assert.equal(plain.json.error.type, "plan_restricted");
+  assert.equal((await chat(HAIKU, { "x-ada-institute": "demo" })).status, 403, "institute without a doubt id: no waiver");
+  assert.equal((await chat(HAIKU, { "x-ada-institute": "demo", "x-ada-doubt": "nope" })).status, 403, "malformed doubt id: no waiver");
+  assert.equal((await chat("anthropic/claude-opus-4.5", doubt(1))).status, 403, "another model is never waived");
+  assert.equal((await chat(HAIKU, { "x-ada-institute": "closed", "x-ada-doubt": "cls_00000001" })).status, 403, "inactive institute: no waiver");
+  assert.equal((await chat(HAIKU, { "x-ada-institute": "ghost", "x-ada-doubt": "cls_00000001" })).status, 403, "unknown institute: no waiver");
+  assert.equal((await call("POST", "/v1/chat/completions", { key: null, headers: doubt(1), body: { model: HAIKU, messages: [] } })).status, 401, "signed out: no waiver");
+  assert.equal(upstreamHits.length, 0, "nothing above reached the provider");
+
+  // --- the waiver ---------------------------------------------------------------------------------
+  const ok = await chat(HAIKU, doubt(1));
+  assert.equal(ok.status, 200, JSON.stringify(ok.json));
+  assert.equal(ok.json.choices[0].message.content, "ok");
+  assert.deepEqual(upstreamHits, [HAIKU]);
+  assert.equal(await I.isMember("demo", "team"), true, "first use made the student a member");
+  await settle();
+  const db = new (createRequire(import.meta.url)(join(base, "node_modules/better-sqlite3")))(join(dir, "auth.db"), { readonly: true });
+  const rows = db.prepare("select user_id, model, institute from usage_events").all();
+  assert.deepEqual(rows, [{ user_id: "team", model: HAIKU, institute: "demo" }], "the usage row names who pays");
+  const plan = (await call("GET", "/v1/plan")).json;
+  assert.equal(plan.usedUsd, 0, "the institute's calls don't eat the student's own plan");
+
+  // --- the daily cap ------------------------------------------------------------------------------
+  await I.putInstitute({ ...I.DEMO, dailyDoubtsPerStudent: 3 });
+  assert.equal((await chat(HAIKU, doubt(1))).status, 200, "same doubt again (a follow-up) is fine");
+  assert.equal((await chat(HAIKU, doubt(2))).status, 200);
+  assert.equal((await chat(HAIKU, doubt(3))).status, 200);
+  const capped = await chat(HAIKU, doubt(4));
+  assert.equal(capped.status, 429, "the doubt past the cap is refused");
+  assert.deepEqual(capped.json, { error: { message: "Daily doubt limit reached", type: "doubt_limit" } });
+  assert.equal((await chat(HAIKU, doubt(2))).status, 200, "doubts already asked today keep working");
+  assert.equal(db.prepare("select count(*) as n from institute_doubts where user_id = 'team'").get().n, 3);
+  await I.putInstitute(I.DEMO);
+
+  // --- speech -------------------------------------------------------------------------------------
+  const spoken = [];
+  S.speechEngine.synth = async (voice, text) => (spoken.push([voice, text]), new Uint8Array([82, 73, 70, 70, text.length]));
+  assert.equal((await call("POST", "/v1/tutor/speech", { key: null, body: { text: "hi" } })).status, 401, "signed-in only");
+  assert.equal((await call("POST", "/v1/tutor/speech", { body: { text: "" } })).status, 400);
+  assert.equal((await call("POST", "/v1/tutor/speech", { body: { text: "x".repeat(1501) } })).status, 400, "1500 characters max");
+  const a = await call("POST", "/v1/tutor/speech", { headers: doubt(1), body: { text: "The answer is four.", voice: "echo" } });
+  assert.equal(a.status, 200);
+  assert.equal(a.headers.get("content-type"), "audio/wav");
+  assert.equal(a.headers.get("x-ada-cache"), "miss");
+  assert.deepEqual([...a.buf], [82, 73, 70, 70, 19]);
+  assert.deepEqual(spoken, [["am_michael", "The answer is four."]], "the app's voice map applies");
+  const again = await call("POST", "/v1/tutor/speech", { body: { text: " The answer is four. ", voice: "echo" } });
+  assert.equal(again.headers.get("x-ada-cache"), "memory", "a repeated line is served from cache");
+  assert.equal(spoken.length, 1);
+  S.speechEngine.synth = async () => {
+    throw new Error("model missing");
+  };
+  const down = await call("POST", "/v1/tutor/speech", { body: { text: "not cached yet" } });
+  assert.equal(down.status, 503, "a synth failure is 503 so the client falls back to the browser voice");
+  assert.match(down.json.error.message, /model missing/);
+  assert.equal((await call("POST", "/v1/tutor/speech", { body: { text: "fourth" } })).status, 503, "6th request this minute still allowed (the 400s counted too)");
+  const limited = await call("POST", "/v1/tutor/speech", { body: { text: "fifth" } });
+  assert.equal(limited.status, 429, "past the per-user rate (6/min in this test)");
+  assert.ok(Number(limited.headers.get("retry-after")) >= 1);
+  console.log("ok");
+} finally {
+  server.close();
+  fake.close();
+}
