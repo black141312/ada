@@ -46,9 +46,12 @@ assert.equal(await I.isMember("demo", "stu"), true);
 // doubt counting: distinct doubts per (institute, student, day); calls per doubt
 const day = "2026-09-26";
 assert.deepEqual(await I.doubtStats("demo", "stu", day, "cls_aaaaaaaa"), { doubtsToday: 0, doubtCalls: null });
-await I.recordDoubtCall("demo", "stu", day, "cls_aaaaaaaa");
-await I.recordDoubtCall("demo", "stu", day, "cls_aaaaaaaa");
-await I.recordDoubtCall("demo", "stu", day, "cls_bbbbbbbb");
+const waiveAll = () => ({ kind: "waive" });
+await I.claimDoubtCall("demo", "stu", day, "cls_aaaaaaaa", waiveAll);
+await I.claimDoubtCall("demo", "stu", day, "cls_aaaaaaaa", waiveAll);
+await I.claimDoubtCall("demo", "stu", day, "cls_bbbbbbbb", waiveAll);
+await I.claimDoubtCall("demo", "stu", day, "cls_dddddddd", () => ({ kind: "deny", status: 429, message: "x" }));
+assert.equal((await I.doubtStats("demo", "stu", day, "cls_dddddddd")).doubtCalls, null, "a denied claim writes nothing");
 assert.deepEqual(await I.doubtStats("demo", "stu", day, "cls_aaaaaaaa"), { doubtsToday: 2, doubtCalls: 2 });
 assert.deepEqual(await I.doubtStats("demo", "stu", day, "cls_cccccccc"), { doubtsToday: 2, doubtCalls: null });
 assert.equal((await I.doubtStats("demo", "stu", "2026-09-27", "cls_aaaaaaaa")).doubtsToday, 0, "a new day starts at zero");
@@ -89,8 +92,12 @@ function fakeStore(over = {}) {
     log,
     getInstitute: async (s) => (log.push(["get", s]), s === "demo" ? DEMO : null),
     ensureMember: async (s, u) => void log.push(["member", s, u]),
-    doubtStats: async (...a) => (log.push(["stats", ...a]), over.stats ?? fresh),
-    recordDoubtCall: async (...a) => void log.push(["record", ...a]),
+    claimDoubtCall: async (slug, user, day, id, decide) => {
+      log.push(["stats", slug, user, day, id]);
+      const d = decide(over.stats ?? fresh);
+      if (d.kind === "waive") log.push(["record", slug, user, day, id]);
+      return d;
+    },
     isBanned: async () => over.banned ?? false,
   };
   return store;
@@ -147,6 +154,21 @@ const NOW = Date.UTC(2026, 8, 26, 10);
   assert.equal((await instituteGate(I.dbStore, h(7), "capper", DEMO.model, NOW)).kind, "waive", "an earlier doubt still works");
   assert.equal((await instituteGate(I.dbStore, h(31), "capper", DEMO.model, NOW + 86_400_000)).kind, "waive", "tomorrow it resets");
   assert.equal(await I.isMember("demo", "capper"), true);
+}
+
+// --- parallel: the check IS the write -------------------------------------------
+{
+  // 40 fresh doubts at once against a cap of 30: exactly 30 get through.
+  const h = (n) => req({ "x-ada-institute": "demo", "x-ada-doubt": `cls_p${String(n).padStart(7, "0")}` });
+  const got = await Promise.all(Array.from({ length: 40 }, (_, n) => instituteGate(I.dbStore, h(n), "racer", DEMO.model, NOW)));
+  assert.equal(got.filter((d) => d.kind === "waive").length, 30, "exactly the cap succeeds");
+  assert.equal(got.filter((d) => d.status === 429).length, 10);
+  assert.equal((await I.doubtStats("demo", "racer", dayOf(NOW), "cls_x0000000")).doubtsToday, 30, "and exactly the cap is recorded");
+  // 75 calls at once on one doubt: exactly CALLS_PER_DOUBT get through.
+  const one = req({ "x-ada-institute": "demo", "x-ada-doubt": "cls_samedoub" });
+  const calls = await Promise.all(Array.from({ length: 75 }, () => instituteGate(I.dbStore, one, "racer2", DEMO.model, NOW)));
+  assert.equal(calls.filter((d) => d.kind === "waive").length, CALLS_PER_DOUBT);
+  assert.equal((await I.doubtStats("demo", "racer2", dayOf(NOW), "cls_samedoub")).doubtCalls, CALLS_PER_DOUBT);
 }
 
 console.log("ok");

@@ -108,6 +108,13 @@ try {
   assert.deepEqual(capped.json, { error: { message: "Daily doubt limit reached", type: "doubt_limit" } });
   assert.equal((await chat(HAIKU, doubt(2))).status, 200, "doubts already asked today keep working");
   assert.equal(db.prepare("select count(*) as n from institute_doubts where user_id = 'team'").get().n, 3);
+
+  // --- parallel requests at the cap: exactly the cap succeeds -----------------------------------
+  await I.putInstitute({ ...I.DEMO, dailyDoubtsPerStudent: 10 }); // 3 used above → 7 left
+  const burst = await Promise.all(Array.from({ length: 12 }, (_, n) => chat(HAIKU, doubt(100 + n))));
+  assert.equal(burst.filter((r) => r.status === 200).length, 7, "exactly the remaining cap gets through");
+  assert.equal(burst.filter((r) => r.status === 429).length, 5);
+  assert.equal(db.prepare("select count(*) as n from institute_doubts where user_id = 'team'").get().n, 10);
   await I.putInstitute(I.DEMO);
 
   // --- speech -------------------------------------------------------------------------------------

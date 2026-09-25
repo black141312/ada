@@ -156,24 +156,56 @@ export interface DoubtStats {
   doubtCalls: number | null;
 }
 
-export async function doubtStats(slug: string, user: string, day: string, doubtId: string): Promise<DoubtStats> {
-  await ensure();
-  const rows = await all<{ doubt_id: string; calls: number | string }>(
-    "select doubt_id, calls from institute_doubts where slug = $1 and user_id = $2 and day = $3",
-    [slug, user, day],
-  );
+const STATS_SQL = "select doubt_id, calls from institute_doubts where slug = $1 and user_id = $2 and day = $3";
+const RECORD_SQL = `insert into institute_doubts (slug, user_id, day, doubt_id, calls, first_at) values ($1, $2, $3, $4, 1, $5)
+  on conflict (slug, user_id, day, doubt_id) do update set calls = institute_doubts.calls + 1`;
+const toStats = (rows: Array<{ doubt_id: string; calls: number | string }>, doubtId: string): DoubtStats => {
   const mine = rows.find((r) => r.doubt_id === doubtId);
   return { doubtsToday: rows.length, doubtCalls: mine ? Number(mine.calls) : null };
+};
+
+export async function doubtStats(slug: string, user: string, day: string, doubtId: string): Promise<DoubtStats> {
+  await ensure();
+  return toStats(await all(STATS_SQL, [slug, user, day]), doubtId);
 }
 
-/** Count one model call against a doubt (creating the doubt's row on its first call). */
-export async function recordDoubtCall(slug: string, user: string, day: string, doubtId: string): Promise<void> {
+/** Read the student's counts, decide, and — only on a waiver — count the call, as ONE atomic step.
+ *  A read-then-write gate let N parallel requests with fresh doubt ids all see "under the cap".
+ *  Postgres: a transaction holding an advisory lock on (institute, student, day), so every instance
+ *  queues on the same key. SQLite: one synchronous IMMEDIATE transaction (writes are serialized). */
+export async function claimDoubtCall(
+  slug: string,
+  user: string,
+  day: string,
+  doubtId: string,
+  decide: (s: DoubtStats) => InstituteDecision,
+): Promise<InstituteDecision> {
   await ensure();
-  await run(
-    `insert into institute_doubts (slug, user_id, day, doubt_id, calls, first_at) values ($1, $2, $3, $4, 1, $5)
-     on conflict (slug, user_id, day, doubt_id) do update set calls = institute_doubts.calls + 1`,
-    [slug, user, day, doubtId, Date.now()],
-  );
+  const params = [slug, user, day];
+  if (!usingPostgres) {
+    const db = lite();
+    return db
+      .transaction(() => {
+        const d = decide(toStats(db.prepare(STATS_SQL.replace(/\$\d+/g, "?")).all(...params) as Array<{ doubt_id: string; calls: number }>, doubtId));
+        if (d.kind === "waive") db.prepare(RECORD_SQL.replace(/\$\d+/g, "?")).run(slug, user, day, doubtId, Date.now());
+        return d;
+      })
+      .immediate();
+  }
+  const client = await pg().connect();
+  try {
+    await client.query("begin");
+    await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [`institute-doubts|${slug}|${user}|${day}`]);
+    const d = decide(toStats((await client.query(STATS_SQL, params)).rows, doubtId));
+    if (d.kind === "waive") await client.query(RECORD_SQL, [slug, user, day, doubtId, Date.now()]);
+    await client.query("commit");
+    return d;
+  } catch (e) {
+    await client.query("rollback").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 // ---------- the decision (pure) ----------
@@ -219,9 +251,9 @@ export function decideInstitute(i: DecisionInput): InstituteDecision {
 export interface InstituteStore {
   getInstitute(slug: string): Promise<Institute | null>;
   ensureMember(slug: string, user: string): Promise<void>;
-  doubtStats(slug: string, user: string, day: string, doubtId: string): Promise<DoubtStats>;
-  recordDoubtCall(slug: string, user: string, day: string, doubtId: string): Promise<void>;
   isBanned(user: string): Promise<boolean>;
+  /** Atomic read-decide-record (see claimDoubtCall). */
+  claimDoubtCall(slug: string, user: string, day: string, doubtId: string, decide: (s: DoubtStats) => InstituteDecision): Promise<InstituteDecision>;
 }
 
 const header = (req: IncomingMessage, name: string): string | null => {
@@ -230,9 +262,8 @@ const header = (req: IncomingMessage, name: string): string | null => {
   return s ? s : null;
 };
 
-/** Read the two headers, look everything up, decide, and — when the institute pays — record the
- *  membership and the call. ponytail: two concurrent NEW doubts at cap-1 can both pass (read, then
- *  write); the overshoot is one doubt, not worth a transaction. */
+/** Read the two headers, look everything up, and decide — counting the call atomically when the
+ *  institute pays. */
 export async function instituteGate(
   store: InstituteStore,
   req: IncomingMessage,
@@ -248,21 +279,19 @@ export async function instituteGate(
   await store.ensureMember(slug, user);
   const rawDoubt = header(req, "x-ada-doubt");
   const doubtId = isDoubtId(rawDoubt) ? rawDoubt : null;
-  const day = dayOf(now);
   // Only look further when the answer could be a waiver — everything else is the student's plan.
   if (model !== institute.model || !doubtId) return { kind: "none" };
-  const [banned, stats] = await Promise.all([store.isBanned(user), store.doubtStats(slug, user, day, doubtId)]);
-  const d = decideInstitute({ slug, institute, model, doubtId, banned, stats });
-  if (d.kind === "waive") await store.recordDoubtCall(slug, user, day, doubtId);
-  return d;
+  const banned = await store.isBanned(user);
+  return store.claimDoubtCall(slug, user, dayOf(now), doubtId, (stats) =>
+    decideInstitute({ slug, institute, model, doubtId, banned, stats }),
+  );
 }
 
 /** The database-backed store. A ban lives on the plan row. */
 export const dbStore: InstituteStore = {
   getInstitute,
   ensureMember,
-  doubtStats,
-  recordDoubtCall,
+  claimDoubtCall,
   isBanned: async (user) => (await planFor(user)).status === "banned",
 };
 
