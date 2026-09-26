@@ -24,6 +24,7 @@ process.env.ADA_AUTH_DB = join(dir, "auth.db");
 process.env.ADA_SPEECH_PER_MINUTE = "3"; // only synthesised (uncached) lines count
 process.env.HOME = process.env.USERPROFILE = dir; // no stored provider credentials leak in
 process.env.OPENROUTER_API_KEY = "test-key";
+process.env.ADA_SPEECH_PROVIDER = "kokoro"; // the OpenRouter voice path has its own test (speech-openrouter.mjs)
 process.chdir(dir);
 
 // The fake OpenRouter: answers every chat with a tiny completion that reports usage.
