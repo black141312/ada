@@ -14,7 +14,7 @@ const S = await import(pathToFileURL(join(base, "src/server/speech-kokoro.ts")).
 const W = await import(pathToFileURL(join(base, "src/server/wav.mjs")).href);
 
 // --- validation + voices ------------------------------------------------------
-assert.deepEqual(S.validateSpeech({ text: "  Hello.  ", voice: "echo" }), { ok: true, text: "Hello.", voice: "am_michael" });
+assert.deepEqual(S.validateSpeech({ text: "  Hello.  ", voice: "echo" }), { ok: true, text: "Hello.", voice: "am_michael", name: "echo" });
 assert.equal(S.validateSpeech({ text: "Hi", voice: "made-up" }).voice, "af_heart", "unknown voice → the default");
 assert.equal(S.validateSpeech({ text: "Hi", voice: "constructor" }).voice, "af_heart", "prototype keys are not voices");
 assert.equal(S.validateSpeech({ text: "Hi" }).voice, "af_heart");

@@ -1,6 +1,10 @@
 /**
  * Server speech for Ada Tutor: POST /v1/tutor/speech { text, voice } → audio/wav.
  *
+ * Two engines (ADA_SPEECH_PROVIDER; default openrouter when OPENROUTER_API_KEY is set, else kokoro):
+ * OpenRouter's gpt-audio-mini (speech-openrouter.ts) — fast, metered, checked for verbatim reading —
+ * with Kokoro as the fallback for any line it gets wrong, times out on, or isn't allowed to pay for.
+ *
  * Kokoro-82M (the app's local voice, same voice map) runs in a forked child process
  * (kokoro-worker.mjs), one line at a time per instance. Output is 16 kHz mono 16-bit WAV
  * (~32 KB/s). Lines are cached by sha1(voice + text): in memory (LRU, 200 MB) and on disk under
@@ -19,7 +23,11 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Identity } from "./enterprise.ts";
 import { readBodyLimited } from "./classes.ts";
-import { planFor } from "./plans.ts";
+import { checkEntitlement, planFor } from "./plans.ts";
+import { appendUsage, enterpriseMode } from "./enterprise.ts";
+import { getInstitute, isSlug } from "./institutes.ts";
+import { instituteCostSince, recordUsage } from "./usage.ts";
+import { OR_SPEECH_MODEL, mapOrVoice, orSpeak, type SpeechUsage } from "./speech-openrouter.ts";
 
 /** Lessons carry OpenAI-style voice names; Kokoro's live only here. Identical to the app's map. */
 export const VOICE_MAP: Record<string, string> = {
@@ -40,7 +48,8 @@ export const mapVoice = (name: unknown): string => (typeof name === "string" && 
 export const MAX_TEXT = 1500;
 const BODY_LIMIT = 16_384; // 1500 chars of JSON-escaped text fits with room to spare
 
-export type SpeechInput = { ok: true; text: string; voice: string } | { ok: false; status: 400; message: string };
+/** `voice` is the Kokoro voice; `name` the lesson's voice name as sent (for the other engine's map). */
+export type SpeechInput = { ok: true; text: string; voice: string; name: string } | { ok: false; status: 400; message: string };
 
 /** Validate a request body. `voice` is the Kokoro voice after mapping. */
 export function validateSpeech(body: unknown): SpeechInput {
@@ -50,10 +59,20 @@ export function validateSpeech(body: unknown): SpeechInput {
   const text = b.text.trim();
   if (!text) return { ok: false, status: 400, message: "empty 'text'" };
   if (text.length > MAX_TEXT) return { ok: false, status: 400, message: `'text' is too long (${MAX_TEXT} characters max)` };
-  return { ok: true, text, voice: mapVoice(b.voice) };
+  return { ok: true, text, voice: mapVoice(b.voice), name: typeof b.voice === "string" ? b.voice : "nova" };
 }
 
 export const cacheKey = (voice: string, text: string): string => createHash("sha1").update(`${voice}\n${text}`).digest("hex");
+
+export type SpeechProvider = "openrouter" | "kokoro";
+/** Read per request, so flipping the env on a running service needs no restart. */
+export function speechProvider(env: NodeJS.ProcessEnv = process.env): SpeechProvider {
+  const p = env.ADA_SPEECH_PROVIDER;
+  if (p === "openrouter" || p === "kokoro") return p;
+  return env.OPENROUTER_API_KEY ? "openrouter" : "kokoro";
+}
+/** The cache key names the engine and its own voice, so a Kokoro line never answers for OpenRouter. */
+export const speechKey = (provider: SpeechProvider, voice: string, text: string): string => cacheKey(`${provider}:${voice}`, text);
 
 /** Sliding one-minute window per user. ponytail: per instance, in memory — across N instances a
  *  user gets N× the rate; fine for "not a free TTS", not a billing control. */
@@ -318,14 +337,63 @@ export function prune(dir: string, maxBytes: number): number {
 
 // ---------- HTTP ----------
 
-/** Swappable for tests — the real one forks Kokoro on first use. */
-export const speechEngine: { synth: Synth } = {
+/** Swappable for tests — `synth` forks Kokoro on first use; `or` calls OpenRouter. */
+export const speechEngine: { synth: Synth; or: typeof orSpeak } = {
   synth: (voice, text, opts) => {
     const s = createSynth({ spawn: spawnWorker });
     speechEngine.synth = s;
     return s(voice, text, opts);
   },
+  or: orSpeak,
 };
+
+/** OpenRouter lines in flight per user. The engine is I/O-bound, so there's no instance-wide queue —
+ *  but one user can't hold more than a few paid calls open at once. */
+export const OR_PER_USER = 3;
+const orInFlight = new Map<string, number>();
+
+/** Who pays for an OpenRouter line, or why nobody will (→ Kokoro, which costs nothing).
+ *  An active institute named by x-ada-institute pays while under its daily budget, exactly like chat;
+ *  otherwise the user's own plan must allow the model (enterprise seats are billed by contract). */
+export async function speechPayer(req: IncomingMessage, user: string): Promise<{ institute?: string } | { denied: string; status?: 403 }> {
+  // A ban beats every payer — same rule as the chat waiver (decideInstitute). handleSpeech also
+  // refuses banned users up front; this keeps the payer decision safe on its own.
+  if ((await planFor(user)).status === "banned") return { denied: "This account is suspended.", status: 403 };
+  const raw = req.headers["x-ada-institute"];
+  const slug = (Array.isArray(raw) ? raw[0] : raw)?.trim();
+  if (isSlug(slug)) {
+    const inst = await getInstitute(slug);
+    if (inst?.active) {
+      if (inst.dailyBudgetUsd != null) {
+        const day = new Date().toISOString().slice(0, 10);
+        if ((await instituteCostSince(slug, Date.parse(`${day}T00:00:00Z`))) >= inst.dailyBudgetUsd) return { denied: `institute ${slug} is over today's budget` };
+      }
+      return { institute: slug };
+    }
+  }
+  if (enterpriseMode()) return {};
+  const ent = await checkEntitlement(user, OR_SPEECH_MODEL);
+  return ent.ok ? {} : { denied: `plan: ${ent.message ?? "not entitled"}` };
+}
+
+function meter(user: string, usage: SpeechUsage | null, institute: string | undefined, started: number): void {
+  if (!usage) {
+    console.warn("[speech] openrouter reported no usage — this line is unmetered");
+    return;
+  }
+  const row = {
+    ts: Date.now(),
+    user,
+    model: OR_SPEECH_MODEL,
+    provider: "openrouter",
+    promptTokens: usage.promptTokens,
+    completionTokens: usage.completionTokens,
+    ms: Date.now() - started,
+    ...(institute ? { institute } : {}),
+  };
+  appendUsage(row);
+  void recordUsage(row);
+}
 
 /** 20 NEW lines a minute (cache hits aren't counted): a doubt's mini-class is ~15–40 lines, heard
  *  over several minutes. ADA_SPEECH_PER_MINUTE overrides. */
@@ -350,16 +418,29 @@ export async function handleSpeech(req: IncomingMessage, res: ServerResponse, wh
   const v = validateSpeech(body);
   if (!v.ok) return fail(res, v.status, v.message);
 
-  const key = cacheKey(v.voice, v.text);
-  let wav = memory.get(key) ?? null;
-  let cache = "memory";
-  if (!wav) {
-    wav = diskGet(key);
-    cache = "disk";
-    if (wav) memory.set(key, wav);
+  const provider = speechProvider();
+  const orVoice = mapOrVoice(v.name);
+  const kokoroKey = speechKey("kokoro", v.voice, v.text);
+  const orKey = speechKey("openrouter", orVoice, v.text);
+  // Look up the requested engine's line first, then — on the OpenRouter path — a Kokoro stand-in
+  // cached earlier for the same line (a misread, a timeout, or a user OpenRouter won't bill).
+  // ponytail: a stand-in is kept for good; a transient OpenRouter failure isn't retried for that line.
+  const lookups: Array<[string, SpeechProvider]> = provider === "openrouter" ? [[orKey, "openrouter"], [kokoroKey, "kokoro"]] : [[kokoroKey, "kokoro"]];
+  let wav: Uint8Array | null = null;
+  let cache = "miss";
+  let engine: SpeechProvider = provider;
+  for (const [k, e] of lookups) {
+    const m = memory.get(k);
+    const d = m ? null : diskGet(k);
+    if (m || d) {
+      wav = (m ?? d)!;
+      if (d) memory.set(k, d);
+      cache = m ? "memory" : "disk";
+      engine = e;
+      break;
+    }
   }
   if (!wav) {
-    cache = "miss";
     // Only synthesis counts against the rate: a cached line costs nothing, and a replayed lesson
     // (all hits) must not lock the student out of the next new one.
     if (!speechLimiter.take(who.user)) {
@@ -370,21 +451,51 @@ export async function handleSpeech(req: IncomingMessage, res: ServerResponse, wh
     res.on("close", () => {
       if (!res.writableFinished) gone.abort();
     });
-    try {
-      wav = await speechEngine.synth(v.voice, v.text, { owner: who.user, signal: gone.signal });
-    } catch (e) {
-      // 503, not 500: the client's answer to this is "use the browser voice", not "report a bug".
-      const status = e instanceof SpeechError ? e.status : 503;
-      return fail(res, status, `voice unavailable: ${e instanceof Error ? e.message : String(e)}`);
+    if (provider === "openrouter") {
+      const payer = await speechPayer(req, who.user);
+      if ("denied" in payer && payer.status === 403) return fail(res, 403, payer.denied);
+      if ("denied" in payer) {
+        console.warn(`[speech] kokoro instead of openrouter for ${who.user}: ${payer.denied}`);
+      } else {
+        const n = orInFlight.get(who.user) ?? 0;
+        if (n >= OR_PER_USER) return fail(res, 429, "too many voice lines at once — wait for the current ones");
+        orInFlight.set(who.user, n + 1);
+        const started = Date.now();
+        try {
+          const r = await speechEngine.or({ text: v.text, voice: orVoice, signal: gone.signal });
+          if (!r.ok && r.estimated) console.warn(`[speech] openrouter reported no usage (${r.reason}) — metering an estimate`);
+          meter(who.user, r.usage, payer.institute, started);
+          if (r.ok) wav = r.wav;
+          else console.warn(`[speech] openrouter → kokoro fallback (${r.reason}): ${r.detail}`);
+        } finally {
+          const left = (orInFlight.get(who.user) ?? 1) - 1;
+          if (left > 0) orInFlight.set(who.user, left);
+          else orInFlight.delete(who.user);
+        }
+      }
     }
-    memory.set(key, wav);
-    diskPut(key, wav);
+    if (wav) {
+      memory.set(orKey, wav);
+      diskPut(orKey, wav);
+    } else {
+      engine = "kokoro";
+      try {
+        wav = await speechEngine.synth(v.voice, v.text, { owner: who.user, signal: gone.signal });
+      } catch (e) {
+        // 503, not 500: the client's answer to this is "use the browser voice", not "report a bug".
+        const status = e instanceof SpeechError ? e.status : 503;
+        return fail(res, status, `voice unavailable: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      memory.set(kokoroKey, wav);
+      diskPut(kokoroKey, wav);
+    }
   }
   res.writeHead(200, {
     "content-type": "audio/wav",
     "content-length": String(wav.byteLength),
     "cache-control": "private, max-age=604800, immutable",
     "x-ada-cache": cache,
+    "x-ada-voice": engine,
   });
   res.end(Buffer.from(wav.buffer, wav.byteOffset, wav.byteLength));
 }
