@@ -13,6 +13,8 @@ import { adminUsers, verifyIdentity } from "./identity.ts";
 import { addAllowed, listAllowed, removeAllowed } from "./allowlist.ts";
 import { costSince, recordUsage } from "./usage.ts";
 import { handleClasses, readBodyLimited } from "./classes.ts";
+import { dbStore, instituteGate, isSlug, publicInstitute, sanitizeWaivedBody } from "./institutes.ts";
+import { handleSpeech } from "./speech-kokoro.ts";
 import { prefetch as prefetchModelCatalog } from "../client/models-dev.ts";
 import { billingWebhookImplemented, checkEntitlement, effectivePlan, isFreeModel, PLANS, planFor, periodStart, setPlan, WINDOW_MS, windowStart, type PlanName } from "./plans.ts";
 import { checkoutUrl, createCheckout, getCheckout, setCheckoutPlan } from "./billing.ts";
@@ -203,6 +205,14 @@ async function identify(req: IncomingMessage): Promise<Identity | "corrupt" | nu
   return locked() ? null : { user: "dev", role: "dev" }; // dev mode: open
 }
 
+const servedAs = (served: string | null, model: string): { servedModel?: string } => (served && served !== model ? { servedModel: served } : {});
+
+/** The last `"model":"…"` in a response tail — what the provider reports it actually ran. */
+export function lastModel(tail: string): string | null {
+  const all = [...tail.matchAll(/"model"\s*:\s*"([^"\\]{1,200})"/g)];
+  return all.length ? all[all.length - 1]![1]! : null;
+}
+
 function json(res: ServerResponse, status: number, obj: unknown): void {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(obj));
@@ -279,7 +289,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
   // send an allowlisted model id with a different provider and leak the body to it before the
   // upstream rejects the id. Route by the model id only.
   const explicit = policy.models?.length ? undefined : typeof body.provider === "string" ? body.provider : undefined;
-  const provider = route(model, explicit);
+  let provider = route(model, explicit);
 
   // A request served by a subscription on THIS machine is paid for by that plan, direct to the
   // vendor — Ada never sees a token of it. Metering it against Ada's own quota would bill the user
@@ -296,7 +306,26 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
   // Plan quota. Skipped for the anonymous free tier (already restricted to `:free` above, and there
   // is no account to meter against) and for enterprise seats, which are governed by org policy and
   // billed by contract rather than by plan.
+  //
+  // Ada Tutor: a request naming an institute (x-ada-institute, set by the Worker) for exactly that
+  // institute's model, with a doubt id to count, is the institute's bill — it skips the price gate
+  // and is capped per student per day instead. Every other request takes today's path unchanged.
+  let institute: string | undefined;
   if (!isAnonymous(who) && !enterpriseMode() && !paidBySubscription && !willForward) {
+    const inst = await instituteGate(dbStore, req, who.user, model, { bytes: Buffer.byteLength(raw), parsed: body });
+    if (inst.kind === "deny") {
+      appendAudit({ ts: Date.now(), user: who.user, event: "institute_denied", detail: `${String(req.headers["x-ada-institute"] ?? "")}: ${inst.message}` });
+      return json(res, inst.status, { error: { message: inst.message, type: inst.type ?? "plan_restricted" } });
+    }
+    if (inst.kind === "waive") {
+      institute = inst.slug;
+      // The institute's money: only the fields a doubt needs reach the provider, output clamped, and
+      // the server — not a client hint — decides where the institute's model is sent.
+      body = sanitizeWaivedBody(body);
+      provider = route(model);
+    }
+  }
+  if (!institute && !isAnonymous(who) && !enterpriseMode() && !paidBySubscription && !willForward) {
     const ent = await checkEntitlement(who.user, model);
     if (!ent.ok) {
       appendAudit({ ts: Date.now(), user: who.user, event: ent.status === 402 ? "quota_exceeded" : "plan_denied_model", detail: model });
@@ -377,6 +406,8 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, who: Identi
           ms: Date.now() - started,
           ...(ttft != null ? { ttftMs: ttft } : {}),
           ...originOf(req),
+          // A waived row also keeps what the provider says it ran (audit; priced from `model`).
+          ...(institute ? { institute, ...servedAs(lastModel(tail), model) } : {}),
         };
         appendUsage(row);
         void recordUsage(row); // fire-and-forget: this is response teardown, nothing can await here
@@ -730,6 +761,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
         return json(res, 501, { error: { message: "billing webhook not implemented — set plans via POST /v1/plans until a payment provider is wired" } });
       }
     }
+    // Ada Tutor: an institute's public branding for its student site. PRE-AUTH — the page shows the
+    // name and logo before anyone signs in. Never the model or the cap.
+    const inst = req.method === "GET" && url.pathname.match(/^\/v1\/institutes\/([^/]+)$/);
+    if (inst) {
+      const slug = inst[1]!;
+      const pub = isSlug(slug) ? await publicInstitute(slug) : null;
+      return pub ? json(res, 200, pub) : json(res, 404, { error: { message: "no such institute" } });
+    }
     // Device-flow approval page (the verification_uri the CLI prints).
     if (req.method === "GET" && url.pathname === "/device") {
       res.writeHead(200, { "content-type": "text/html" });
@@ -914,6 +953,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     }
     if (req.method === "POST" && url.pathname === "/v1/images/generations") {
       return await handleImages(req, res, who);
+    }
+    if (req.method === "POST" && url.pathname === "/v1/tutor/speech") {
+      return await handleSpeech(req, res, who);
     }
     if (url.pathname === "/v1/classes" || url.pathname.startsWith("/v1/classes/")) {
       return await handleClasses(req, res, who, url);

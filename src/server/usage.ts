@@ -33,10 +33,20 @@ export interface UsageEvent {
   /** Two-letter country, only when a proxy in front of us already resolved one. We never look it
    *  up ourselves and never store the IP it came from. */
   country?: string;
+  /** The institute that paid for this call (Ada Tutor), when it did. Null = the user's own plan.
+   *  Stored so part 5 can bill institutes; never read by the spend cap. */
+  institute?: string;
+  /** What the provider reported it actually ran, when that differs from `model` (e.g. OpenRouter's
+   *  dated id for an alias). Audit only: cost is always priced from `model`, the id we route and
+   *  price — a dated id models.dev doesn't know would fall to the pessimistic unknown price. */
+  servedModel?: string;
 }
 
 const pg = () => authDatabase() as Pool;
 const lite = () => authDatabase() as Database.Database;
+
+// The institute budget check reads "what has this institute spent today" on every waived call.
+const INSTITUTE_IDX = "create index if not exists usage_events_institute_ts on usage_events (institute, ts)";
 
 let ready: Promise<void> | null = null;
 function ensure(): Promise<void> {
@@ -55,7 +65,9 @@ function ensure(): Promise<void> {
            ms integer,
            ttft_ms integer,
            tz text,
-           country text
+           country text,
+           institute text,
+           served_model text
          )`
       : `create table if not exists usage_events (
            id integer primary key autoincrement,
@@ -68,7 +80,9 @@ function ensure(): Promise<void> {
            ms integer,
            ttft_ms integer,
            tz text,
-           country text
+           country text,
+           institute text,
+           served_model text
          )`;
     const idx = "create index if not exists usage_events_user_ts on usage_events (user_id, ts)";
     // Columns added after the table shipped. `create table if not exists` is a no-op against an
@@ -81,17 +95,21 @@ function ensure(): Promise<void> {
       ["ttft_ms", "integer"],
       ["tz", "text"],
       ["country", "text"],
+      ["institute", "text"],
+      ["served_model", "text"],
     ];
     if (usingPostgres) {
       await pg().query(ddl);
       await pg().query(idx);
       for (const [col, type] of added) await pg().query(`alter table usage_events add column if not exists ${col} ${type}`);
+      await pg().query(INSTITUTE_IDX);
     } else {
       lite().exec(ddl);
       lite().exec(idx);
       // sqlite has no ADD COLUMN IF NOT EXISTS — ask the table what it already has.
       const have = new Set((lite().prepare("pragma table_info(usage_events)").all() as Array<{ name: string }>).map((r) => r.name));
       for (const [col, type] of added) if (!have.has(col)) lite().exec(`alter table usage_events add column ${col} ${type}`);
+      lite().exec(INSTITUTE_IDX);
     }
   })();
   return ready;
@@ -105,15 +123,15 @@ export async function recordUsage(e: UsageEvent): Promise<void> {
     await ensure();
     if (usingPostgres) {
       await pg().query(
-        "insert into usage_events (ts, user_id, model, provider, prompt_tokens, completion_tokens, ms, ttft_ms, tz, country) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-        [e.ts, e.user, e.model, e.provider, e.promptTokens, e.completionTokens, e.ms ?? null, e.ttftMs ?? null, e.tz ?? null, e.country ?? null],
+        "insert into usage_events (ts, user_id, model, provider, prompt_tokens, completion_tokens, ms, ttft_ms, tz, country, institute, served_model) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        [e.ts, e.user, e.model, e.provider, e.promptTokens, e.completionTokens, e.ms ?? null, e.ttftMs ?? null, e.tz ?? null, e.country ?? null, e.institute ?? null, e.servedModel ?? null],
       );
     } else {
       lite()
         .prepare(
-          "insert into usage_events (ts, user_id, model, provider, prompt_tokens, completion_tokens, ms, ttft_ms, tz, country) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          "insert into usage_events (ts, user_id, model, provider, prompt_tokens, completion_tokens, ms, ttft_ms, tz, country, institute, served_model) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
-        .run(e.ts, e.user, e.model, e.provider, e.promptTokens, e.completionTokens, e.ms ?? null, e.ttftMs ?? null, e.tz ?? null, e.country ?? null);
+        .run(e.ts, e.user, e.model, e.provider, e.promptTokens, e.completionTokens, e.ms ?? null, e.ttftMs ?? null, e.tz ?? null, e.country ?? null, e.institute ?? null, e.servedModel ?? null);
     }
   } catch (err) {
     console.error("[ada] usage write failed:", err instanceof Error ? err.message : err);
@@ -126,11 +144,13 @@ export interface UsageTotal {
   requests: number;
 }
 
-/** What one account has used since a timestamp — the number a quota is checked against. */
+/** What one account has used since a timestamp — the number a quota is checked against. Calls an
+ *  institute paid for (Ada Tutor) are excluded: they are the institute's bill, and counting them
+ *  here would let a student's doubts exhaust their own plan. */
 export async function usageSince(user: string, sinceMs: number): Promise<UsageTotal> {
   await ensure();
   const sql =
-    "select coalesce(sum(prompt_tokens),0) as p, coalesce(sum(completion_tokens),0) as c, count(*) as n from usage_events where user_id = $1 and ts >= $2";
+    "select coalesce(sum(prompt_tokens),0) as p, coalesce(sum(completion_tokens),0) as c, count(*) as n from usage_events where user_id = $1 and ts >= $2 and institute is null";
   const row = usingPostgres
     ? ((await pg().query(sql, [user, sinceMs])).rows[0] as { p: string; c: string; n: string })
     : (lite().prepare(sql.replace(/\$\d/g, "?")).get(user, sinceMs) as { p: number; c: number; n: number });
@@ -170,12 +190,29 @@ export async function costSince(user: string, sinceMs: number): Promise<Spend> {
   return total;
 }
 
+/** What an institute (Ada Tutor) has paid for since a timestamp, in USD — priced exactly like a
+ *  user's spend: stored tokens × today's price for the row's model. */
+export async function instituteCostSince(slug: string, sinceMs: number): Promise<number> {
+  await ensure();
+  const sql =
+    "select model, coalesce(sum(prompt_tokens),0) as p, coalesce(sum(completion_tokens),0) as c from usage_events where institute = $1 and ts >= $2 group by model";
+  const rows = usingPostgres
+    ? ((await pg().query(sql, [slug, sinceMs])).rows as Array<{ model: string; p: string; c: string }>)
+    : (lite().prepare(sql.replace(/\$\d/g, "?")).all(slug, sinceMs) as Array<{ model: string; p: number; c: number }>);
+  let usd = 0;
+  for (const r of rows) {
+    const [inPrice, outPrice] = priceUsd(r.model);
+    usd += (Number(r.p) * inPrice + Number(r.c) * outPrice) / 1_000_000;
+  }
+  return usd;
+}
+
 /** Per-model breakdown for an account over a window — for a usage page, and for costing a period
  *  once a price table exists (cost needs the model, which is why it's stored per row). */
 export async function usageByModel(user: string, sinceMs: number): Promise<Array<UsageTotal & { model: string }>> {
   await ensure();
   const sql =
-    "select model, coalesce(sum(prompt_tokens),0) as p, coalesce(sum(completion_tokens),0) as c, count(*) as n from usage_events where user_id = $1 and ts >= $2 group by model order by n desc";
+    "select model, coalesce(sum(prompt_tokens),0) as p, coalesce(sum(completion_tokens),0) as c, count(*) as n from usage_events where user_id = $1 and ts >= $2 and institute is null group by model order by n desc";
   const rows = usingPostgres
     ? ((await pg().query(sql, [user, sinceMs])).rows as Array<{ model: string; p: string; c: string; n: string }>)
     : (lite().prepare(sql.replace(/\$\d/g, "?")).all(user, sinceMs) as Array<{ model: string; p: number; c: number; n: number }>);

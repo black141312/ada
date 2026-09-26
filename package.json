@@ -76,6 +76,7 @@
     "better-sqlite3": "^12.11.1",
     "ink": "^7.1.1",
     "ink-text-input": "^6.0.0",
+    "kokoro-js": "1.2.1",
     "openai": "^6.45.0",
     "pg": "^8.22.0",
     "react": "^19.2.8",

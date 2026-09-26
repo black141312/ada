@@ -1,0 +1,407 @@
+/**
+ * Coaching institutes (Ada Tutor): an institute pays for its students' doubts.
+ *
+ * A request that names an institute (`x-ada-institute`, set by the Cloudflare Worker from the
+ * subdomain — it overwrites anything the browser sent) is paid for by that institute only when it
+ * asks for the institute's own model and carries a doubt id (`x-ada-doubt`) to count against the
+ * student's daily cap. Anything else — another model, no doubt id, an unknown or inactive
+ * institute — falls through to the student's own plan exactly as before.
+ *
+ * Same shape as plans.ts/classes.ts: the module owns its DDL, runs it once, speaks Postgres and SQLite.
+ *
+ * ponytail: the backend trusts x-ada-institute from anyone who can reach it; the Worker overwrites it,
+ * but a client calling Cloud Run directly can set it too. Every institute is therefore bounded by its
+ * daily budget, per-student cap and per-doubt ceilings. If abuse appears, the upgrade is a shared
+ * secret the Worker adds (e.g. x-ada-worker-key) and the backend requires before honouring the header.
+ */
+import type { IncomingMessage } from "node:http";
+import type { Pool } from "pg";
+import type Database from "better-sqlite3";
+import { authDatabase, usingPostgres } from "./db.ts";
+import { planFor } from "./plans.ts";
+import { instituteCostSince } from "./usage.ts";
+
+const pg = () => authDatabase() as Pool;
+const lite = () => authDatabase() as Database.Database;
+
+export interface Institute {
+  slug: string;
+  name: string;
+  logoUrl: string | null;
+  /** The one model the institute pays for. Exact id, compared exactly. */
+  model: string;
+  dailyDoubtsPerStudent: number;
+  /** Most the institute pays per UTC day, USD, summed from its usage rows. Null = unlimited — only
+   *  ever by explicit choice: the column defaults to 5. */
+  dailyBudgetUsd: number | null;
+  active: boolean;
+}
+
+/** The pilot, created on first boot if absent. Haiku via OpenRouter — the hosted backend's key. */
+export const DEMO: Institute = {
+  slug: "demo",
+  name: "Demo Coaching",
+  logoUrl: null,
+  model: "anthropic/claude-haiku-4.5",
+  dailyDoubtsPerStudent: 30,
+  dailyBudgetUsd: 5,
+  active: true,
+};
+
+/** Model calls one doubt id may make per day on the institute's bill. A doubt is an outline, 2–4
+ *  scenes, and the odd repair or follow-up — ~8–20 calls. Without a ceiling one doubt id, reused
+ *  forever, would be unlimited free Haiku; the per-institute daily budget backstops the rest. */
+export const CALLS_PER_DOUBT = 25;
+
+export const isSlug = (s: unknown): s is string => typeof s === "string" && /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/.test(s);
+/** Same format the app mints for classes (classes.ts isClassId) — a doubt is a class doc. */
+export const isDoubtId = (s: unknown): s is string => typeof s === "string" && /^cls_[a-z0-9]{8}$/.test(s);
+
+/** Doubt caps reset at UTC midnight (05:30 IST — nobody is studying then). */
+export const dayOf = (now = Date.now()): string => new Date(now).toISOString().slice(0, 10);
+
+let ready: Promise<void> | null = null;
+function ensure(): Promise<void> {
+  ready ??= (async () => {
+    const ddl = [
+      `create table if not exists institutes (
+        slug text primary key,
+        name text not null,
+        logo_url text,
+        model text not null,
+        daily_doubts_per_student integer not null,
+        active boolean not null default true,
+        created_at bigint not null,
+        daily_budget_usd double precision default 5
+      )`,
+      // ponytail: open join — anyone signed in who uses the subdomain becomes a member. Part 3 adds
+      // invite / email-domain rules; this table is where they'll be checked.
+      `create table if not exists institute_members (
+        slug text not null,
+        user_id text not null,
+        first_seen bigint not null,
+        primary key (slug, user_id)
+      )`,
+      // One row per (student, day, doubt): the cap counts rows, `calls` bounds a single doubt.
+      `create table if not exists institute_doubts (
+        slug text not null,
+        user_id text not null,
+        day text not null,
+        doubt_id text not null,
+        calls integer not null default 0,
+        first_at bigint not null,
+        primary key (slug, user_id, day, doubt_id)
+      )`,
+    ];
+    for (const stmt of ddl) {
+      if (usingPostgres) await pg().query(stmt);
+      else lite().exec(stmt.replace(/bigint/g, "integer").replace(/double precision/g, "real"));
+    }
+    // Added after the table first shipped (on this branch). DEFAULT 5 gives any row that predates it
+    // the safe budget rather than "unlimited".
+    if (usingPostgres) {
+      await pg().query("alter table institutes add column if not exists daily_budget_usd double precision default 5");
+    } else {
+      const cols = lite().prepare("pragma table_info(institutes)").all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === "daily_budget_usd")) lite().exec("alter table institutes add column daily_budget_usd real default 5");
+    }
+    await run(
+      `insert into institutes (slug, name, logo_url, model, daily_doubts_per_student, active, created_at, daily_budget_usd)
+       values ($1, $2, $3, $4, $5, $6, $7, $8) on conflict (slug) do nothing`,
+      [DEMO.slug, DEMO.name, DEMO.logoUrl, DEMO.model, DEMO.dailyDoubtsPerStudent, usingPostgres ? true : 1, Date.now(), DEMO.dailyBudgetUsd],
+    );
+  })().catch((e) => {
+    ready = null; // a concurrent first-run race is transient — let the next request retry
+    throw e;
+  });
+  return ready;
+}
+
+async function all<T>(sql: string, params: unknown[]): Promise<T[]> {
+  if (usingPostgres) return (await pg().query(sql, params)).rows as T[];
+  return lite().prepare(sql.replace(/\$\d+/g, "?")).all(...params) as T[];
+}
+async function run(sql: string, params: unknown[]): Promise<number> {
+  if (usingPostgres) return (await pg().query(sql, params)).rowCount ?? 0;
+  return lite().prepare(sql.replace(/\$\d+/g, "?")).run(...params).changes;
+}
+
+type Row = {
+  slug: string;
+  name: string;
+  logo_url: string | null;
+  model: string;
+  daily_doubts_per_student: number | string;
+  active: boolean | number;
+  daily_budget_usd: number | string | null;
+};
+const fromRow = (r: Row): Institute => ({
+  slug: r.slug,
+  name: r.name,
+  logoUrl: r.logo_url,
+  model: r.model,
+  dailyDoubtsPerStudent: Number(r.daily_doubts_per_student),
+  dailyBudgetUsd: r.daily_budget_usd == null ? null : Number(r.daily_budget_usd),
+  active: r.active === true || r.active === 1,
+});
+
+/** An institute by slug, active or not. Null when there's no such row. */
+export async function getInstitute(slug: string): Promise<Institute | null> {
+  if (!isSlug(slug)) return null;
+  await ensure();
+  const r = (await all<Row>("select slug, name, logo_url, model, daily_doubts_per_student, active, daily_budget_usd from institutes where slug = $1", [slug]))[0];
+  return r ? fromRow(r) : null;
+}
+
+/** Create or replace an institute. Admin CRUD is part 3; this is what it (and the tests) call. */
+export async function putInstitute(i: Institute): Promise<void> {
+  await ensure();
+  await run(
+    `insert into institutes (slug, name, logo_url, model, daily_doubts_per_student, active, created_at, daily_budget_usd)
+     values ($1, $2, $3, $4, $5, $6, $7, $8)
+     on conflict (slug) do update set name = excluded.name, logo_url = excluded.logo_url, model = excluded.model,
+       daily_doubts_per_student = excluded.daily_doubts_per_student, active = excluded.active, daily_budget_usd = excluded.daily_budget_usd`,
+    [i.slug, i.name, i.logoUrl, i.model, i.dailyDoubtsPerStudent, usingPostgres ? i.active : i.active ? 1 : 0, Date.now(), i.dailyBudgetUsd],
+  );
+}
+
+/** Idempotent: the first use of an institute makes the user a member. */
+export async function ensureMember(slug: string, user: string): Promise<void> {
+  await ensure();
+  await run("insert into institute_members (slug, user_id, first_seen) values ($1, $2, $3) on conflict (slug, user_id) do nothing", [slug, user, Date.now()]);
+}
+
+export async function isMember(slug: string, user: string): Promise<boolean> {
+  await ensure();
+  return (await all("select 1 from institute_members where slug = $1 and user_id = $2", [slug, user])).length > 0;
+}
+
+export interface DoubtStats {
+  /** Distinct doubts this student has asked this institute today. */
+  doubtsToday: number;
+  /** Model calls already made under this doubt id today; null when this doubt is new today. */
+  doubtCalls: number | null;
+}
+
+const STATS_SQL = "select doubt_id, calls from institute_doubts where slug = $1 and user_id = $2 and day = $3";
+const RECORD_SQL = `insert into institute_doubts (slug, user_id, day, doubt_id, calls, first_at) values ($1, $2, $3, $4, 1, $5)
+  on conflict (slug, user_id, day, doubt_id) do update set calls = institute_doubts.calls + 1`;
+const toStats = (rows: Array<{ doubt_id: string; calls: number | string }>, doubtId: string): DoubtStats => {
+  const mine = rows.find((r) => r.doubt_id === doubtId);
+  return { doubtsToday: rows.length, doubtCalls: mine ? Number(mine.calls) : null };
+};
+
+export async function doubtStats(slug: string, user: string, day: string, doubtId: string): Promise<DoubtStats> {
+  await ensure();
+  return toStats(await all(STATS_SQL, [slug, user, day]), doubtId);
+}
+
+/** Run `fn` after every earlier call with the same key has settled — one at a time per key, keys
+ *  independent. The entry is deleted once the key's chain goes idle, so the map only holds keys with
+ *  work in flight. */
+const chains = new Map<string, Promise<void>>();
+export function serialize<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const run = (chains.get(key) ?? Promise.resolve()).then(fn);
+  const tail = run.then(
+    () => {},
+    () => {},
+  );
+  chains.set(key, tail);
+  void tail.then(() => {
+    if (chains.get(key) === tail) chains.delete(key);
+  });
+  return run;
+}
+/** Keys with work queued or running (for tests). */
+export const serializedKeys = (): number => chains.size;
+
+/** Read the student's counts, decide, and — only on a waiver — count the call, as ONE atomic step.
+ *  A read-then-write gate let N parallel requests with fresh doubt ids all see "under the cap".
+ *  Postgres: a transaction holding an advisory lock on (institute, student, day), so every instance
+ *  queues on the same key. Within one instance the same key is also queued IN MEMORY before a pool
+ *  connection is taken — otherwise one student firing 30 parallel requests parks 30 connections on
+ *  the lock and starves every other query on the instance (the pool has 10).
+ *  SQLite: one synchronous IMMEDIATE transaction (writes are serialized). */
+export async function claimDoubtCall(
+  slug: string,
+  user: string,
+  day: string,
+  doubtId: string,
+  decide: (s: DoubtStats) => InstituteDecision,
+): Promise<InstituteDecision> {
+  await ensure();
+  const params = [slug, user, day];
+  if (!usingPostgres) {
+    const db = lite();
+    return db
+      .transaction(() => {
+        const d = decide(toStats(db.prepare(STATS_SQL.replace(/\$\d+/g, "?")).all(...params) as Array<{ doubt_id: string; calls: number }>, doubtId));
+        if (d.kind === "waive") db.prepare(RECORD_SQL.replace(/\$\d+/g, "?")).run(slug, user, day, doubtId, Date.now());
+        return d;
+      })
+      .immediate();
+  }
+  const key = `institute-doubts|${slug}|${user}|${day}`;
+  return serialize(key, async () => {
+    const client = await pg().connect();
+    try {
+      await client.query("begin");
+      await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [key]);
+      const d = decide(toStats((await client.query(STATS_SQL, params)).rows, doubtId));
+      if (d.kind === "waive") await client.query(RECORD_SQL, [slug, user, day, doubtId, Date.now()]);
+      await client.query("commit");
+      client.release();
+      return d;
+    } catch (e) {
+      await client.query("rollback").catch(() => {});
+      // Passing the error destroys the connection instead of returning a possibly-broken one.
+      client.release(e instanceof Error ? e : new Error(String(e)));
+      throw e;
+    }
+  });
+}
+
+// ---------- the waived request body ----------
+
+/** A waived call is the institute's money, so its body is cut down to what a doubt needs. The chat
+ *  adapters forward the client's body as-is, and on OpenRouter that body can pick other models
+ *  (`models`, `route`), add paid features (`plugins` — web search, PDF OCR; `transforms`;
+ *  `web_search_options`), multiply the output (`n`), or buy extra thinking (`reasoning`,
+ *  `reasoning_effort`, `verbosity`). An allowlist, not a denylist, so a field OpenRouter adds next
+ *  month is dropped by default. */
+export const WAIVED_BODY_LIMIT = 2 * 1024 * 1024;
+export const WAIVED_MAX_TOKENS = 6000; // a chalkboard scene is ~2–4k tokens of output
+const WAIVED_KEEP = ["model", "messages", "stream", "stream_options", "temperature", "top_p", "stop", "response_format", "seed", "presence_penalty", "frequency_penalty"];
+
+/** Why this body can't be waived, or null. Text and images only: a `file` part is how a PDF gets in,
+ *  and PDFs are where OpenRouter's paid parsing engines come in. */
+export function waivedBodyProblem(body: Record<string, unknown>): string | null {
+  if (!Array.isArray(body.messages)) return "'messages' must be an array";
+  for (const m of body.messages as Array<{ content?: unknown }>) {
+    if (!Array.isArray(m?.content)) continue;
+    for (const p of m.content as Array<{ type?: unknown }>) {
+      if (p?.type !== "text" && p?.type !== "image_url") return "institute doubts accept text and images only";
+    }
+  }
+  return null;
+}
+
+export function sanitizeWaivedBody(body: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k of WAIVED_KEEP) if (k in body) out[k] = body[k];
+  const asked = [body.max_tokens, body.max_completion_tokens].filter((v): v is number => typeof v === "number" && Number.isFinite(v) && v >= 1);
+  out.max_tokens = Math.min(WAIVED_MAX_TOKENS, ...asked.map(Math.floor));
+  return out;
+}
+
+// ---------- the decision (pure) ----------
+
+export type InstituteDecision =
+  /** Not an institute request, or one the institute doesn't pay for: today's rules apply. */
+  | { kind: "none" }
+  /** The institute pays: skip the student's price gate, count the call against the doubt. */
+  | { kind: "waive"; slug: string; doubtId: string; newDoubt: boolean }
+  | { kind: "deny"; status: 400 | 403 | 413 | 429; message: string; type?: "doubt_limit" | "institute_budget" };
+
+export interface DecisionInput {
+  /** Validated x-ada-institute, or null. */
+  slug: string | null;
+  /** The institute that slug names, or null if none. */
+  institute: Institute | null;
+  model: string;
+  /** Validated x-ada-doubt, or null. */
+  doubtId: string | null;
+  banned: boolean;
+  /** Raw request body size, and waivedBodyProblem() of it. */
+  bodyBytes: number;
+  bodyProblem: string | null;
+  stats: DoubtStats;
+  /** What the institute has paid for so far today (UTC), USD. */
+  spentTodayUsd: number;
+}
+
+export const DAILY_LIMIT_MESSAGE = "Daily doubt limit reached";
+export const BUDGET_MESSAGE = "This site has reached today's limit. Try again tomorrow.";
+export const DOUBT_LIMIT_MESSAGE = "This doubt has reached its limit — ask a new doubt to continue";
+
+/** The whole institute rule, kept pure so every branch is tested without a database.
+ *  The waiver needs ALL of: an active institute, the request asking for exactly that institute's
+ *  model, and a doubt id to count. Missing any one → "none", which is the student's own plan. */
+export function decideInstitute(i: DecisionInput): InstituteDecision {
+  if (!i.slug || !i.institute || !i.institute.active || i.institute.slug !== i.slug) return { kind: "none" };
+  if (i.model !== i.institute.model) return { kind: "none" };
+  if (!i.doubtId) return { kind: "none" };
+  if (i.banned) return { kind: "deny", status: 403, message: "This account is suspended." };
+  if (i.bodyBytes > WAIVED_BODY_LIMIT) return { kind: "deny", status: 413, message: "doubt too large (2 MB max) — use a smaller photo" };
+  if (i.bodyProblem) return { kind: "deny", status: 400, message: i.bodyProblem };
+  if (i.institute.dailyBudgetUsd != null && i.spentTodayUsd >= i.institute.dailyBudgetUsd) {
+    return { kind: "deny", status: 429, message: BUDGET_MESSAGE, type: "institute_budget" };
+  }
+  const isNew = i.stats.doubtCalls === null;
+  if (isNew && i.stats.doubtsToday >= i.institute.dailyDoubtsPerStudent) return { kind: "deny", status: 429, message: DAILY_LIMIT_MESSAGE, type: "doubt_limit" };
+  if (!isNew && i.stats.doubtCalls! >= CALLS_PER_DOUBT) return { kind: "deny", status: 429, message: DOUBT_LIMIT_MESSAGE, type: "doubt_limit" };
+  return { kind: "waive", slug: i.slug, doubtId: i.doubtId, newDoubt: isNew };
+}
+
+// ---------- the gate (decision + stores) ----------
+
+export interface InstituteStore {
+  getInstitute(slug: string): Promise<Institute | null>;
+  ensureMember(slug: string, user: string): Promise<void>;
+  isBanned(user: string): Promise<boolean>;
+  /** USD the institute has paid for since a timestamp (its usage rows). */
+  spentSince(slug: string, sinceMs: number): Promise<number>;
+  /** Atomic read-decide-record (see claimDoubtCall). */
+  claimDoubtCall(slug: string, user: string, day: string, doubtId: string, decide: (s: DoubtStats) => InstituteDecision): Promise<InstituteDecision>;
+}
+
+const header = (req: IncomingMessage, name: string): string | null => {
+  const v = req.headers[name];
+  const s = (Array.isArray(v) ? v[0] : v)?.trim();
+  return s ? s : null;
+};
+
+/** Read the two headers, look everything up, and decide — counting the call atomically when the
+ *  institute pays. `body` is the request (raw size + parsed) for the waived-body checks. */
+export async function instituteGate(
+  store: InstituteStore,
+  req: IncomingMessage,
+  user: string,
+  model: string,
+  body: { bytes: number; parsed: Record<string, unknown> },
+  now = Date.now(),
+): Promise<InstituteDecision> {
+  const rawSlug = header(req, "x-ada-institute");
+  const slug = isSlug(rawSlug) ? rawSlug : null;
+  if (!slug) return { kind: "none" };
+  const institute = await store.getInstitute(slug);
+  if (!institute?.active) return { kind: "none" };
+  await store.ensureMember(slug, user);
+  const rawDoubt = header(req, "x-ada-doubt");
+  const doubtId = isDoubtId(rawDoubt) ? rawDoubt : null;
+  // Only look further when the answer could be a waiver — everything else is the student's plan.
+  if (model !== institute.model || !doubtId) return { kind: "none" };
+  const day = dayOf(now);
+  // ponytail: usage rows land when a response ENDS, so calls still in flight aren't counted yet — the
+  // budget can overshoot by the calls running at the moment it's crossed. Bounded, not worth a ledger.
+  const [banned, spentTodayUsd] = await Promise.all([store.isBanned(user), store.spentSince(slug, Date.parse(`${day}T00:00:00Z`))]);
+  const bodyProblem = waivedBodyProblem(body.parsed);
+  return store.claimDoubtCall(slug, user, day, doubtId, (stats) =>
+    decideInstitute({ slug, institute, model, doubtId, banned, bodyBytes: body.bytes, bodyProblem, stats, spentTodayUsd }),
+  );
+}
+
+/** The database-backed store. A ban lives on the plan row. */
+export const dbStore: InstituteStore = {
+  getInstitute,
+  ensureMember,
+  claimDoubtCall,
+  isBanned: async (user) => (await planFor(user)).status === "banned",
+  spentSince: instituteCostSince,
+};
+
+/** Public branding for the student site: never the model or the cap. */
+export async function publicInstitute(slug: string): Promise<{ slug: string; name: string; logoUrl: string | null } | null> {
+  const i = await getInstitute(slug);
+  return i?.active ? { slug: i.slug, name: i.name, logoUrl: i.logoUrl } : null;
+}
