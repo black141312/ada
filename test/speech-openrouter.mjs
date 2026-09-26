@@ -84,6 +84,20 @@ assert.equal(O.wordSimilarity("one two three four five six seven eight nine ten"
 assert.equal(O.wordSimilarity("one two three four five six seven eight nine ten", "one two three four five six seven eight nine eleven"), 0.9);
 assert.ok(O.wordSimilarity("The answer is four.", "Sure! The answer is four. Let me know if you need more help.") < O.VERBATIM_MIN, "chatter is caught");
 assert.ok(O.wordSimilarity("The answer is four.", "") < O.VERBATIM_MIN);
+assert.equal(O.VERBATIM_MIN, 0.95);
+
+// numbers are heard, not spelled: digits and words compare equal; any different number fails
+assert.deepEqual(O.spokenWords("v = 20.4 m/s, the 2nd time, -3 degrees, 1,000 items."), ["v", "twenty", "point", "four", "m", "s", "the", "second", "time", "minus", "three", "degrees", "one", "thousand", "items"]);
+assert.deepEqual(O.spokenWords("One hundred and five"), ["one", "hundred", "five"], "British 'and' inside a number is dropped");
+assert.deepEqual(O.spokenWords("salt and pepper"), ["salt", "and", "pepper"], "an ordinary 'and' is kept");
+assert.equal(O.verbatim("So v equals 20 metres per second.", "So v equals twenty metres per second.").ok, true, "20 read as twenty");
+assert.equal(O.verbatim("The height is 20.4 metres.", "The height is twenty point four metres.").ok, true);
+assert.equal(O.verbatim("It is 105 grams.", "It is one hundred and five grams.").ok, true);
+const TWELVE = "The mass is 12 kilograms and the speed is 5 metres per second.";
+assert.match(O.verbatim(TWELVE, TWELVE.replace("12", "20")).why, /numbers differ/, "one changed number in a 12-word line fails");
+assert.equal(O.verbatim(TWELVE, TWELVE.replace("12", "twelve")).ok, true);
+assert.match(O.verbatim(TWELVE, TWELVE.replace("mass", "weight")).why, /similarity/, "one changed word in 12 (0.92) fails the 0.95 bar");
+assert.equal(O.verbatim(TWELVE, "the mass is twelve kilograms, and the speed is five metres per second").ok, true, "case, commas and digits-as-words pass");
 assert.equal(O.wordSimilarity("It's v squared.", "its v squared"), 1, "apostrophes don't count");
 
 // --- orSpeak with a fake fetch ------------------------------------------------------------------
@@ -120,6 +134,44 @@ const streamOf = (text) => new Response(new ReadableStream({ start(c) { c.enqueu
   });
   assert.equal(hang.reason, "timeout");
   assert.ok(Date.now() - t0 < 1000, "bounded by the timeout");
+  assert.equal(hang.estimated, true, "a timed-out call isn't free: its usage is estimated");
+  assert.ok(hang.usage.completionTokens > 0 && hang.usage.promptTokens > 0);
+
+  // strict guard through orSpeak
+  const wrongNumber = await O.orSpeak({ text: TWELVE, voice: "marin", fetchImpl: async () => streamOf(sse(TWELVE.replace("12", "20"))) });
+  assert.equal(wrongNumber.ok, false, "a 12-word line with one changed number falls back");
+  assert.equal(wrongNumber.reason, "not_verbatim");
+  assert.equal(wrongNumber.estimated, undefined, "the stream's own usage is used when present");
+  const spelled = await O.orSpeak({ text: "So v equals 20 metres per second.", voice: "marin", fetchImpl: async () => streamOf(sse("So v equals twenty metres per second.")) });
+  assert.equal(spelled.ok, true, "20 read as twenty is accepted");
+
+  // cut off mid-stream: some audio arrived, no usage → estimated from what arrived / the line
+  const partial = await O.orSpeak({
+    text: "A long line that never finishes.",
+    voice: "marin",
+    timeoutMs: 80,
+    fetchImpl: async (_u, init) =>
+      new Response(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(new TextEncoder().encode(sse("A long", { audio: 48_000, usage: null }).replace("data: [DONE]\n\n", "")));
+            init.signal.addEventListener("abort", () => c.error(init.signal.reason));
+          },
+        }),
+      ),
+  });
+  assert.equal(partial.reason, "timeout");
+  assert.equal(partial.estimated, true);
+  assert.ok(partial.usage.completionTokens >= 50, "at least the 2 s of audio that arrived");
+
+  // byte cap: a runaway stream is abandoned and billed by estimate
+  const runaway = await O.orSpeak({ text: "Short.", voice: "marin", maxPcmBytes: 10_000, fetchImpl: async () => streamOf(sse("Short.", { audio: 24_000, usage: null })) });
+  assert.equal(runaway.ok, false);
+  assert.match(runaway.detail, /abandoned/);
+  assert.equal(runaway.estimated, true);
+  assert.equal(O.MAX_PCM_BYTES, 8 * 1024 * 1024);
+  // an HTTP error isn't a generation: nothing to bill
+  assert.equal((await O.orSpeak({ text: "x", voice: "marin", fetchImpl: async () => new Response("no", { status: 502 }) })).usage, null);
 }
 
 // ---------- HTTP, against a fake OpenRouter ----------
@@ -132,6 +184,11 @@ const fake = createServer((req, res) => {
     const b = JSON.parse(body);
     const text = b.messages[1].content;
     upstream.push(text);
+    if (text.startsWith("hang")) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sse("hang", { audio: 2400, usage: null }).replace("data: [DONE]\n\n", ""));
+      return; // never ends
+    }
     if (text.startsWith("slow")) {
       slow++;
       await new Promise((r) => setTimeout(r, 300));
@@ -221,6 +278,27 @@ try {
   assert.equal(burst.filter((r) => r.status === 200).length, 3);
   assert.equal(burst.filter((r) => r.status === 429).length, 1);
   assert.equal(slow, 3);
+
+  // a timed-out line is still metered (estimate) and falls back to Kokoro
+  const realOr = S.speechEngine.or;
+  S.speechEngine.or = (o) => O.orSpeak({ ...o, timeoutMs: 100 });
+  const before = rows().length;
+  const timedOut = await speak("hang here please.", DEMO);
+  assert.equal(timedOut.voice, "kokoro");
+  await settle();
+  assert.equal(rows().length, before + 1, "the timeout was metered");
+  assert.ok(rows().at(-1).completion_tokens > 0);
+  S.speechEngine.or = realOr;
+
+  // a banned student can't make the institute pay for voice
+  await setPlan("team", "pro", "banned");
+  const n2 = upstream.length;
+  const banned = await speak("Banned line.", DEMO);
+  assert.equal(banned.status, 403);
+  assert.equal(upstream.length, n2, "no OpenRouter call for a banned user");
+  const denied = await S.speechPayer({ headers: DEMO }, "team");
+  assert.deepEqual(denied, { denied: "This account is suspended.", status: 403 }, "the payer decision refuses bans on its own");
+  await setPlan("team", "pro", "active");
 
   // ADA_SPEECH_PROVIDER=kokoro: OpenRouter is never called
   process.env.ADA_SPEECH_PROVIDER = "kokoro";

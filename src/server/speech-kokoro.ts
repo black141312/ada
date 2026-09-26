@@ -355,7 +355,10 @@ const orInFlight = new Map<string, number>();
 /** Who pays for an OpenRouter line, or why nobody will (→ Kokoro, which costs nothing).
  *  An active institute named by x-ada-institute pays while under its daily budget, exactly like chat;
  *  otherwise the user's own plan must allow the model (enterprise seats are billed by contract). */
-export async function speechPayer(req: IncomingMessage, user: string): Promise<{ institute?: string } | { denied: string }> {
+export async function speechPayer(req: IncomingMessage, user: string): Promise<{ institute?: string } | { denied: string; status?: 403 }> {
+  // A ban beats every payer — same rule as the chat waiver (decideInstitute). handleSpeech also
+  // refuses banned users up front; this keeps the payer decision safe on its own.
+  if ((await planFor(user)).status === "banned") return { denied: "This account is suspended.", status: 403 };
   const raw = req.headers["x-ada-institute"];
   const slug = (Array.isArray(raw) ? raw[0] : raw)?.trim();
   if (isSlug(slug)) {
@@ -450,6 +453,7 @@ export async function handleSpeech(req: IncomingMessage, res: ServerResponse, wh
     });
     if (provider === "openrouter") {
       const payer = await speechPayer(req, who.user);
+      if ("denied" in payer && payer.status === 403) return fail(res, 403, payer.denied);
       if ("denied" in payer) {
         console.warn(`[speech] kokoro instead of openrouter for ${who.user}: ${payer.denied}`);
       } else {
@@ -459,6 +463,7 @@ export async function handleSpeech(req: IncomingMessage, res: ServerResponse, wh
         const started = Date.now();
         try {
           const r = await speechEngine.or({ text: v.text, voice: orVoice, signal: gone.signal });
+          if (!r.ok && r.estimated) console.warn(`[speech] openrouter reported no usage (${r.reason}) — metering an estimate`);
           meter(who.user, r.usage, payer.institute, started);
           if (r.ok) wav = r.wav;
           else console.warn(`[speech] openrouter → kokoro fallback (${r.reason}): ${r.detail}`);
